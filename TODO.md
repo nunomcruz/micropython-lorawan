@@ -71,6 +71,7 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Fix three `portTICK_PERIOD_MS` integer-division bugs (2/10=0, 10000/10=1000 ticks): replaced with `pdMS_TO_TICKS()`
 - [x] Guard `LoRaMacProcess()` with `s_mac_initialized` flag — must not call before `LoRaMacInitialization()`
 - [x] Increase LoRaWAN task stack from 4 KB to 8 KB (RxChainCalibration call chain is deep)
+- [x] Fix GIL deadlock: `mp_printf` from LoRaWAN task blocks on `MP_THREAD_GIL_ENTER()` — Python thread holds GIL while sleeping in `xEventGroupWaitBits`. Replaced with `esp_rom_printf` (ROM UART, no locking) throughout the task.
 - [x] Add diagnostic prints around `LoRaMacInitialization()` to identify any remaining hang
 - [ ] Test: ABP uplink appears on TTN console with correct payload  ← needs hardware
 

@@ -12,6 +12,7 @@
 
 #include "esp_attr.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"
@@ -215,10 +216,13 @@ static void lorawan_task(void *arg) {
                 LoRaMacRegion_t region =
                     s_lora_obj ? s_lora_obj->region : LORAMAC_REGION_EU868;
 
-                mp_printf(&mp_plat_print, "lorawan: LoRaMacInitialization start\n");
+                // esp_rom_printf is GIL-free; mp_printf from this task deadlocks
+                // because the Python thread holds the GIL while sleeping in
+                // xEventGroupWaitBits.
+                esp_rom_printf("lorawan: LoRaMacInitialization start\n");
                 LoRaMacStatus_t st =
                     LoRaMacInitialization(&s_mac_primitives, &s_mac_callbacks, region);
-                mp_printf(&mp_plat_print, "lorawan: LoRaMacInitialization returned %d\n", (int)st);
+                esp_rom_printf("lorawan: LoRaMacInitialization returned %d\n", (int)st);
 
                 if (st != LORAMAC_STATUS_OK) {
                     xEventGroupSetBits(s_events, EVT_INIT_ERROR);
@@ -258,7 +262,7 @@ static void lorawan_task(void *arg) {
 
                 s_mac_initialized = true;
                 if (s_lora_obj) s_lora_obj->initialized = true;
-                mp_printf(&mp_plat_print, "lorawan: init done\n");
+                esp_rom_printf("lorawan: init done\n");
                 xEventGroupSetBits(s_events, EVT_COMPLETED);
                 break;
             }
@@ -332,8 +336,7 @@ static void lorawan_task(void *arg) {
 
                 LoRaMacStatus_t st = LoRaMacMcpsRequest(&mcps);
                 if (st != LORAMAC_STATUS_OK) {
-                    mp_printf(&mp_plat_print,
-                              "lorawan: McpsRequest failed: %d\n", (int)st);
+                    esp_rom_printf("lorawan: McpsRequest failed: %d\n", (int)st);
                     xEventGroupSetBits(s_events, EVT_TX_ERROR);
                 }
                 // EVT_TX_DONE / EVT_TX_ERROR set asynchronously by mcps_confirm
@@ -418,10 +421,14 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     s_rx_queue  = xQueueCreate(LORAWAN_RX_QSIZE,  sizeof(lorawan_rx_pkt_t));
     s_events    = xEventGroupCreate();
 
-    xTaskCreatePinnedToCore(lorawan_task, "lorawan",
+    BaseType_t task_ok = xTaskCreatePinnedToCore(lorawan_task, "lorawan",
                             LORAWAN_TASK_STACK / sizeof(StackType_t),
                             NULL, LORAWAN_TASK_PRIO,
                             &s_task_handle, 1);
+    if (task_ok != pdPASS) {
+        mp_raise_msg(&mp_type_RuntimeError,
+                     MP_ERROR_TEXT("failed to create LoRaWAN task (out of memory?)"));
+    }
 
     lorawan_cmd_data_t cmd = { .cmd = CMD_INIT };
     send_cmd_wait(&cmd, EVT_COMPLETED | EVT_INIT_ERROR);
