@@ -17,8 +17,8 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Create `manifest.py` — freeze both lora-sx127x and lora-sx126x drivers plus tbeam.py
 - [x] Create `modules/tbeam.py` — HardwareInfo class, _detect_radio(), _detect_pmu(), _detect_gps_pins(), _detect_oled()
 - [x] Compile LILYGO_TTGO_TBEAM board (1565KB, 23% of 4MB partition used; all lora drivers + tbeam.py frozen)
-- [ ] Flash and test `tbeam.detect()` on at least one T-Beam (SX1276)
-- [ ] Test raw LoRa TX/RX with existing Python driver via tbeam.lora_spi() / tbeam.lora_pins()
+- [x] Flash and test `tbeam.detect()` on T-Beam v1.1 SX1262/AXP192: radio=sx1262, pmu=axp192, irq=33, busy=32, gps_rx=34, gps_tx=12
+- [x] Test raw LoRa TX via tbeam.lora_modem(): SF7/125kHz/14dBm on 868.1MHz, TX done confirmed
 
 ## Phase 2 — USER_C_MODULE Skeleton (Session 3)
 
