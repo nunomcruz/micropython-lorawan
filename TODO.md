@@ -52,8 +52,8 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Implement runtime radio selection: Radio_SX1276 and Radio_SX126x tables; radio_select.c owns writable Radio global; lorawan_radio_select(bool) copies the right table at init
 - [x] Fix dual-radio symbol collision: hal/sx1276_radio_wrapper.c and hal/sx126x_radio_wrapper.c rename TxTimeoutTimer/RxTimeoutTimer/FskBandwidths/Radio via #define before #including originals — no modifications to loramac-node/ sources
 - [x] Compile full HAL + both radio drivers — zero errors, zero warnings; firmware 1579 KB (both Radio tables now fully linked)
-- [ ] Test SPI: read register 0x42 on SX1276 board, must return 0x12  ← needs hardware
-- [ ] Test timer accuracy: 200ms timer callback, verify fires within 500ms  ← needs hardware
+- [x] Test SPI: read register 0x42 = 0x12 confirmed on T-Beam SX1276 hardware
+- [x] Test timer accuracy: 200ms timer fires within 500ms confirmed on hardware
 - [ ] Test on SX1262 board if available: BUSY pin reads, command interface  ← needs hardware
 
 ## Phase 4 — Python Bindings (Sessions 7–10)
