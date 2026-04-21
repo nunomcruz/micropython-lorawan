@@ -28,7 +28,7 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Create `modlorawan.c` skeleton — version() function, MP_REGISTER_MODULE
 - [x] Create `lorawan_config.h` — pin defines, region defines, radio selection
 - [x] Create HAL stub files (empty .c with correct headers)
-- [x] Compile with USER_C_MODULES — build succeeded (1565KB, no errors); flash/REPL test requires hardware
+- [x] Compile with USER_C_MODULES and verify `import lorawan; lorawan.version()` works — confirmed on T-Beam hardware, returns `'0.1.0'`
 
 ## Phase 3 — ESP32 HAL (Sessions 4–6)
 
