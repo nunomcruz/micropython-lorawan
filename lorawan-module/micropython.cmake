@@ -13,7 +13,7 @@ target_sources(usermod_lorawan INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/bindings/modlorawan.c
 )
 
-# ESP32 HAL (stubs for Phase 2; implemented in Phase 3)
+# ESP32 HAL (implemented in Phase 3, Session 4)
 target_sources(usermod_lorawan INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/hal/esp32_gpio.c
     ${CMAKE_CURRENT_LIST_DIR}/hal/esp32_spi.c

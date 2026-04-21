@@ -32,12 +32,13 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 
 ## Phase 3 — ESP32 HAL (Sessions 4–6)
 
-### Session 4: Core HAL
+### Session 4: Core HAL ✓
 
-- [ ] Implement `hal/esp32_gpio.c` — GpioInit, GpioSetInterrupt, GpioRemoveInterrupt, GpioWrite, GpioRead (using ESP-IDF gpio driver)
-- [ ] Implement `hal/esp32_spi.c` — SpiInit, SpiDeInit, SpiInOut (using ESP-IDF spi_master, SPI3_HOST, 10MHz)
-- [ ] Implement `hal/esp32_timer.c` — TimerInit, TimerStart, TimerStop, TimerSetValue, TimerGetCurrentTime, TimerGetElapsedTime (using esp_timer)
-- [ ] Implement `hal/esp32_delay.c` — DelayMs (vTaskDelay for >10ms, ets_delay_us for short delays)
+- [x] Implement `hal/esp32_gpio.c` — GpioInit, GpioSetInterrupt, GpioRemoveInterrupt, GpioWrite, GpioRead (using ESP-IDF gpio driver)
+- [x] Implement `hal/esp32_spi.c` — SpiInit, SpiDeInit, SpiInOut (using ESP-IDF spi_master, SPI3_HOST, 10MHz, software CS)
+- [x] Implement `hal/esp32_timer.c` — TimerInit, TimerStart, TimerStop, TimerSetValue, TimerGetCurrentTime, TimerGetElapsedTime (one esp_timer + sorted linked list, ESP_TIMER_TASK dispatch)
+- [x] Implement `hal/esp32_delay.c` — DelayMs (vTaskDelay for >10ms, esp_rom_delay_us for short delays)
+- [x] Compile clean — zero errors, zero warnings; firmware 1565 KB (no size regression)
 
 ### Session 5: Board and Radio HAL
 
