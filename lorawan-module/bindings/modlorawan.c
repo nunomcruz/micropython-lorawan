@@ -177,6 +177,7 @@ static IRAM_ATTR void on_mac_process_notify(void) {
 
 static void lorawan_task(void *arg) {
     (void)arg;
+    esp_rom_printf("lorawan: task started (stack=%u)\n", LORAWAN_TASK_STACK);
 
     MibRequestConfirm_t mib;
     McpsReq_t           mcps;
@@ -421,8 +422,10 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     s_rx_queue  = xQueueCreate(LORAWAN_RX_QSIZE,  sizeof(lorawan_rx_pkt_t));
     s_events    = xEventGroupCreate();
 
+    // ESP-IDF v5+ uses BYTES for usStackDepth (differs from vanilla FreeRTOS).
+    // Do NOT divide by sizeof(StackType_t) here.
     BaseType_t task_ok = xTaskCreatePinnedToCore(lorawan_task, "lorawan",
-                            LORAWAN_TASK_STACK / sizeof(StackType_t),
+                            LORAWAN_TASK_STACK,
                             NULL, LORAWAN_TASK_PRIO,
                             &s_task_handle, 1);
     if (task_ok != pdPASS) {
