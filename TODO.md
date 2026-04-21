@@ -9,14 +9,14 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Test USER_C_MODULE example: compiled with `cexample` + `cppexample` (usermod_cexample, usermod_cppexample confirmed by build); flash/REPL test requires hardware
 - [x] Confirm loramac-node v4.7.0 is cloned and directory structure understood
 
-## Phase 1 — T-Beam Board Definition (Session 2)
+## Phase 1 — T-Beam Board Definition (Session 2) ✓
 
-- [ ] Create `ports/esp32/boards/LILYGO_TTGO_TBEAM/` using LORA32 as template
-- [ ] Create `mpconfigboard.h`, `mpconfigboard.cmake`, `board.json`, `board.md`
-- [ ] Create `sdkconfig.board` with SPIRAM and partition config
-- [ ] Create `manifest.py` — freeze both lora-sx127x and lora-sx126x drivers plus tbeam.py
-- [ ] Create `modules/tbeam.py` — HardwareInfo class, _detect_radio(), _detect_pmu(), _detect_gps_pins(), _detect_oled()
-- [ ] Compile LILYGO_TTGO_TBEAM board
+- [x] Create `ports/esp32/boards/LILYGO_TTGO_TBEAM/` using LORA32 as template
+- [x] Create `mpconfigboard.h`, `mpconfigboard.cmake`, `board.json`, `board.md`
+- [x] Create `sdkconfig.board` with SPIRAM and partition config
+- [x] Create `manifest.py` — freeze both lora-sx127x and lora-sx126x drivers plus tbeam.py
+- [x] Create `modules/tbeam.py` — HardwareInfo class, _detect_radio(), _detect_pmu(), _detect_gps_pins(), _detect_oled()
+- [x] Compile LILYGO_TTGO_TBEAM board (1565KB, 23% of 4MB partition used; all lora drivers + tbeam.py frozen)
 - [ ] Flash and test `tbeam.detect()` on at least one T-Beam (SX1276)
 - [ ] Test raw LoRa TX/RX with existing Python driver via tbeam.lora_spi() / tbeam.lora_pins()
 

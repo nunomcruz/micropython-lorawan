@@ -1,0 +1,7 @@
+include("$(PORT_DIR)/boards/manifest.py")
+require("lora")
+require("lora-sx127x")
+require("lora-sx126x")
+require("lora-sync")
+require("lora-async")
+freeze("modules")

@@ -1,0 +1,9 @@
+# T-Beam uses standard 40MHz crystal oscillator
+CONFIG_XTAL_FREQ_40=y
+
+# QIO flash mode and 80MHz frequency for 4MB flash
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# Hostname shown on the network
+CONFIG_LWIP_LOCAL_HOSTNAME="mpy-tbeam"

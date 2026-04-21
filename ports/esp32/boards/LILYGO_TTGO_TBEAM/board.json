@@ -1,0 +1,22 @@
+{
+    "deploy": [
+        "../deploy.md"
+    ],
+    "deploy_options": {
+        "flash_offset": "0x1000"
+    },
+    "docs": "",
+    "features": [
+        "BLE",
+        "GPS",
+        "LoRa",
+        "SPIRAM",
+        "WiFi"
+    ],
+    "images": [],
+    "mcu": "esp32",
+    "product": "TTGO T-Beam",
+    "thumbnail": "",
+    "url": "https://www.lilygo.cc/products/t-beam",
+    "vendor": "LILYGO"
+}
