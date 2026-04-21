@@ -70,10 +70,12 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Compile clean — zero errors, 1612 KB firmware; module constants EU868, CLASS_A/B/C exported
 - [x] Fix three `portTICK_PERIOD_MS` integer-division bugs (2/10=0, 10000/10=1000 ticks): replaced with `pdMS_TO_TICKS()`
 - [x] Guard `LoRaMacProcess()` with `s_mac_initialized` flag — must not call before `LoRaMacInitialization()`
-- [x] Increase LoRaWAN task stack from 4 KB to 8 KB (RxChainCalibration call chain is deep)
 - [x] Fix GIL deadlock: `mp_printf` from LoRaWAN task blocks on `MP_THREAD_GIL_ENTER()` — Python thread holds GIL while sleeping in `xEventGroupWaitBits`. Replaced with `esp_rom_printf` (ROM UART, no locking) throughout the task.
-- [x] Add diagnostic prints around `LoRaMacInitialization()` to identify any remaining hang
-- [ ] Test: ABP uplink appears on TTN console with correct payload  ← needs hardware
+- [x] Fix task stack: ESP-IDF v5+ `xTaskCreatePinnedToCore` uses BYTES not words — was passing `8192/sizeof(StackType_t)=2048` bytes; now passes 8192 bytes directly. Silent overflow masked by busy-spin (canary never checked).
+- [x] Fix busy-spin deadlock: `pdMS_TO_TICKS(10)` = 1 tick on 100 Hz — `pdMS_TO_TICKS(2)=0` caused non-blocking `ulTaskNotifyTake` which acquired `xKernelLock` at MHz rate, starving CPU0's `xQueueSend`.
+- [x] Add `datarate` kwarg to `send()` — DR_0..DR_5 constants exported; default DR_0 (SF12) for maximum uplink range
+- [x] Test: LoRaMacInitialization ✓, ABP join ✓, send() TX confirmed ✓ — packet transmitted on hardware
+- [ ] Test: ABP uplink appears on TTN console with correct payload  ← verify with SF12 if SF7 misses
 
 ### Session 8: OTAA Join
 

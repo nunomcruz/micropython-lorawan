@@ -65,6 +65,7 @@ typedef struct {
     uint8_t  data[LW_PAYLOAD_MAX];
     uint8_t  len;
     uint8_t  port;
+    uint8_t  datarate;
     bool     confirmed;
 } cmd_tx_t;
 
@@ -177,18 +178,17 @@ static IRAM_ATTR void on_mac_process_notify(void) {
 
 static void lorawan_task(void *arg) {
     (void)arg;
-    esp_rom_printf("lorawan: task started (stack=%u)\n", LORAWAN_TASK_STACK);
 
     MibRequestConfirm_t mib;
     McpsReq_t           mcps;
     lorawan_cmd_data_t  cmd;
 
     for (;;) {
-        // Sleep until MacProcessNotify wakes us, or 2 ms passes.
-        // pdMS_TO_TICKS(2) is correct on any tick rate; the old form
-        // 2/portTICK_PERIOD_MS = 0 on a 100 Hz (10 ms) tick system,
-        // which turned this into a busy-spin.
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
+        // Sleep until MacProcessNotify wakes us or a command arrives.
+        // pdMS_TO_TICKS(2) = 0 on 100 Hz → non-blocking poll causing extreme
+        // kernel-lock contention that starves CPU0's xQueueSend.
+        // 10 ms = 1 tick on 100 Hz: task actually sleeps and yields CPU1.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
 
         // Guard: LoRaMacProcess() must not be called before the MAC stack is
         // initialised.  The CMD_INIT handler sets s_mac_initialized after
@@ -326,13 +326,13 @@ static void lorawan_task(void *arg) {
                     mcps.Req.Confirmed.fPort       = cmd.tx.port;
                     mcps.Req.Confirmed.fBuffer     = cmd.tx.data;
                     mcps.Req.Confirmed.fBufferSize = cmd.tx.len;
-                    mcps.Req.Confirmed.Datarate    = DR_5;
+                    mcps.Req.Confirmed.Datarate    = cmd.tx.datarate;
                 } else {
                     mcps.Type = MCPS_UNCONFIRMED;
                     mcps.Req.Unconfirmed.fPort       = cmd.tx.port;
                     mcps.Req.Unconfirmed.fBuffer     = cmd.tx.data;
                     mcps.Req.Unconfirmed.fBufferSize = cmd.tx.len;
-                    mcps.Req.Unconfirmed.Datarate    = DR_5;
+                    mcps.Req.Unconfirmed.Datarate    = cmd.tx.datarate;
                 }
 
                 LoRaMacStatus_t st = LoRaMacMcpsRequest(&mcps);
@@ -492,11 +492,13 @@ static mp_obj_t lorawan_send(size_t n_args, const mp_obj_t *pos_args,
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not joined"));
     }
 
-    enum { ARG_data, ARG_port, ARG_confirmed };
+    enum { ARG_data, ARG_port, ARG_confirmed, ARG_datarate };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_data,      MP_ARG_REQUIRED | MP_ARG_OBJ },
         { MP_QSTR_port,      MP_ARG_KW_ONLY  | MP_ARG_INT,  {.u_int  = 1} },
         { MP_QSTR_confirmed, MP_ARG_KW_ONLY  | MP_ARG_BOOL, {.u_bool = false} },
+        // DR_0=SF12 .. DR_5=SF7; default DR_0 for maximum range on first uplinks
+        { MP_QSTR_datarate,  MP_ARG_KW_ONLY  | MP_ARG_INT,  {.u_int  = DR_0} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
@@ -510,10 +512,11 @@ static mp_obj_t lorawan_send(size_t n_args, const mp_obj_t *pos_args,
     }
 
     lorawan_cmd_data_t cmd;
-    cmd.cmd          = CMD_TX;
-    cmd.tx.len       = (uint8_t)buf.len;
-    cmd.tx.port      = (uint8_t)args[ARG_port].u_int;
-    cmd.tx.confirmed = args[ARG_confirmed].u_bool;
+    cmd.cmd           = CMD_TX;
+    cmd.tx.len        = (uint8_t)buf.len;
+    cmd.tx.port       = (uint8_t)args[ARG_port].u_int;
+    cmd.tx.confirmed  = args[ARG_confirmed].u_bool;
+    cmd.tx.datarate   = (uint8_t)args[ARG_datarate].u_int;
     memcpy(cmd.tx.data, buf.buf, buf.len);
 
     xEventGroupClearBits(s_events, EVT_TX_DONE | EVT_TX_ERROR);
@@ -639,6 +642,13 @@ static const mp_rom_map_elem_t lorawan_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_CLASS_A),   MP_ROM_INT(CLASS_A) },
     { MP_ROM_QSTR(MP_QSTR_CLASS_B),   MP_ROM_INT(CLASS_B) },
     { MP_ROM_QSTR(MP_QSTR_CLASS_C),   MP_ROM_INT(CLASS_C) },
+    // Data rate constants (EU868): DR_0=SF12 .. DR_5=SF7
+    { MP_ROM_QSTR(MP_QSTR_DR_0),      MP_ROM_INT(DR_0) },
+    { MP_ROM_QSTR(MP_QSTR_DR_1),      MP_ROM_INT(DR_1) },
+    { MP_ROM_QSTR(MP_QSTR_DR_2),      MP_ROM_INT(DR_2) },
+    { MP_ROM_QSTR(MP_QSTR_DR_3),      MP_ROM_INT(DR_3) },
+    { MP_ROM_QSTR(MP_QSTR_DR_4),      MP_ROM_INT(DR_4) },
+    { MP_ROM_QSTR(MP_QSTR_DR_5),      MP_ROM_INT(DR_5) },
 };
 static MP_DEFINE_CONST_DICT(lorawan_module_globals, lorawan_module_globals_table);
 
