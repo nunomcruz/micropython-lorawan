@@ -27,6 +27,11 @@ LED      = 4       # Status LED (may not exist on v0.7)
 _PINS_SX1276 = {"irq": 26, "busy": None}   # DIO0 = GPIO26
 _PINS_SX1262 = {"irq": 33, "busy": 32}     # DIO1 = GPIO33, BUSY = GPIO32
 
+# T-Beam SX1262 uses a TCXO on DIO3 at 1.8V.
+# Without this the radio raises XOSC_START_ERR (0x20) on first configure().
+# Source: Meshtastic variant.h SX126X_DIO3_TCXO_VOLTAGE = 1.8
+SX1262_TCXO_MV = 1800
+
 # GPS UART pins differ by board revision
 # v1.0+: ESP32 RX=34 (input-only GPIO, ideal for RX), TX=12
 # v0.7:  ESP32 RX=12, TX=15
@@ -156,6 +161,27 @@ def lora_pins(hw_info=None):
     if hw_info.busy_pin is not None:
         return cs, irq, rst, Pin(hw_info.busy_pin, Pin.IN)
     return cs, irq, rst
+
+
+def lora_modem(hw_info=None, lora_cfg=None):
+    """Construct and return the correct lora driver for detected hardware.
+
+    Returns a SyncModem-based instance (SX1276 or SX1262) ready to configure().
+    Handles SX1262 TCXO initialisation automatically.
+    """
+    if hw_info is None:
+        hw_info = detect()
+    spi = lora_spi()
+    if hw_info.radio == "sx1276":
+        from lora import sx127x
+        cs, irq, rst = lora_pins(hw_info)
+        return sx127x.SX1276(spi, cs=cs, dio0=irq, reset=rst, lora_cfg=lora_cfg)
+    else:
+        from lora import sx126x
+        cs, irq, rst, busy = lora_pins(hw_info)
+        return sx126x.SX1262(spi, cs=cs, dio1=irq, reset=rst, busy=busy,
+                              dio3_tcxo_millivolts=SX1262_TCXO_MV,
+                              lora_cfg=lora_cfg)
 
 
 def gps_uart(hw_info=None, baudrate=9600):
