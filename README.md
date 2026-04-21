@@ -30,7 +30,7 @@ make -C mpy-cross
 cd ports/esp32
 make submodules
 make BOARD=LILYGO_TTGO_TBEAM \
-     USER_C_MODULES=/path/to/lorawan-module/micropython.cmake
+     USER_C_MODULES=$(pwd)/../../lorawan-module/micropython.cmake
 ```
 
 ## Usage example
@@ -72,7 +72,7 @@ This is a work in progress. See [TODO.md](TODO.md) for the development roadmap a
 
 ## Architecture
 
-The LoRaWAN module lives outside the MicroPython tree in `lorawan-module/` and is compiled via `USER_C_MODULES`. It includes:
+The LoRaWAN module lives in `lorawan-module/` (inside this repo) and is compiled via `USER_C_MODULES`. It includes:
 
 - ESP32 HAL layer (GPIO, SPI, Timer, Delay) using ESP-IDF APIs
 - LoRaMAC-node v4.7.0 MAC stack (copied, not a submodule)

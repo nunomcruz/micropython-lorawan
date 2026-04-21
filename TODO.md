@@ -20,15 +20,15 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Flash and test `tbeam.detect()` on T-Beam v1.1 SX1262/AXP192: radio=sx1262, pmu=axp192, irq=33, busy=32, gps_rx=34, gps_tx=12
 - [x] Test raw LoRa TX via tbeam.lora_modem(): SF7/125kHz/14dBm on 868.1MHz, TX done confirmed
 
-## Phase 2 — USER_C_MODULE Skeleton (Session 3)
+## Phase 2 — USER_C_MODULE Skeleton (Session 3) ✓
 
-- [ ] Create `lorawan-module/` directory structure (hal/, bindings/, config/, loramac-node/)
-- [ ] Copy required LoRaMAC-node sources: src/mac/, src/radio/sx1276/, src/radio/sx126x/, src/radio/radio.h, src/peripherals/soft-se/, src/boards/utilities.h
-- [ ] Create `micropython.cmake` with INTERFACE library pattern, all source files and include paths
-- [ ] Create `modlorawan.c` skeleton — version() function, MP_REGISTER_MODULE
-- [ ] Create `lorawan_config.h` — pin defines, region defines, radio selection
-- [ ] Create HAL stub files (empty .c with correct headers)
-- [ ] Compile with USER_C_MODULES and verify `import lorawan; lorawan.version()` works
+- [x] Create `lorawan-module/` directory structure (hal/, bindings/, config/, loramac-node/)
+- [x] Copy required LoRaMAC-node sources: src/mac/, src/radio/sx1276/, src/radio/sx126x/, src/radio/radio.h, src/peripherals/soft-se/, src/boards/utilities.h
+- [x] Create `micropython.cmake` with INTERFACE library pattern, all source files and include paths
+- [x] Create `modlorawan.c` skeleton — version() function, MP_REGISTER_MODULE
+- [x] Create `lorawan_config.h` — pin defines, region defines, radio selection
+- [x] Create HAL stub files (empty .c with correct headers)
+- [x] Compile with USER_C_MODULES — build succeeded (1565KB, no errors); flash/REPL test requires hardware
 
 ## Phase 3 — ESP32 HAL (Sessions 4–6)
 
