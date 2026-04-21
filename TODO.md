@@ -49,8 +49,9 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 
 ### Session 6: Integration and Test ✓
 
-- [x] Implement runtime radio selection: Radio_SX1276 table in sx1276_board.c; radio_select.c owns the mutable Radio global; lorawan_radio_select(bool) selects at init. SX126x table placeholder deferred to Phase 4 (sx126x/radio.c conflicts with sx1276.c on TxTimeoutTimer/FskBandwidths — LoRaMAC-node was not designed for dual-radio linking).
-- [x] Compile full HAL — zero errors, zero warnings; firmware 1537 KB (8 KB growth from new HAL code)
+- [x] Implement runtime radio selection: Radio_SX1276 and Radio_SX126x tables; radio_select.c owns writable Radio global; lorawan_radio_select(bool) copies the right table at init
+- [x] Fix dual-radio symbol collision: hal/sx1276_radio_wrapper.c and hal/sx126x_radio_wrapper.c rename TxTimeoutTimer/RxTimeoutTimer/FskBandwidths/Radio via #define before #including originals — no modifications to loramac-node/ sources
+- [x] Compile full HAL + both radio drivers — zero errors, zero warnings; firmware 1579 KB (both Radio tables now fully linked)
 - [ ] Test SPI: read register 0x42 on SX1276 board, must return 0x12  ← needs hardware
 - [ ] Test timer accuracy: 200ms timer callback, verify fires within 500ms  ← needs hardware
 - [ ] Test on SX1262 board if available: BUSY pin reads, command interface  ← needs hardware

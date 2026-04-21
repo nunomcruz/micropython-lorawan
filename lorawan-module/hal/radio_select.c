@@ -9,14 +9,9 @@
 
 #include "radio_select.h"
 
-// SX1276 Radio function-pointer table — defined in hal/sx1276_board.c.
-extern const struct Radio_s Radio_SX1276;
-
-// SX126x Radio function-pointer table (Phase 4).
-// sx126x/radio.c shares global symbol names with sx1276.c and cannot be
-// linked in the same binary without namespace isolation.  Phase 4 will add
-// a proper SX126x Radio table once the MAC layer is wired up.
-static const struct Radio_s s_radio_sx126x_placeholder;  // all-zero / NULL ptrs
+// Radio function-pointer tables — defined in the namespace wrapper TUs.
+extern const struct Radio_s Radio_SX1276;   // hal/sx1276_radio_wrapper.c
+extern const struct Radio_s Radio_SX126x;   // hal/sx126x_radio_wrapper.c
 
 // The Radio symbol used by LoRaMAC-node.  Declared as "extern const" in
 // radio.h to protect other TUs from writing it; this definition is the
@@ -27,7 +22,6 @@ void lorawan_radio_select(bool is_sx1276) {
     if (is_sx1276) {
         Radio = Radio_SX1276;
     } else {
-        // Phase 4: replace with real SX126x Radio table
-        Radio = s_radio_sx126x_placeholder;
+        Radio = Radio_SX126x;
     }
 }

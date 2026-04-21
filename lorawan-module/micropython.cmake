@@ -47,14 +47,14 @@ target_sources(usermod_lorawan INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/mac/region/RegionEU868.c
 )
 
-# Radio core drivers (both included for HAL; runtime selection via Radio ptr).
-# sx126x/radio.c (the Radio_s function-pointer table for SX126x) is NOT compiled
-# here — it shares global names (TxTimeoutTimer, FskBandwidths, …) with sx1276.c
-# and LoRaMAC-node was not designed to link both simultaneously.  The SX126x
-# Radio table will be wired up in Phase 4 when MAC integration begins.
+# Radio core drivers — both included via namespace wrappers.
+# sx1276.c and sx126x/radio.c share global names (TxTimeoutTimer,
+# RxTimeoutTimer, FskBandwidths, Radio).  The wrapper files rename those
+# symbols before including the originals so both can link in one binary.
+# Originals in loramac-node/ are NOT modified.
 target_sources(usermod_lorawan INTERFACE
-    ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/radio/sx1276/sx1276.c
-    ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/radio/sx126x/sx126x.c
+    ${CMAKE_CURRENT_LIST_DIR}/hal/sx1276_radio_wrapper.c
+    ${CMAKE_CURRENT_LIST_DIR}/hal/sx126x_radio_wrapper.c
 )
 
 # Soft secure element (AES-128, CMAC, key management)
