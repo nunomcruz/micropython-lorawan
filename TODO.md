@@ -2,12 +2,12 @@
 
 Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more Claude Code sessions.
 
-## Phase 0 — Environment Setup (Session 1)
+## Phase 0 — Environment Setup (Session 1) ✓
 
-- [ ] Verify MicroPython compiles for ESP32_GENERIC (`make -C mpy-cross && cd ports/esp32 && make submodules && make BOARD=ESP32_GENERIC`)
-- [ ] Verify LILYGO_TTGO_LORA32 board compiles (`make BOARD=LILYGO_TTGO_LORA32`)
-- [ ] Test USER_C_MODULE example: compile with `cexample`, flash, run `import cexample; cexample.add_ints(1, 2)` in REPL
-- [ ] Confirm loramac-node v4.7.0 is cloned and directory structure understood
+- [x] Verify MicroPython compiles for ESP32_GENERIC (`make -C mpy-cross && cd ports/esp32 && make submodules && make BOARD=ESP32_GENERIC`)
+- [x] Verify LILYGO_TTGO_LORA32 board compiles (`make BOARD=LILYGO_TTGO_LORA32`)
+- [x] Test USER_C_MODULE example: compiled with `cexample` + `cppexample` (usermod_cexample, usermod_cppexample confirmed by build); flash/REPL test requires hardware
+- [x] Confirm loramac-node v4.7.0 is cloned and directory structure understood
 
 ## Phase 1 — T-Beam Board Definition (Session 2)
 
