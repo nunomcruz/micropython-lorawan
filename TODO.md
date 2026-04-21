@@ -58,16 +58,17 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 
 ## Phase 4 — Python Bindings (Sessions 7–10)
 
-### Session 7: ABP Join + Send (first uplink!)
+### Session 7: ABP Join + Send (first uplink!) ✓
 
-- [ ] Implement lorawan_obj_t struct in modlorawan.c
-- [ ] Implement LoRaWAN.__init__ (radio detection, MAC init, pin config)
-- [ ] Implement join_abp() — configure DevAddr, NwkSKey, AppSKey
-- [ ] Implement send() — uplink to TTN
-- [ ] Create dedicated FreeRTOS task for LoRaWAN processing
-- [ ] **CRITICAL**: Set TCXO register to 0x09 (crystal, not TCXO) for T-Beam
-- [ ] **CRITICAL**: Set EU868_RX_WND_2_DR to DR_3 for TTN
-- [ ] Test: ABP uplink appears on TTN console with correct payload
+- [x] Implement lorawan_obj_t struct in modlorawan.c
+- [x] Implement LoRaWAN.__init__ (radio detection via reg 0x42, MAC init, FreeRTOS task)
+- [x] Implement join_abp() — configure DevAddr, NwkSKey (all 3 LoRaWAN 1.1 slots), AppSKey
+- [x] Implement send() — blocks up to 10 s waiting for McpsConfirm
+- [x] Dedicated FreeRTOS task (lorawan_task, CPU1, priority 6) with cmd queue + event group
+- [x] **CRITICAL**: EU868 RX2 set to 869.525 MHz / DR3 (SF9/BW125) for TTN — both MIB_RX2_CHANNEL and MIB_RX2_DEFAULT_CHANNEL
+- [x] TCXO: handled at radio HAL level (SX1276: crystal 0x09 from CLAUDE.md; SX1262: DIO3→1.8V from Session 5)
+- [x] Compile clean — zero errors, 1575 KB firmware; module constants EU868, CLASS_A/B/C exported
+- [ ] Test: ABP uplink appears on TTN console with correct payload  ← needs hardware
 
 ### Session 8: OTAA Join
 
