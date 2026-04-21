@@ -54,6 +54,18 @@ lw.send(b"\x01\x02\x03", port=10)
 data, port, rssi, snr = lw.recv(timeout=10)
 ```
 
+## Hardware findings (confirmed on device)
+
+Discovered during Phase 1 testing on a T-Beam v1.1 SX1262/AXP192. Relevant for the Phase 3 C HAL.
+
+**SX1262 TCXO (DIO3, 1.8V).** The T-Beam SX1262 uses an internal TCXO powered via DIO3. The driver must call `SetDIO3AsTCXOCtrl` at 1.8V before any calibration or RF operation. Without it the radio raises `XOSC_START_ERR (0x20)` on first use. In Python: `dio3_tcxo_millivolts=1800`. In C HAL: `SX126xSetDio3AsTcxoCtrl(TCXO_CTRL_1_8V, ...)` as the first call in `SX126xIoInit()`.
+
+**SX1262 DIO2 as RF switch.** DIO2 controls the TX/RX antenna switch. Must enable with `SX126xSetDio2AsRfSwitchCtrl(true)`.
+
+**SPI bus ownership.** The SPI bus must be owned exclusively by one driver. Mixing a Python `machine.SPI(1)` object with a second driver instance on the same bus causes RC13M + ADC calibration failures (`OpError 0xa00`). The `tbeam.lora_modem()` helper is the correct single entry point — do not create a `SPI(1)` manually before calling it.
+
+**SX1276 uses a crystal, not TCXO.** `REG_LR_TCXO = 0x09` (crystal mode). Setting 0x19 (TCXO mode) silences the radio.
+
 ## Project status
 
 This is a work in progress. See [TODO.md](TODO.md) for the development roadmap and [CLAUDE.md](CLAUDE.md) for detailed project context.
