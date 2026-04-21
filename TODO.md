@@ -67,7 +67,11 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Dedicated FreeRTOS task (lorawan_task, CPU1, priority 6) with cmd queue + event group
 - [x] **CRITICAL**: EU868 RX2 set to 869.525 MHz / DR3 (SF9/BW125) for TTN — both MIB_RX2_CHANNEL and MIB_RX2_DEFAULT_CHANNEL
 - [x] TCXO: handled at radio HAL level (SX1276: crystal 0x09 from CLAUDE.md; SX1262: DIO3→1.8V from Session 5)
-- [x] Compile clean — zero errors, 1575 KB firmware; module constants EU868, CLASS_A/B/C exported
+- [x] Compile clean — zero errors, 1612 KB firmware; module constants EU868, CLASS_A/B/C exported
+- [x] Fix three `portTICK_PERIOD_MS` integer-division bugs (2/10=0, 10000/10=1000 ticks): replaced with `pdMS_TO_TICKS()`
+- [x] Guard `LoRaMacProcess()` with `s_mac_initialized` flag — must not call before `LoRaMacInitialization()`
+- [x] Increase LoRaWAN task stack from 4 KB to 8 KB (RxChainCalibration call chain is deep)
+- [x] Add diagnostic prints around `LoRaMacInitialization()` to identify any remaining hang
 - [ ] Test: ABP uplink appears on TTN console with correct payload  ← needs hardware
 
 ### Session 8: OTAA Join

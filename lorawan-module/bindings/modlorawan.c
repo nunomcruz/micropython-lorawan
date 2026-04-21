@@ -30,7 +30,9 @@
 
 // ---- Constants ----
 
-#define LORAWAN_TASK_STACK  4096
+// 8 KB: LoRaMacInitialization() → SX1276Init() → RxChainCalibration() is a
+// deep call chain; 4 KB was tight with the 222-byte payload on the stack.
+#define LORAWAN_TASK_STACK  8192
 #define LORAWAN_TASK_PRIO   6
 #define LORAWAN_CMD_QSIZE   8
 #define LORAWAN_RX_QSIZE    4
@@ -113,7 +115,8 @@ static TaskHandle_t       s_task_handle;
 static LoRaMacPrimitives_t s_mac_primitives;
 static LoRaMacCallback_t   s_mac_callbacks;
 
-static lorawan_obj_t *s_lora_obj;  // weak ref — valid while the object lives
+static lorawan_obj_t *s_lora_obj;       // weak ref — valid while the object lives
+static volatile bool  s_mac_initialized; // set true after LoRaMacInitialization() succeeds
 
 // ---- LoRaMAC MAC-layer callbacks (run in the LoRaWAN task context) ----
 
@@ -179,10 +182,18 @@ static void lorawan_task(void *arg) {
     lorawan_cmd_data_t  cmd;
 
     for (;;) {
-        // Sleep until MacProcessNotify wakes us, or 2 ms passes
-        ulTaskNotifyTake(pdTRUE, 2 / portTICK_PERIOD_MS);
+        // Sleep until MacProcessNotify wakes us, or 2 ms passes.
+        // pdMS_TO_TICKS(2) is correct on any tick rate; the old form
+        // 2/portTICK_PERIOD_MS = 0 on a 100 Hz (10 ms) tick system,
+        // which turned this into a busy-spin.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
 
-        LoRaMacProcess();
+        // Guard: LoRaMacProcess() must not be called before the MAC stack is
+        // initialised.  The CMD_INIT handler sets s_mac_initialized after
+        // LoRaMacInitialization() + LoRaMacStart() succeed.
+        if (s_mac_initialized) {
+            LoRaMacProcess();
+        }
 
         while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
             switch (cmd.cmd) {
@@ -204,12 +215,12 @@ static void lorawan_task(void *arg) {
                 LoRaMacRegion_t region =
                     s_lora_obj ? s_lora_obj->region : LORAMAC_REGION_EU868;
 
+                mp_printf(&mp_plat_print, "lorawan: LoRaMacInitialization start\n");
                 LoRaMacStatus_t st =
                     LoRaMacInitialization(&s_mac_primitives, &s_mac_callbacks, region);
+                mp_printf(&mp_plat_print, "lorawan: LoRaMacInitialization returned %d\n", (int)st);
 
                 if (st != LORAMAC_STATUS_OK) {
-                    mp_printf(&mp_plat_print,
-                              "lorawan: LoRaMacInitialization failed: %d\n", (int)st);
                     xEventGroupSetBits(s_events, EVT_INIT_ERROR);
                     break;
                 }
@@ -245,7 +256,9 @@ static void lorawan_task(void *arg) {
                 mib.Param.Rx2DefaultChannel.Datarate  = DR_3;
                 LoRaMacMibSetRequestConfirm(&mib);
 
+                s_mac_initialized = true;
                 if (s_lora_obj) s_lora_obj->initialized = true;
+                mp_printf(&mp_plat_print, "lorawan: init done\n");
                 xEventGroupSetBits(s_events, EVT_COMPLETED);
                 break;
             }
@@ -501,7 +514,7 @@ static mp_obj_t lorawan_send(size_t n_args, const mp_obj_t *pos_args,
     EventBits_t bits = xEventGroupWaitBits(s_events,
                                            EVT_TX_DONE | EVT_TX_ERROR,
                                            pdTRUE, pdFALSE,
-                                           10000 / portTICK_PERIOD_MS);
+                                           pdMS_TO_TICKS(10000));
 
     if (bits & EVT_TX_ERROR) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("send failed"));
@@ -586,7 +599,7 @@ static mp_obj_t lorawan_test_hal(void) {
 
     int64_t deadline = esp_timer_get_time() + 500000LL;
     while (!s_test_timer_fired && esp_timer_get_time() < deadline) {
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
     bool timer_ok = s_test_timer_fired;
 
