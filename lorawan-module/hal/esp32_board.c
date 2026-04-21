@@ -91,6 +91,12 @@ uint8_t GetBoardPowerSource(void)
     return USB_POWER;
 }
 
+Version_t BoardGetVersion(void)
+{
+    Version_t v = { .Value = 0x01000000 };  // v1.0.0.0
+    return v;
+}
+
 void BoardCriticalSectionBegin(uint32_t *mask)
 {
     (void)mask;

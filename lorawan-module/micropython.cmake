@@ -13,7 +13,7 @@ target_sources(usermod_lorawan INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/bindings/modlorawan.c
 )
 
-# ESP32 HAL (implemented in Phase 3, Session 4)
+# ESP32 HAL (implemented in Phase 3, Sessions 4–6)
 target_sources(usermod_lorawan INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/hal/esp32_gpio.c
     ${CMAKE_CURRENT_LIST_DIR}/hal/esp32_spi.c
@@ -22,6 +22,7 @@ target_sources(usermod_lorawan INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/hal/esp32_board.c
     ${CMAKE_CURRENT_LIST_DIR}/hal/sx1276_board.c
     ${CMAKE_CURRENT_LIST_DIR}/hal/sx126x_board.c
+    ${CMAKE_CURRENT_LIST_DIR}/hal/radio_select.c
 )
 
 # LoRaMAC-node utility and system functions
@@ -46,7 +47,11 @@ target_sources(usermod_lorawan INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/mac/region/RegionEU868.c
 )
 
-# Radio drivers (both included; runtime selection via Radio function pointer)
+# Radio core drivers (both included for HAL; runtime selection via Radio ptr).
+# sx126x/radio.c (the Radio_s function-pointer table for SX126x) is NOT compiled
+# here — it shares global names (TxTimeoutTimer, FskBandwidths, …) with sx1276.c
+# and LoRaMAC-node was not designed to link both simultaneously.  The SX126x
+# Radio table will be wired up in Phase 4 when MAC integration begins.
 target_sources(usermod_lorawan INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/radio/sx1276/sx1276.c
     ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/radio/sx126x/sx126x.c

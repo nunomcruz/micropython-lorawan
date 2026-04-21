@@ -8,6 +8,7 @@
 
 #include "sx1276/sx1276.h"
 #include "sx1276-board.h"
+#include "radio.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -152,3 +153,36 @@ uint32_t SX1276GetDio1PinState(void)
 
 void SX1276DbgPinTxWrite(uint8_t state) { (void)state; }
 void SX1276DbgPinRxWrite(uint8_t state) { (void)state; }
+
+// Radio function-pointer table for LoRaMAC-node.  Named Radio_SX1276 so the
+// linker-visible Radio symbol remains in hal/radio_select.c (writable, needed
+// for runtime radio selection).
+const struct Radio_s Radio_SX1276 = {
+    SX1276Init,
+    SX1276GetStatus,
+    SX1276SetModem,
+    SX1276SetChannel,
+    SX1276IsChannelFree,
+    SX1276Random,
+    SX1276SetRxConfig,
+    SX1276SetTxConfig,
+    SX1276CheckRfFrequency,       // board-supplied: hal/sx1276_board.c
+    SX1276GetTimeOnAir,
+    SX1276Send,
+    SX1276SetSleep,
+    SX1276SetStby,
+    SX1276SetRx,
+    SX1276StartCad,
+    SX1276SetTxContinuousWave,
+    SX1276ReadRssi,
+    SX1276Write,
+    SX1276Read,
+    SX1276WriteBuffer,
+    SX1276ReadBuffer,
+    SX1276SetMaxPayloadLength,
+    SX1276SetPublicNetwork,
+    SX1276GetWakeupTime,
+    NULL,  // IrqProcess — SX1276 uses hardware DIO interrupts, no polling
+    NULL,  // RxBoosted  — SX126x only
+    NULL,  // SetRxDutyCycle — SX126x only
+};
