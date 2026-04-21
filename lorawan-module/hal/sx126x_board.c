@@ -1,121 +1,248 @@
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
+
+#include "gpio.h"
+#include "spi.h"
+#include "delay.h"
+#include "lorawan_config.h"
+
 #include "sx126x/sx126x.h"
 #include "sx126x-board.h"
 
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+// Current operating mode — written by driver, read back in board callbacks
 static RadioOperatingModes_t operating_mode = MODE_STDBY_RC;
+
+// TCXO startup time in SX126x timer units (15.625 µs each).
+// 5 ms / 15.625 µs = 320 ticks — enough for the T-Beam 26 MHz TCXO.
+#define TCXO_TIMEOUT_TICKS  320U
+
+// WaitOnBusy hard timeout in microseconds (10 ms)
+#define BUSY_TIMEOUT_US     10000LL
+
+static inline void nss_low(void)  { GpioWrite(&SX126x.Spi.Nss, 0); }
+static inline void nss_high(void) { GpioWrite(&SX126x.Spi.Nss, 1); }
 
 void SX126xIoInit(void)
 {
+    // NSS: output, start high (deasserted)
+    GpioInit(&SX126x.Spi.Nss, (PinNames)RADIO_NSS_PIN,
+             PIN_OUTPUT, PIN_PUSH_PULL, PIN_NO_PULL, 1);
+
+    // Reset: output, start high
+    GpioInit(&SX126x.Reset, (PinNames)RADIO_RESET_PIN,
+             PIN_OUTPUT, PIN_PUSH_PULL, PIN_NO_PULL, 1);
+
+    // BUSY: input, no pull
+    GpioInit(&SX126x.BUSY, (PinNames)RADIO_BUSY_PIN,
+             PIN_INPUT, PIN_PUSH_PULL, PIN_NO_PULL, 0);
+
+    // DIO1: input, no pull — main interrupt (TX done, RX done, timeout, …)
+    GpioInit(&SX126x.DIO1, (PinNames)RADIO_DIO1_PIN,
+             PIN_INPUT, PIN_PUSH_PULL, PIN_NO_PULL, 0);
+
+    // Initialise SPI bus (MOSI=27, MISO=19, SCLK=5, NSS managed manually)
+    SpiInit(&SX126x.Spi, SPI_1,
+            (PinNames)RADIO_MOSI_PIN, (PinNames)RADIO_MISO_PIN,
+            (PinNames)RADIO_SCLK_PIN, NC);
 }
 
 void SX126xIoIrqInit(DioIrqHandler dioIrq)
 {
-    (void)dioIrq;
+    if (dioIrq) {
+        GpioSetInterrupt(&SX126x.DIO1, IRQ_RISING_EDGE,
+                         IRQ_HIGH_PRIORITY, dioIrq);
+    }
 }
 
 void SX126xIoDeInit(void)
 {
+    GpioRemoveInterrupt(&SX126x.DIO1);
+    SpiDeInit(&SX126x.Spi);
+    GpioInit(&SX126x.Spi.Nss, (PinNames)RADIO_NSS_PIN,
+             PIN_INPUT, PIN_PUSH_PULL, PIN_NO_PULL, 0);
 }
 
 void SX126xIoTcxoInit(void)
 {
+    // T-Beam SX1262: internal TCXO powered via DIO3 at 1.8V.
+    // Must be configured before any calibration or RF operation.
+    // TCXO_CTRL_1_8V = 0x02; timeout in 15.625 µs units.
+    SX126xSetDio3AsTcxoCtrl(TCXO_CTRL_1_8V, TCXO_TIMEOUT_TICKS);
 }
 
 void SX126xIoRfSwitchInit(void)
 {
+    // T-Beam SX1262: DIO2 drives the TX/RX RF switch.
+    SX126xSetDio2AsRfSwitchCtrl(true);
 }
 
-void SX126xIoDbgInit(void)
-{
-}
+void SX126xIoDbgInit(void) {}
 
 void SX126xReset(void)
 {
+    // Hold reset low for 10 ms then release; wait 10 ms for POR
+    GpioInit(&SX126x.Reset, (PinNames)RADIO_RESET_PIN,
+             PIN_OUTPUT, PIN_PUSH_PULL, PIN_NO_PULL, 0);
+    DelayMs(10);
+    GpioInit(&SX126x.Reset, (PinNames)RADIO_RESET_PIN,
+             PIN_OUTPUT, PIN_PUSH_PULL, PIN_NO_PULL, 1);
+    DelayMs(10);
 }
 
 void SX126xWaitOnBusy(void)
 {
+    int64_t deadline = esp_timer_get_time() + BUSY_TIMEOUT_US;
+    while (GpioRead(&SX126x.BUSY)) {
+        if (esp_timer_get_time() >= deadline) {
+            // Timeout — radio may be stuck; proceed anyway to avoid deadlock
+            break;
+        }
+    }
 }
 
 void SX126xWakeup(void)
 {
+    // Assert NSS to wake the radio from sleep, then deassert.
+    // BUSY will pulse high briefly; SX126xWaitOnBusy() blocks until ready.
+    nss_low();
+    SpiInOut(&SX126x.Spi, RADIO_GET_STATUS);
+    nss_high();
+    SX126xWaitOnBusy();
 }
 
 void SX126xWriteCommand(RadioCommands_t opcode, uint8_t *buffer, uint16_t size)
 {
-    (void)opcode; (void)buffer; (void)size;
+    SX126xWaitOnBusy();
+    nss_low();
+    SpiInOut(&SX126x.Spi, (uint16_t)opcode);
+    for (uint16_t i = 0; i < size; i++) {
+        SpiInOut(&SX126x.Spi, buffer[i]);
+    }
+    nss_high();
+    // SX126x datasheet §14.3: BUSY goes high after NSS high; don't wait here —
+    // the next WaitOnBusy call (at the start of the next command) will catch it.
 }
 
 uint8_t SX126xReadCommand(RadioCommands_t opcode, uint8_t *buffer, uint16_t size)
 {
-    (void)opcode; (void)buffer; (void)size;
-    return 0;
-}
-
-void SX126xWriteRegister(uint16_t address, uint8_t value)
-{
-    (void)address; (void)value;
-}
-
-uint8_t SX126xReadRegister(uint16_t address)
-{
-    (void)address;
-    return 0;
+    SX126xWaitOnBusy();
+    nss_low();
+    SpiInOut(&SX126x.Spi, (uint16_t)opcode);
+    uint8_t status = (uint8_t)SpiInOut(&SX126x.Spi, 0x00);  // NOP → status byte
+    for (uint16_t i = 0; i < size; i++) {
+        buffer[i] = (uint8_t)SpiInOut(&SX126x.Spi, 0x00);
+    }
+    nss_high();
+    return status;
 }
 
 void SX126xWriteRegisters(uint16_t address, uint8_t *buffer, uint16_t size)
 {
-    (void)address; (void)buffer; (void)size;
+    SX126xWaitOnBusy();
+    nss_low();
+    SpiInOut(&SX126x.Spi, RADIO_WRITE_REGISTER);
+    SpiInOut(&SX126x.Spi, (address >> 8) & 0xFF);
+    SpiInOut(&SX126x.Spi, address & 0xFF);
+    for (uint16_t i = 0; i < size; i++) {
+        SpiInOut(&SX126x.Spi, buffer[i]);
+    }
+    nss_high();
 }
 
 void SX126xReadRegisters(uint16_t address, uint8_t *buffer, uint16_t size)
 {
-    (void)address; (void)buffer; (void)size;
+    SX126xWaitOnBusy();
+    nss_low();
+    SpiInOut(&SX126x.Spi, RADIO_READ_REGISTER);
+    SpiInOut(&SX126x.Spi, (address >> 8) & 0xFF);
+    SpiInOut(&SX126x.Spi, address & 0xFF);
+    SpiInOut(&SX126x.Spi, 0x00);  // NOP → status byte (discard)
+    for (uint16_t i = 0; i < size; i++) {
+        buffer[i] = (uint8_t)SpiInOut(&SX126x.Spi, 0x00);
+    }
+    nss_high();
+}
+
+void SX126xWriteRegister(uint16_t address, uint8_t value)
+{
+    SX126xWriteRegisters(address, &value, 1);
+}
+
+uint8_t SX126xReadRegister(uint16_t address)
+{
+    uint8_t data;
+    SX126xReadRegisters(address, &data, 1);
+    return data;
 }
 
 void SX126xWriteBuffer(uint8_t offset, uint8_t *buffer, uint8_t size)
 {
-    (void)offset; (void)buffer; (void)size;
+    SX126xWaitOnBusy();
+    nss_low();
+    SpiInOut(&SX126x.Spi, RADIO_WRITE_BUFFER);
+    SpiInOut(&SX126x.Spi, offset);
+    for (uint8_t i = 0; i < size; i++) {
+        SpiInOut(&SX126x.Spi, buffer[i]);
+    }
+    nss_high();
 }
 
 void SX126xReadBuffer(uint8_t offset, uint8_t *buffer, uint8_t size)
 {
-    (void)offset; (void)buffer; (void)size;
+    SX126xWaitOnBusy();
+    nss_low();
+    SpiInOut(&SX126x.Spi, RADIO_READ_BUFFER);
+    SpiInOut(&SX126x.Spi, offset);
+    SpiInOut(&SX126x.Spi, 0x00);  // NOP → status byte (discard)
+    for (uint8_t i = 0; i < size; i++) {
+        buffer[i] = (uint8_t)SpiInOut(&SX126x.Spi, 0x00);
+    }
+    nss_high();
 }
 
 void SX126xSetRfTxPower(int8_t power)
 {
-    (void)power;
+    // For SX1262, SX126xSetTxParams configures PA config + output power register
+    SX126xSetTxParams(power, RADIO_RAMP_800_US);
 }
 
 uint8_t SX126xGetDeviceId(void)
 {
+    // T-Beam SX1262 variant
     return SX1262;
 }
 
 void SX126xAntSwOn(void)
 {
+    // DIO2 controls the RF switch; SX126xSetDio2AsRfSwitchCtrl enables this
+    // in hardware — no separate GPIO drive needed.
 }
 
 void SX126xAntSwOff(void)
 {
+    // Same as above — handled by radio hardware.
 }
 
 bool SX126xCheckRfFrequency(uint32_t frequency)
 {
-    (void)frequency;
-    return true;
+    // EU868 band: 863–870 MHz; accept full ISM range 150 MHz–960 MHz
+    return (frequency >= 150000000UL && frequency <= 960000000UL);
 }
 
 uint32_t SX126xGetBoardTcxoWakeupTime(void)
 {
-    return 0;
+    // 5 ms startup time for the T-Beam TCXO
+    return 5;
 }
 
 uint32_t SX126xGetDio1PinState(void)
 {
-    return 0;
+    return GpioRead(&SX126x.DIO1);
 }
 
 RadioOperatingModes_t SX126xGetOperatingMode(void)

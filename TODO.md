@@ -40,11 +40,12 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Implement `hal/esp32_delay.c` — DelayMs (vTaskDelay for >10ms, esp_rom_delay_us for short delays)
 - [x] Compile clean — zero errors, zero warnings; firmware 1565 KB (no size regression)
 
-### Session 5: Board and Radio HAL
+### Session 5: Board and Radio HAL ✓
 
-- [ ] Implement `hal/esp32_board.c` — BoardInitPeriph, BoardInitMcu, BoardGetRandomSeed (esp_random), BoardGetUniqueId (WiFi MAC), BoardGetBatteryLevel
-- [ ] Implement `hal/sx1276_board.c` — SX1276IoInit, SX1276IoIrqInit, SX1276SetRfTxPower (PA_BOOST), SX1276Reset, SX1276GetPaSelect
-- [ ] Implement `hal/sx126x_board.c` — SX126xIoInit, SX126xIoIrqInit, SX126xReset, SX126xWaitOnBusy, SX126xWriteCommand/ReadCommand, SX126xWriteRegisters/ReadRegisters, etc.
+- [x] Implement `hal/esp32_board.c` — BoardInitPeriph, BoardInitMcu, BoardGetRandomSeed (esp_random), BoardGetUniqueId (WiFi MAC), BoardGetBatteryLevel
+- [x] Implement `hal/sx1276_board.c` — SX1276IoInit, SX1276IoIrqInit, SX1276SetRfTxPower (PA_BOOST), SX1276Reset, SX1276GetPaSelect
+- [x] Implement `hal/sx126x_board.c` — SX126xIoInit, SX126xIoIrqInit, SX126xReset, SX126xWaitOnBusy, SX126xWriteCommand/ReadCommand, SX126xWriteRegisters/ReadRegisters, SX126xWriteBuffer/ReadBuffer, SX126xSetRfTxPower, SX126xGetDeviceId, SX126xAntSwOn/Off; SX126xIoTcxoInit sets DIO3→1.8V TCXO; SX126xIoRfSwitchInit enables DIO2 RF switch
+- [x] Compile clean — zero errors, zero warnings; firmware 1565 KB (no size regression)
 
 ### Session 6: Integration and Test
 
