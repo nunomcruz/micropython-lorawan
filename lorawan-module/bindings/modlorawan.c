@@ -624,17 +624,10 @@ static void lorawan_task(void *arg) {
                     break;
                 }
 
-                // Re-apply TTN EU868 RX2 config: the restored MacGroup2 may have
-                // been saved with different values (or before CMD_INIT set them).
-                mib.Type = MIB_RX2_CHANNEL;
-                mib.Param.Rx2Channel.Frequency = 869525000;
-                mib.Param.Rx2Channel.Datarate  = DR_3;
-                LoRaMacMibSetRequestConfirm(&mib);
-
-                mib.Type = MIB_RX2_DEFAULT_CHANNEL;
-                mib.Param.Rx2DefaultChannel.Frequency = 869525000;
-                mib.Param.Rx2DefaultChannel.Datarate  = DR_3;
-                LoRaMacMibSetRequestConfirm(&mib);
+                // Do NOT re-apply RX2 or channel config here. The Join Accept
+                // DLSettings field sets Rx2DataRate during OTAA; that value is
+                // stored in MacGroup2 and restored by RestoreNvmData. Overriding
+                // with hardcoded values would undo the join-negotiated parameters.
 
                 // Sync Python-side cached state from the restored MAC params.
                 if (s_lora_obj) {
