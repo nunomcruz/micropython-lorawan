@@ -269,8 +269,6 @@ static void lorawan_task(void *arg) {
             }
 
             case CMD_JOIN_ABP: {
-                // LoRaWAN 1.0 ABP: the single NwkSKey maps to all three
-                // v1.1 network session keys. AppSKey is set separately.
                 uint8_t *nwk = cmd.join_abp.nwk_s_key;
                 uint8_t *app = cmd.join_abp.app_s_key;
 
@@ -300,6 +298,16 @@ static void lorawan_task(void *arg) {
 
                 mib.Type = MIB_APP_S_KEY;
                 mib.Param.AppSKey = app;
+                LoRaMacMibSetRequestConfirm(&mib);
+
+                // LoRaMAC-node defaults to LoRaWAN 1.1.1 (MIC uses two keys).
+                // TTN ABP devices are almost always registered as LoRaWAN 1.0.x,
+                // which uses a single-key MIC — force 1.0.4 so the MIC matches.
+                mib.Type = MIB_ABP_LORAWAN_VERSION;
+                mib.Param.AbpLrWanVersion.Fields.Major    = 1;
+                mib.Param.AbpLrWanVersion.Fields.Minor    = 0;
+                mib.Param.AbpLrWanVersion.Fields.Patch    = 4;
+                mib.Param.AbpLrWanVersion.Fields.Revision = 0;
                 LoRaMacMibSetRequestConfirm(&mib);
 
                 if (s_lora_obj) s_lora_obj->joined = true;
