@@ -33,26 +33,30 @@ make BOARD=LILYGO_TTGO_TBEAM \
      USER_C_MODULES=$(pwd)/../../lorawan-module/micropython.cmake
 ```
 
-## Usage example
+## Usage example (ABP — confirmed working)
 
 ```python
-import tbeam
 import lorawan
 
-hw = tbeam.detect()
-print(hw)  # HardwareInfo(radio=sx1276, pmu=axp192, ...)
-
+# Init: detects radio (SX1276 reg 0x42 = 0x12), starts LoRaWAN task on CPU1
 lw = lorawan.LoRaWAN(region=lorawan.EU868)
-lw.join_otaa(
-    dev_eui=bytes.fromhex("..."),
-    join_eui=bytes.fromhex("..."),
-    app_key=bytes.fromhex("..."),
-    timeout=30,
+
+# ABP join (LoRaWAN 1.0 keys)
+lw.join_abp(
+    dev_addr=0x260B0000,
+    nwk_s_key=bytes.fromhex("00000000000000000000000000000000"),
+    app_s_key=bytes.fromhex("00000000000000000000000000000000"),
 )
 
-lw.send(b"\x01\x02\x03", port=10)
-data, port, rssi, snr = lw.recv(timeout=10)
+# Send uplink — default DR_0 (SF12) for maximum range
+lw.send(b"hello", port=1)
+lw.send(b"hello", port=1, datarate=lorawan.DR_5)  # SF7 if closer to gateway
+
+# Data rate constants: DR_0=SF12 (best range) .. DR_5=SF7 (fastest)
+# Device class constants: CLASS_A, CLASS_B, CLASS_C
 ```
+
+OTAA join (`join_otaa`) is planned for Session 8.
 
 ## Hardware findings (confirmed on device)
 
@@ -68,7 +72,9 @@ Discovered during Phase 1 testing on a T-Beam v1.1 SX1262/AXP192. Relevant for t
 
 ## Project status
 
-This is a work in progress. See [TODO.md](TODO.md) for the development roadmap and [CLAUDE.md](CLAUDE.md) for detailed project context.
+Phase 4 Session 7 complete: ABP join and uplink confirmed working on T-Beam v1.1 SX1276/AXP192. MAC initialisation, ABP join, and TX confirmed at the MAC layer. Sessions 8–10 (OTAA, downlink, persistence) in progress.
+
+See [TODO.md](TODO.md) for the development roadmap and [CLAUDE.md](../CLAUDE.md) for project context including hardware constants and FreeRTOS pitfalls.
 
 ## Architecture
 
