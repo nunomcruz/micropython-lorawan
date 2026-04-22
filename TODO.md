@@ -120,7 +120,32 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 
 ### Session 11: Core extras
 
-- [ ] Full runtime pin configuration from Python (for non-T-Beam boards)
+- [x] Full runtime pin configuration from Python (for non-T-Beam boards)
+      - New kwargs: `radio="sx1276"|"sx1262"`, `spi_id`, `mosi`, `miso`, `sclk`, `cs`, `reset`, `irq`, `busy`
+      - `g_lorawan_pins` struct in `hal/pin_config.h/.c` — defaults are T-Beam values
+      - All board IoInit functions use runtime struct instead of `lorawan_config.h` macros
+      - `irq` sets both `dio0` (SX1276) and `dio1_1262` (SX1262) — only the right one is consumed
+      - `radio` kwarg now accepts strings "sx1276"/"sx1262" (True/False kept for backwards compat)
+      - QSTR promotion: clean build required after adding `busy` kwarg (stale frozen_content.c)
+      - Compile clean — 1617 KB (1 KB growth for pin_config.c + new kwargs)
+- [x] LoRaWAN version selection (`lorawan_version=lorawan.V1_0_4|lorawan.V1_1`)
+      - `V1_0_4`, `V1_1` module constants exported
+      - ABP: `MIB_ABP_LORAWAN_VERSION` set from instance version (1.0.4 single-key MIC; 1.1 two-key)
+      - OTAA: `join_otaa(..., nwk_key=...)` optional kwarg; omit for 1.0.x (NwkKey=AppKey internally)
+- [x] Configurable RX2 window (`rx2_dr`, `rx2_freq` kwargs on `__init__`)
+      - Default: 869.525 MHz / DR_3 (TTN EU868). Pass `rx2_dr=lorawan.DR_0` for standard LoRaWAN.
+      - Values applied in CMD_INIT from `lorawan_obj_t` instead of hardcoded constants
+- [x] TX power in dBm EIRP (`tx_power=14` kwarg on `__init__`; getter/setter also in dBm)
+      - `tx_power=None` → region max (16 dBm EU868). `tx_power=14` → 14 dBm (index 1).
+      - `dbm_to_tx_power()` and `tx_power_to_dbm()` helpers: EU868 step = 2 dBm, range 2–16 dBm
+      - Setter rounds down (never exceeds requested EIRP); getter converts index→dBm
+- [x] Hardware TX power override (beyond regulatory limits, user responsibility)
+      - `lw.tx_power(20)` or `tx_power=20` on init: `g_tx_power_hw_override` in pin_config.c/.h
+      - `SX126xSetRfTxPower` and `SX1276SetRfTxPower` both check override before using MAC value
+      - Hardware caps enforced by radio drivers: SX1276 ≤ 20 dBm, SX1262 ≤ 22 dBm
+      - Override and ADR mutually exclusive: setting override auto-disables ADR; enabling ADR clears override
+      - Warning logged when override exceeds region regulatory limit
+      - Version bumped to 0.6.0; compile clean — 1618 KB (+1 KB)
 - [ ] End-to-end SX1262 test: join, uplink, downlink, confirmed, persistence
 - [ ] Class C support (`request_class(CLASS_C)`, continuous RX2 window)
 - [ ] Implement `on_class_change(callback)` — confirmed class transitions

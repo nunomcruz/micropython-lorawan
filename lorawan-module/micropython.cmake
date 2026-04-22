@@ -15,6 +15,7 @@ target_sources(usermod_lorawan INTERFACE
 
 # ESP32 HAL (implemented in Phase 3, Sessions 4–6)
 target_sources(usermod_lorawan INTERFACE
+    ${CMAKE_CURRENT_LIST_DIR}/hal/pin_config.c
     ${CMAKE_CURRENT_LIST_DIR}/hal/esp32_gpio.c
     ${CMAKE_CURRENT_LIST_DIR}/hal/esp32_spi.c
     ${CMAKE_CURRENT_LIST_DIR}/hal/esp32_timer.c

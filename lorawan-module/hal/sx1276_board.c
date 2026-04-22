@@ -5,6 +5,7 @@
 #include "spi.h"
 #include "delay.h"
 #include "lorawan_config.h"
+#include "pin_config.h"
 
 #include "sx1276/sx1276.h"
 #include "sx1276-board.h"
@@ -15,26 +16,21 @@
 
 void SX1276IoInit(void)
 {
-    // NSS: output, start high (deasserted)
-    GpioInit(&SX1276.Spi.Nss, (PinNames)RADIO_NSS_PIN,
+    GpioInit(&SX1276.Spi.Nss, (PinNames)g_lorawan_pins.nss,
              PIN_OUTPUT, PIN_PUSH_PULL, PIN_NO_PULL, 1);
 
-    // Reset: output, start high
-    GpioInit(&SX1276.Reset, (PinNames)RADIO_RESET_PIN,
+    GpioInit(&SX1276.Reset, (PinNames)g_lorawan_pins.reset,
              PIN_OUTPUT, PIN_PUSH_PULL, PIN_NO_PULL, 1);
 
-    // DIO0: input, no pull — main interrupt for TX/RX done
-    GpioInit(&SX1276.DIO0, (PinNames)RADIO_DIO0_PIN,
+    GpioInit(&SX1276.DIO0, (PinNames)g_lorawan_pins.dio0,
              PIN_INPUT, PIN_PUSH_PULL, PIN_NO_PULL, 0);
 
-    // DIO1: input, no pull — RX timeout / CAD done
-    GpioInit(&SX1276.DIO1, (PinNames)RADIO_DIO1_PIN_1276,
+    GpioInit(&SX1276.DIO1, (PinNames)g_lorawan_pins.dio1_1276,
              PIN_INPUT, PIN_PUSH_PULL, PIN_NO_PULL, 0);
 
-    // Initialise SPI bus (MOSI=27, MISO=19, SCLK=5, NSS managed manually)
     SpiInit(&SX1276.Spi, SPI_1,
-            (PinNames)RADIO_MOSI_PIN, (PinNames)RADIO_MISO_PIN,
-            (PinNames)RADIO_SCLK_PIN, NC);
+            (PinNames)g_lorawan_pins.mosi, (PinNames)g_lorawan_pins.miso,
+            (PinNames)g_lorawan_pins.sclk, NC);
 }
 
 void SX1276IoIrqInit(DioIrqHandler **irqHandlers)
@@ -58,7 +54,7 @@ void SX1276IoDeInit(void)
     GpioRemoveInterrupt(&SX1276.DIO0);
     GpioRemoveInterrupt(&SX1276.DIO1);
     SpiDeInit(&SX1276.Spi);
-    GpioInit(&SX1276.Spi.Nss, (PinNames)RADIO_NSS_PIN,
+    GpioInit(&SX1276.Spi.Nss, (PinNames)g_lorawan_pins.nss,
              PIN_INPUT, PIN_PUSH_PULL, PIN_NO_PULL, 0);
 }
 
@@ -76,17 +72,22 @@ void SX1276IoDbgInit(void)
 
 void SX1276Reset(void)
 {
-    // Drive reset low for 10 ms then release; SX1276 datasheet §7.2.2
-    GpioInit(&SX1276.Reset, (PinNames)RADIO_RESET_PIN,
+    GpioInit(&SX1276.Reset, (PinNames)g_lorawan_pins.reset,
              PIN_OUTPUT, PIN_PUSH_PULL, PIN_NO_PULL, 0);
     DelayMs(10);
-    GpioInit(&SX1276.Reset, (PinNames)RADIO_RESET_PIN,
+    GpioInit(&SX1276.Reset, (PinNames)g_lorawan_pins.reset,
              PIN_OUTPUT, PIN_PUSH_PULL, PIN_NO_PULL, 1);
     DelayMs(6);
 }
 
 void SX1276SetRfTxPower(int8_t power)
 {
+    // Hardware cap: SX1276 PA_BOOST supports up to +20 dBm (enforced below).
+    // g_tx_power_hw_override overrides the MAC-provided value when set by the user.
+    if (g_tx_power_hw_override != LORAWAN_TX_POWER_NO_OVERRIDE) {
+        power = g_tx_power_hw_override;
+    }
+
     uint8_t pa_config = SX1276Read(REG_LR_PACONFIG);
     uint8_t pa_dac    = SX1276Read(REG_LR_PADAC);
 

@@ -6,6 +6,7 @@
 #include "spi.h"
 #include "delay.h"
 #include "lorawan_config.h"
+#include "pin_config.h"
 
 #include "sx126x/sx126x.h"
 #include "sx126x-board.h"
@@ -29,26 +30,21 @@ static inline void nss_high(void) { GpioWrite(&SX126x.Spi.Nss, 1); }
 
 void SX126xIoInit(void)
 {
-    // NSS: output, start high (deasserted)
-    GpioInit(&SX126x.Spi.Nss, (PinNames)RADIO_NSS_PIN,
+    GpioInit(&SX126x.Spi.Nss, (PinNames)g_lorawan_pins.nss,
              PIN_OUTPUT, PIN_PUSH_PULL, PIN_NO_PULL, 1);
 
-    // Reset: output, start high
-    GpioInit(&SX126x.Reset, (PinNames)RADIO_RESET_PIN,
+    GpioInit(&SX126x.Reset, (PinNames)g_lorawan_pins.reset,
              PIN_OUTPUT, PIN_PUSH_PULL, PIN_NO_PULL, 1);
 
-    // BUSY: input, no pull
-    GpioInit(&SX126x.BUSY, (PinNames)RADIO_BUSY_PIN,
+    GpioInit(&SX126x.BUSY, (PinNames)g_lorawan_pins.busy,
              PIN_INPUT, PIN_PUSH_PULL, PIN_NO_PULL, 0);
 
-    // DIO1: input, no pull — main interrupt (TX done, RX done, timeout, …)
-    GpioInit(&SX126x.DIO1, (PinNames)RADIO_DIO1_PIN,
+    GpioInit(&SX126x.DIO1, (PinNames)g_lorawan_pins.dio1_1262,
              PIN_INPUT, PIN_PUSH_PULL, PIN_NO_PULL, 0);
 
-    // Initialise SPI bus (MOSI=27, MISO=19, SCLK=5, NSS managed manually)
     SpiInit(&SX126x.Spi, SPI_1,
-            (PinNames)RADIO_MOSI_PIN, (PinNames)RADIO_MISO_PIN,
-            (PinNames)RADIO_SCLK_PIN, NC);
+            (PinNames)g_lorawan_pins.mosi, (PinNames)g_lorawan_pins.miso,
+            (PinNames)g_lorawan_pins.sclk, NC);
 }
 
 void SX126xIoIrqInit(DioIrqHandler dioIrq)
@@ -63,7 +59,7 @@ void SX126xIoDeInit(void)
 {
     GpioRemoveInterrupt(&SX126x.DIO1);
     SpiDeInit(&SX126x.Spi);
-    GpioInit(&SX126x.Spi.Nss, (PinNames)RADIO_NSS_PIN,
+    GpioInit(&SX126x.Spi.Nss, (PinNames)g_lorawan_pins.nss,
              PIN_INPUT, PIN_PUSH_PULL, PIN_NO_PULL, 0);
 }
 
@@ -85,11 +81,10 @@ void SX126xIoDbgInit(void) {}
 
 void SX126xReset(void)
 {
-    // Hold reset low for 10 ms then release; wait 10 ms for POR
-    GpioInit(&SX126x.Reset, (PinNames)RADIO_RESET_PIN,
+    GpioInit(&SX126x.Reset, (PinNames)g_lorawan_pins.reset,
              PIN_OUTPUT, PIN_PUSH_PULL, PIN_NO_PULL, 0);
     DelayMs(10);
-    GpioInit(&SX126x.Reset, (PinNames)RADIO_RESET_PIN,
+    GpioInit(&SX126x.Reset, (PinNames)g_lorawan_pins.reset,
              PIN_OUTPUT, PIN_PUSH_PULL, PIN_NO_PULL, 1);
     DelayMs(10);
 }
@@ -207,8 +202,12 @@ void SX126xReadBuffer(uint8_t offset, uint8_t *buffer, uint8_t size)
 
 void SX126xSetRfTxPower(int8_t power)
 {
-    // For SX1262, SX126xSetTxParams configures PA config + output power register
-    SX126xSetTxParams(power, RADIO_RAMP_800_US);
+    // Hardware cap: SX1262 supports up to +22 dBm (enforced inside SX126xSetTxParams).
+    // g_tx_power_hw_override overrides the MAC-provided value when set by the user;
+    // allows exceeding the region's regulatory limit at the user's responsibility.
+    int8_t p = (g_tx_power_hw_override != LORAWAN_TX_POWER_NO_OVERRIDE)
+               ? g_tx_power_hw_override : power;
+    SX126xSetTxParams(p, RADIO_RAMP_800_US);
 }
 
 uint8_t SX126xGetDeviceId(void)

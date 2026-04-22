@@ -3,11 +3,14 @@
 //                         recv, on_rx, on_tx_done, confirmed uplink ACK tracking,
 //                         nvram_save/restore (ESP32 NVS via MIB_NVM_CTXS),
 //                         datarate/adr/tx_power getters+setters.
+// Phase 5, Session 11:   runtime pin config; lorawan_version (1.0.4/1.1), rx2_dr/freq,
+//                         tx_power kwargs on __init__; nwk_key kwarg on join_otaa.
 // FreeRTOS task owns all MAC calls; Python thread communicates via queue + event group.
 
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <limits.h>
 
 #include "py/runtime.h"
 #include "py/obj.h"
@@ -25,6 +28,7 @@
 #include "freertos/event_groups.h"
 
 #include "radio_select.h"
+#include "pin_config.h"
 #include "sx1276-board.h"
 #include "sx126x-board.h"
 #include "sx1276/sx1276.h"
@@ -49,6 +53,10 @@
 // NVS namespace and key for MAC context persistence
 #define LW_NVS_NAMESPACE  "lorawan"
 #define LW_NVS_KEY        "nvm_ctx"
+
+// LoRaWAN version selection (lorawan_obj_t.lorawan_version)
+#define LORAWAN_V1_0_4  0
+#define LORAWAN_V1_1    1
 
 // Event group bits
 #define EVT_COMPLETED    (1u << 0)
@@ -81,6 +89,7 @@ typedef struct {
     uint8_t dev_eui[8];
     uint8_t join_eui[8];
     uint8_t app_key[16];
+    uint8_t nwk_key[16]; // for 1.1: separate root key; for 1.0.x: copy of app_key
 } cmd_join_otaa_t;
 
 typedef struct {
@@ -130,6 +139,10 @@ typedef struct {
     bool            is_sx1276;
     LoRaMacRegion_t region;
     DeviceClass_t   device_class;
+    // LoRaWAN configuration (set at __init__, applied in CMD_INIT)
+    uint8_t         lorawan_version; // LORAWAN_V1_0_4 or LORAWAN_V1_1
+    uint8_t         rx2_dr;          // RX2 data rate index (e.g. DR_3 for TTN)
+    uint32_t        rx2_freq;        // RX2 frequency in Hz
     // Python callbacks
     mp_obj_t        rx_callback;
     mp_obj_t        tx_callback;
@@ -144,7 +157,7 @@ typedef struct {
     // Cached MAC parameters (updated on init and after each TX when ADR is on)
     int8_t          channels_datarate;
     bool            adr_enabled;
-    int8_t          channels_tx_power;
+    int8_t          channels_tx_power; // TX_POWER index (0=max); convert to/from dBm at API boundary
 } lorawan_obj_t;
 
 // ---- Static FreeRTOS state (one LoRaWAN instance per firmware) ----
@@ -167,6 +180,27 @@ static volatile bool s_nvram_autosave_needed; // mlme_confirm(JOIN_OK) sets this
 static uint8_t       s_otaa_dev_eui[8];
 static uint8_t       s_otaa_join_eui[8];
 static uint8_t       s_otaa_app_key[16];
+static uint8_t       s_otaa_nwk_key[16]; // 1.0.x: same as app_key; 1.1: separate root key
+
+// ---- TX power dBm ↔ MAC index conversion ----
+//
+// EU868 EIRP table: index 0 = 16 dBm, each step down = -2 dBm, max index 7 = 2 dBm.
+// Conversion rounds down (never exceeds requested power, important for regulatory compliance).
+// Other regions may have different tables; this helper is EU868-accurate for now.
+
+static int tx_power_to_dbm(int8_t index) {
+    int8_t i = (index < 0) ? 0 : (index > 7) ? 7 : index;
+    return 16 - 2 * (int)i;
+}
+
+static int8_t dbm_to_tx_power(int dbm) {
+    // eirp(i) = 16 - 2i  =>  i = ceil((16 - dbm) / 2.0)
+    // Integer: (16 - dbm + 1) / 2, then clamp to [0, 7]
+    if (dbm >= 16) return 0;
+    if (dbm <= 2)  return 7;
+    int8_t i = (int8_t)((16 - dbm + 1) / 2);
+    return (i > 7) ? 7 : i;
+}
 
 // ---- Scheduler trampolines (run in MicroPython VM context) ----
 //
@@ -443,17 +477,29 @@ static void lorawan_task(void *arg) {
                 mib.Param.Class = cls;
                 LoRaMacMibSetRequestConfirm(&mib);
 
-                // EU868 RX2: 869.525 MHz, DR3 (SF9/BW125) — TTN default
-                // The LoRaMAC-node default is DR0; wrong value = missed downlinks.
+                // RX2 window: use per-instance configuration.
+                // Default: 869.525 MHz / DR_3 (TTN EU868). Standard LoRaWAN uses DR_0.
+                uint32_t rx2_freq = s_lora_obj ? s_lora_obj->rx2_freq : 869525000;
+                uint8_t  rx2_dr   = s_lora_obj ? s_lora_obj->rx2_dr   : DR_3;
                 mib.Type = MIB_RX2_CHANNEL;
-                mib.Param.Rx2Channel.Frequency = 869525000;
-                mib.Param.Rx2Channel.Datarate  = DR_3;
+                mib.Param.Rx2Channel.Frequency = rx2_freq;
+                mib.Param.Rx2Channel.Datarate  = rx2_dr;
                 LoRaMacMibSetRequestConfirm(&mib);
 
                 mib.Type = MIB_RX2_DEFAULT_CHANNEL;
-                mib.Param.Rx2DefaultChannel.Frequency = 869525000;
-                mib.Param.Rx2DefaultChannel.Datarate  = DR_3;
+                mib.Param.Rx2DefaultChannel.Frequency = rx2_freq;
+                mib.Param.Rx2DefaultChannel.Datarate  = rx2_dr;
                 LoRaMacMibSetRequestConfirm(&mib);
+                esp_rom_printf("lorawan: RX2 freq=%lu DR=%u\n",
+                               (unsigned long)rx2_freq, (unsigned)rx2_dr);
+
+                // Apply user-specified initial TX power (if non-default).
+                // channels_tx_power is a MAC index; 0 = max (16 dBm EU868).
+                if (s_lora_obj && s_lora_obj->channels_tx_power != 0) {
+                    mib.Type = MIB_CHANNELS_TX_POWER;
+                    mib.Param.ChannelsTxPower = s_lora_obj->channels_tx_power;
+                    LoRaMacMibSetRequestConfirm(&mib);
+                }
 
                 // Cache initial MAC parameter values into the Python object.
                 if (s_lora_obj) {
@@ -509,13 +555,14 @@ static void lorawan_task(void *arg) {
                 mib.Param.AppSKey = app;
                 LoRaMacMibSetRequestConfirm(&mib);
 
-                // LoRaMAC-node defaults to LoRaWAN 1.1.1 (MIC uses two keys).
-                // TTN ABP devices are almost always registered as LoRaWAN 1.0.x,
-                // which uses a single-key MIC — force 1.0.4 so the MIC matches.
+                // Set ABP LoRaWAN version for MIC computation.
+                // 1.0.4 uses single-key MIC; 1.1 uses two-key MIC.
+                // LoRaMAC-node defaults to 1.1.1 — must be set explicitly.
+                bool is_v11 = s_lora_obj && (s_lora_obj->lorawan_version == LORAWAN_V1_1);
                 mib.Type = MIB_ABP_LORAWAN_VERSION;
                 mib.Param.AbpLrWanVersion.Fields.Major    = 1;
-                mib.Param.AbpLrWanVersion.Fields.Minor    = 0;
-                mib.Param.AbpLrWanVersion.Fields.Patch    = 4;
+                mib.Param.AbpLrWanVersion.Fields.Minor    = is_v11 ? 1 : 0;
+                mib.Param.AbpLrWanVersion.Fields.Patch    = is_v11 ? 0 : 4;
                 mib.Param.AbpLrWanVersion.Fields.Revision = 0;
                 LoRaMacMibSetRequestConfirm(&mib);
 
@@ -529,6 +576,7 @@ static void lorawan_task(void *arg) {
                 memcpy(s_otaa_dev_eui,  cmd.join_otaa.dev_eui,  8);
                 memcpy(s_otaa_join_eui, cmd.join_otaa.join_eui, 8);
                 memcpy(s_otaa_app_key,  cmd.join_otaa.app_key,  16);
+                memcpy(s_otaa_nwk_key,  cmd.join_otaa.nwk_key,  16);
 
                 mib.Type = MIB_NETWORK_ACTIVATION;
                 mib.Param.NetworkActivation = ACTIVATION_TYPE_OTAA;
@@ -546,12 +594,10 @@ static void lorawan_task(void *arg) {
                 mib.Param.AppKey = s_otaa_app_key;
                 LoRaMacMibSetRequestConfirm(&mib);
 
-                // LoRaWAN 1.0.x has a single root key (AppKey); LoRaMAC-node v4.7.0
-                // always uses NwkKey for the Join Request MIC (LoRaMacCryptoPrepareJoinRequest
-                // hardcodes micComputationKeyID = NWK_KEY).  Set NwkKey = AppKey so the
-                // MIC matches what TTN expects for a 1.0.x-registered device.
+                // LoRaMAC-node always uses NwkKey for the Join Request MIC.
+                // 1.0.x: NwkKey = AppKey (single root key). 1.1: separate NwkKey.
                 mib.Type = MIB_NWK_KEY;
-                mib.Param.NwkKey = s_otaa_app_key;
+                mib.Param.NwkKey = s_otaa_nwk_key;
                 LoRaMacMibSetRequestConfirm(&mib);
 
                 s_otaa_active       = true;
@@ -775,11 +821,34 @@ static EventBits_t send_cmd_wait_result(lorawan_cmd_data_t *cmd, EventBits_t wai
 static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
                                   size_t n_args, size_t n_kw,
                                   const mp_obj_t *all_args) {
-    enum { ARG_region, ARG_radio, ARG_device_class };
+    enum {
+        ARG_region, ARG_radio, ARG_device_class,
+        ARG_spi_id, ARG_mosi, ARG_miso, ARG_sclk,
+        ARG_cs, ARG_reset, ARG_irq, ARG_busy,
+        ARG_lorawan_version, ARG_rx2_dr, ARG_rx2_freq, ARG_tx_power,
+    };
     static const mp_arg_t allowed_args[] = {
-        { MP_QSTR_region,       MP_ARG_REQUIRED | MP_ARG_INT },
-        { MP_QSTR_radio,        MP_ARG_KW_ONLY  | MP_ARG_OBJ, {.u_obj = mp_const_none} },
-        { MP_QSTR_device_class, MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = CLASS_A} },
+        { MP_QSTR_region,           MP_ARG_REQUIRED | MP_ARG_INT },
+        { MP_QSTR_radio,            MP_ARG_KW_ONLY  | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        { MP_QSTR_device_class,     MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = CLASS_A} },
+        // Pin overrides — -1 means "use T-Beam default from lorawan_config.h"
+        { MP_QSTR_spi_id,           MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_mosi,             MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_miso,             MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_sclk,             MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_cs,               MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_reset,            MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_irq,              MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_busy,             MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
+        // LoRaWAN protocol version — affects MIC computation and key derivation
+        { MP_QSTR_lorawan_version,  MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = LORAWAN_V1_0_4} },
+        // RX2 window — default: TTN EU868 (869.525 MHz / DR_3 = SF9/125kHz)
+        // Standard LoRaWAN EU868 uses DR_0 (SF12). Pass rx2_dr=lorawan.DR_0 for standard networks.
+        { MP_QSTR_rx2_dr,           MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = DR_3} },
+        { MP_QSTR_rx2_freq,         MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = 869525000} },
+        // TX power in dBm EIRP. None = use region maximum (16 dBm for EU868).
+        // Internally converted to MAC TX_POWER index; getter also returns dBm.
+        { MP_QSTR_tx_power,         MP_ARG_KW_ONLY  | MP_ARG_OBJ, {.u_obj = mp_const_none} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args,
@@ -796,6 +865,9 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     self->is_sx1276        = true;
     self->region           = (LoRaMacRegion_t)args[ARG_region].u_int;
     self->device_class     = (DeviceClass_t)args[ARG_device_class].u_int;
+    self->lorawan_version  = (uint8_t)args[ARG_lorawan_version].u_int;
+    self->rx2_dr           = (uint8_t)args[ARG_rx2_dr].u_int;
+    self->rx2_freq         = (uint32_t)args[ARG_rx2_freq].u_int;
     self->rx_callback      = mp_const_none;
     self->tx_callback      = mp_const_none;
     self->tx_counter       = 0;
@@ -806,21 +878,71 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     self->snr              = 0;
     self->channels_datarate = DR_0;
     self->adr_enabled       = false;
-    self->channels_tx_power = 0;   // TX_POWER_0 = max power
+    // tx_power kwarg: None = use region max (index 0 = 16 dBm EU868); int = dBm.
+    // If dBm exceeds the region table max, activate hardware override (user's responsibility).
+    if (args[ARG_tx_power].u_obj != mp_const_none) {
+        int dbm = (int)mp_obj_get_int(args[ARG_tx_power].u_obj);
+        int8_t idx      = dbm_to_tx_power(dbm);
+        int    mac_max  = tx_power_to_dbm(0); // region table max (16 dBm EU868)
+        if (dbm > mac_max) {
+            g_tx_power_hw_override = (int8_t)dbm; // bypass MAC validation
+            self->channels_tx_power = 0;           // MAC sees region max
+        } else {
+            self->channels_tx_power = idx;
+        }
+    } else {
+        self->channels_tx_power = 0; // TX_POWER_0 = region max
+    }
+
+    // Apply pin overrides to g_lorawan_pins before any IoInit.
+    // -1 means "keep T-Beam default" (set in pin_config.c initialiser).
+    // irq routes to the appropriate field for both radio types; only one
+    // IoInit call will actually consume it.
+    #define _APPLY(field, idx) \
+        if (args[idx].u_int != -1) g_lorawan_pins.field = (int)args[idx].u_int
+    if (args[ARG_spi_id].u_int != -1) {
+        g_lorawan_pins.spi_host = (int)args[ARG_spi_id].u_int;
+    }
+    _APPLY(mosi,  ARG_mosi);
+    _APPLY(miso,  ARG_miso);
+    _APPLY(sclk,  ARG_sclk);
+    _APPLY(nss,   ARG_cs);
+    _APPLY(reset, ARG_reset);
+    _APPLY(busy,  ARG_busy);
+    if (args[ARG_irq].u_int != -1) {
+        int irq_pin = (int)args[ARG_irq].u_int;
+        g_lorawan_pins.dio0      = irq_pin;  // SX1276 path
+        g_lorawan_pins.dio1_1262 = irq_pin;  // SX1262 path
+    }
+    #undef _APPLY
+
+    // Parse radio kwarg: "sx1276" | "sx1262" | None (auto-detect).
+    // True/False kept for backwards compatibility.
+    bool radio_forced = false;
+    bool is_sx1276_forced = false;
+    if (args[ARG_radio].u_obj != mp_const_none) {
+        if (mp_obj_is_str(args[ARG_radio].u_obj)) {
+            const char *rs = mp_obj_str_get_str(args[ARG_radio].u_obj);
+            if (strcmp(rs, "sx1276") == 0) {
+                radio_forced = true; is_sx1276_forced = true;
+            } else if (strcmp(rs, "sx1262") == 0) {
+                radio_forced = true; is_sx1276_forced = false;
+            } else {
+                mp_raise_ValueError(
+                    MP_ERROR_TEXT("radio: expected 'sx1276', 'sx1262', or None"));
+            }
+        } else {
+            radio_forced = true;
+            is_sx1276_forced = mp_obj_is_true(args[ARG_radio].u_obj);
+        }
+    }
 
     // Radio detection: bring up SX1276 HAL (GPIO + SPI), reset, read reg 0x42.
-    // SX1276 version register returns 0x12; anything else means SX1262.
+    // SX1276 version register returns 0x12; anything else → SX1262.
     SX1276IoInit();
     SX1276Reset();
     uint8_t reg42 = SX1276Read(0x42);
-    bool is_sx1276;
-
-    if (args[ARG_radio].u_obj != mp_const_none) {
-        // Caller forced a radio: radio=True → SX1276, radio=False → SX1262
-        is_sx1276 = mp_obj_is_true(args[ARG_radio].u_obj);
-    } else {
-        is_sx1276 = (reg42 == 0x12);
-    }
+    bool is_sx1276 = radio_forced ? is_sx1276_forced : (reg42 == 0x12);
 
     if (!is_sx1276) {
         SX126xIoInit();
@@ -904,12 +1026,14 @@ static mp_obj_t lorawan_join_otaa(size_t n_args, const mp_obj_t *pos_args,
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
     }
 
-    enum { ARG_dev_eui, ARG_join_eui, ARG_app_key, ARG_timeout };
+    enum { ARG_dev_eui, ARG_join_eui, ARG_app_key, ARG_timeout, ARG_nwk_key };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_dev_eui,  MP_ARG_REQUIRED | MP_ARG_OBJ },
         { MP_QSTR_join_eui, MP_ARG_REQUIRED | MP_ARG_OBJ },
         { MP_QSTR_app_key,  MP_ARG_REQUIRED | MP_ARG_OBJ },
         { MP_QSTR_timeout,  MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = 30} },
+        // nwk_key: LoRaWAN 1.1 root network key. Omit for 1.0.x (NwkKey = AppKey).
+        { MP_QSTR_nwk_key,  MP_ARG_KW_ONLY  | MP_ARG_OBJ, {.u_obj = mp_const_none} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
@@ -935,6 +1059,18 @@ static mp_obj_t lorawan_join_otaa(size_t n_args, const mp_obj_t *pos_args,
     memcpy(cmd.join_otaa.dev_eui,  dev_eui_buf.buf,  8);
     memcpy(cmd.join_otaa.join_eui, join_eui_buf.buf, 8);
     memcpy(cmd.join_otaa.app_key,  app_key_buf.buf,  16);
+
+    // nwk_key: if provided use it (LoRaWAN 1.1); otherwise copy app_key (1.0.x behaviour).
+    if (args[ARG_nwk_key].u_obj != mp_const_none) {
+        mp_buffer_info_t nwk_key_buf;
+        mp_get_buffer_raise(args[ARG_nwk_key].u_obj, &nwk_key_buf, MP_BUFFER_READ);
+        if (nwk_key_buf.len != 16) {
+            mp_raise_ValueError(MP_ERROR_TEXT("nwk_key must be 16 bytes"));
+        }
+        memcpy(cmd.join_otaa.nwk_key, nwk_key_buf.buf, 16);
+    } else {
+        memcpy(cmd.join_otaa.nwk_key, app_key_buf.buf, 16);
+    }
 
     // Phase 1: send command, wait for MAC to accept it.
     send_cmd_wait(&cmd, EVT_COMPLETED);
@@ -1154,6 +1290,8 @@ static mp_obj_t lorawan_datarate(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_datarate_obj, 1, 2, lorawan_datarate);
 
 // adr(enabled=None) — getter/setter for MIB_ADR.
+// Enabling ADR while a tx_power override is active clears the override:
+// ADR adjusts the MAC TX power index, which must reach the radio for ADR to work.
 static mp_obj_t lorawan_adr(size_t n_args, const mp_obj_t *args) {
     lorawan_obj_t *self = MP_OBJ_TO_PTR(args[0]);
     if (!self->initialized) {
@@ -1162,29 +1300,67 @@ static mp_obj_t lorawan_adr(size_t n_args, const mp_obj_t *args) {
     if (n_args == 1) {
         return mp_obj_new_bool(self->adr_enabled);
     }
-    lorawan_cmd_data_t cmd;
-    cmd.cmd = CMD_SET_PARAMS;
+    bool enable = mp_obj_is_true(args[1]);
+    if (enable && g_tx_power_hw_override != LORAWAN_TX_POWER_NO_OVERRIDE) {
+        mp_printf(&mp_plat_print,
+                  "lorawan: ADR enabled — clearing tx_power override (%d dBm)\n",
+                  (int)g_tx_power_hw_override);
+        g_tx_power_hw_override = LORAWAN_TX_POWER_NO_OVERRIDE;
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_SET_PARAMS };
     cmd.set_params.type = 0;
-    cmd.set_params.adr = mp_obj_is_true(args[1]);
+    cmd.set_params.adr  = enable;
     send_cmd_wait(&cmd, EVT_COMPLETED);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_adr_obj, 1, 2, lorawan_adr);
 
-// tx_power(power=None) — getter/setter for MIB_CHANNELS_TX_POWER.
-// 0 = TX_POWER_0 = max (EU868: 16 dBm EIRP), 7 = TX_POWER_7 = min.
+// tx_power(dbm=None) — getter/setter for TX power in dBm EIRP.
+// EU868 regulatory range: 2–16 dBm (step 2 dBm) via MAC index.
+// Values beyond the region max bypass MAC validation via a hardware override
+// (g_tx_power_hw_override). Hardware caps: SX1276 ≤ 20 dBm, SX1262 ≤ 22 dBm.
+// Override and ADR are mutually exclusive — setting one disables the other.
 static mp_obj_t lorawan_tx_power(size_t n_args, const mp_obj_t *args) {
     lorawan_obj_t *self = MP_OBJ_TO_PTR(args[0]);
     if (!self->initialized) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
     }
     if (n_args == 1) {
-        return mp_obj_new_int(self->channels_tx_power);
+        // If override is active return actual hardware power, not the MAC index.
+        if (g_tx_power_hw_override != LORAWAN_TX_POWER_NO_OVERRIDE) {
+            return mp_obj_new_int((int)g_tx_power_hw_override);
+        }
+        return mp_obj_new_int(tx_power_to_dbm(self->channels_tx_power));
     }
-    lorawan_cmd_data_t cmd;
-    cmd.cmd = CMD_SET_PARAMS;
-    cmd.set_params.type = 2;
-    cmd.set_params.tx_power = (int8_t)mp_obj_get_int(args[1]);
+
+    int    dbm     = (int)mp_obj_get_int(args[1]);
+    int8_t idx     = dbm_to_tx_power(dbm);
+    int    mac_max = tx_power_to_dbm(0); // region table max (EU868: 16 dBm)
+
+    if (dbm > mac_max) {
+        // Beyond region regulatory limit: activate hardware override.
+        g_tx_power_hw_override = (int8_t)dbm;
+        mp_printf(&mp_plat_print,
+                  "lorawan: tx_power %d dBm — above region limit (%d dBm), user responsibility\n",
+                  dbm, mac_max);
+        // ADR adjusts the MAC index, which hardware would then ignore — disable it.
+        if (self->adr_enabled) {
+            mp_printf(&mp_plat_print,
+                      "lorawan: ADR disabled (incompatible with tx_power override)\n");
+            lorawan_cmd_data_t adr_cmd = { .cmd = CMD_SET_PARAMS };
+            adr_cmd.set_params.type = 0;
+            adr_cmd.set_params.adr  = false;
+            send_cmd_wait(&adr_cmd, EVT_COMPLETED);
+        }
+        idx = 0; // MAC stays at region max
+    } else {
+        // Within regulatory limits: clear any previous override.
+        g_tx_power_hw_override = LORAWAN_TX_POWER_NO_OVERRIDE;
+    }
+
+    lorawan_cmd_data_t cmd = { .cmd = CMD_SET_PARAMS };
+    cmd.set_params.type     = 2;
+    cmd.set_params.tx_power = idx;
     send_cmd_wait(&cmd, EVT_COMPLETED);
     return mp_const_none;
 }
@@ -1218,7 +1394,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.5.0", 5);
+    return mp_obj_new_str("0.6.0", 5);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 
@@ -1280,7 +1456,10 @@ static const mp_rom_map_elem_t lorawan_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_CLASS_A),   MP_ROM_INT(CLASS_A) },
     { MP_ROM_QSTR(MP_QSTR_CLASS_B),   MP_ROM_INT(CLASS_B) },
     { MP_ROM_QSTR(MP_QSTR_CLASS_C),   MP_ROM_INT(CLASS_C) },
-    // Data rate constants (EU868): DR_0=SF12 .. DR_5=SF7
+    // LoRaWAN protocol version constants
+    { MP_ROM_QSTR(MP_QSTR_V1_0_4),    MP_ROM_INT(LORAWAN_V1_0_4) },
+    { MP_ROM_QSTR(MP_QSTR_V1_1),      MP_ROM_INT(LORAWAN_V1_1) },
+    // Data rate constants (EU868): DR_0=SF12/BW125 .. DR_5=SF7/BW125
     { MP_ROM_QSTR(MP_QSTR_DR_0),      MP_ROM_INT(DR_0) },
     { MP_ROM_QSTR(MP_QSTR_DR_1),      MP_ROM_INT(DR_1) },
     { MP_ROM_QSTR(MP_QSTR_DR_2),      MP_ROM_INT(DR_2) },

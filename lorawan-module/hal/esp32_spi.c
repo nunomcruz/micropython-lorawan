@@ -3,6 +3,7 @@
 
 #include "spi.h"
 #include "lorawan_config.h"
+#include "pin_config.h"
 
 #include "driver/spi_master.h"
 #include "esp_attr.h"
@@ -30,8 +31,7 @@ void SpiInit(Spi_t *obj, SpiId_t spiId, PinNames mosi, PinNames miso,
         .max_transfer_sz = 256,
     };
 
-    // SPI3_HOST == VSPI on ESP32; DMA auto-selects best channel
-    esp_err_t err = spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    esp_err_t err = spi_bus_initialize(g_lorawan_pins.spi_host, &buscfg, SPI_DMA_CH_AUTO);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         // ESP_ERR_INVALID_STATE means the bus is already initialised (e.g. shared)
         return;
@@ -46,7 +46,7 @@ void SpiInit(Spi_t *obj, SpiId_t spiId, PinNames mosi, PinNames miso,
     };
 
     spi_device_handle_t handle;
-    if (spi_bus_add_device(SPI3_HOST, &devcfg, &handle) == ESP_OK) {
+    if (spi_bus_add_device(g_lorawan_pins.spi_host, &devcfg, &handle) == ESP_OK) {
         obj->Nss.port = (void *)handle;
     }
 }
@@ -54,7 +54,7 @@ void SpiInit(Spi_t *obj, SpiId_t spiId, PinNames mosi, PinNames miso,
 void SpiDeInit(Spi_t *obj) {
     if (!obj || !obj->Nss.port) return;
     spi_bus_remove_device(SPI_DEV_HANDLE(obj));
-    spi_bus_free(SPI3_HOST);
+    spi_bus_free(g_lorawan_pins.spi_host);
     obj->Nss.port = NULL;
 }
 
