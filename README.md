@@ -33,30 +33,64 @@ make BOARD=LILYGO_TTGO_TBEAM \
      USER_C_MODULES=$(pwd)/../../lorawan-module/micropython.cmake
 ```
 
-## Usage example (ABP — confirmed working)
+## Usage example (OTAA — confirmed working)
 
 ```python
 import lorawan
 
-# Init: detects radio (SX1276 reg 0x42 = 0x12), starts LoRaWAN task on CPU1
 lw = lorawan.LoRaWAN(region=lorawan.EU868)
+lw.configure(...)  # radio/region parameters
 
-# ABP join (LoRaWAN 1.0 keys)
-lw.join_abp(
-    dev_addr=0x260B0000,
-    nwk_s_key=bytes.fromhex("00000000000000000000000000000000"),
-    app_s_key=bytes.fromhex("00000000000000000000000000000000"),
-)
+# Always restore NVM before joining — the MAC initialises DevNonce to 0 on
+# every boot. Without restore, TTN rejects the join with "devnonce is too small"
+# because it has already seen that nonce in a previous session.
+try:
+    lw.nvram_restore()
+except OSError:
+    pass  # first boot — no saved session yet
+
+if lw.joined:
+    pass  # session still active, skip join
+else:
+    lw.join_otaa(
+        dev_eui=bytes.fromhex("0000000000000000"),
+        join_eui=bytes.fromhex("0000000000000000"),
+        app_key=bytes.fromhex("00000000000000000000000000000000"),
+        timeout=30,
+    )
+    # DevNonce is automatically saved to NVS after a successful join —
+    # no need to call nvram_save() here for join safety.
 
 # Send uplink — default DR_0 (SF12) for maximum range
 lw.send(b"hello", port=1)
 lw.send(b"hello", port=1, datarate=lorawan.DR_5)  # SF7 if closer to gateway
 
+# Save session after each uplink to persist frame counters
+lw.nvram_save()
+
 # Data rate constants: DR_0=SF12 (best range) .. DR_5=SF7 (fastest)
 # Device class constants: CLASS_A, CLASS_B, CLASS_C
 ```
 
-OTAA join (`join_otaa`) is planned for Session 8.
+## Usage example (ABP)
+
+```python
+import lorawan
+
+lw = lorawan.LoRaWAN(region=lorawan.EU868)
+
+try:
+    lw.nvram_restore()
+except OSError:
+    lw.join_abp(
+        dev_addr=0x260B0000,
+        nwk_s_key=bytes.fromhex("00000000000000000000000000000000"),
+        app_s_key=bytes.fromhex("00000000000000000000000000000000"),
+    )
+
+lw.send(b"hello", port=1)
+lw.nvram_save()
+```
 
 ## Hardware findings (confirmed on device)
 
@@ -72,7 +106,7 @@ Discovered during Phase 1 testing on a T-Beam v1.1 SX1262/AXP192. Relevant for t
 
 ## Project status
 
-Phase 4 Session 7 complete: ABP join and uplink confirmed working on T-Beam v1.1 SX1276/AXP192. MAC initialisation, ABP join, and TX confirmed at the MAC layer. Sessions 8–10 (OTAA, downlink, persistence) in progress.
+Phase 4 Sessions 7–10 complete: ABP join, OTAA join, uplink/downlink, confirmed messages, ADR, and NVS session persistence all confirmed working on T-Beam v1.1 SX1276/AXP192. DevNonce is automatically saved to NVS after every successful OTAA join. Phase 5 (Class C, time sync, multicast) in progress.
 
 See [TODO.md](TODO.md) for the development roadmap and [CLAUDE.md](../CLAUDE.md) for project context including hardware constants and FreeRTOS pitfalls.
 

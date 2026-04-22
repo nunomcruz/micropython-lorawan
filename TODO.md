@@ -100,7 +100,7 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Test: confirmed uplink with ACK ✓ — stats()["last_tx_ack"] = True; on_tx_done callback fired with True
 - [x] Test: on_rx callback ✓ — lambda fired with (b'\x10\x11\x12\x13\x14\x15', 1, -104, 8)
 - [x] Test: on_tx_done callback ✓ — "tx_done: True" printed after unconfirmed send
-- Note: dev_nonce_too_small on TTN is expected without NVS persistence — fix in Session 10; workaround: reset device in TTN Console before each OTAA session
+- Note: dev_nonce_too_small on TTN without NVS persistence — fixed in Session 10 (auto-save on join + nvram_restore() at boot)
 
 ### Session 10: Persistence + ADR ✓
 
@@ -112,7 +112,9 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Compile clean — zero errors; firmware 1616 KB (2 KB growth for NVM + getter/setter code)
 - [x] Test: reboot without re-join, frame counter continues — FCntUp=4 saved/restored, first uplink FCnt=5 accepted by TTN immediately
 - [x] Test: ADR jumps DR_0→DR_5 on first downlink after lw.adr(True); lw.datarate() tracks correctly
+- [x] Fix DevNonce auto-save: mlme_confirm(JOIN_OK) sets s_nvram_autosave_needed; lorawan_task saves NVM immediately after LoRaMacProcess() returns — DevNonce is never lost to a reset between join and the first Python nvram_save() call
 - Note: nvram_save CRC fix required — LoRaMacHandleNvm runs lazily on next LoRaMacProcess tick; nvram_save recomputes all group CRCs explicitly before nvs_set_blob to avoid stale CRC causing RestoreNvmData to silently skip the Crypto group (FCntUp reset to 0)
+- Note: nvram_restore() must be called at every boot before join() — the MAC initialises DevNonce to 0 by default; without restore, each reboot repeats already-seen nonces and TTN rejects with "devnonce is too small"
 
 ## Phase 5 — Advanced Features (Sessions 11–15)
 

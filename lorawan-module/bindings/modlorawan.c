@@ -161,8 +161,9 @@ static lorawan_obj_t *s_lora_obj;        // weak ref — valid while the object 
 static volatile bool  s_mac_initialized; // set true after LoRaMacInitialization() succeeds
 
 // OTAA join state — written by Python thread (join_otaa), read/cleared in lorawan_task
-static volatile bool s_otaa_active;       // join in progress; cleared on success or Python timeout
-static volatile bool s_otaa_retry_needed; // mlme_confirm(JOIN_FAIL) sets this; task re-sends
+static volatile bool s_otaa_active;          // join in progress; cleared on success or Python timeout
+static volatile bool s_otaa_retry_needed;    // mlme_confirm(JOIN_FAIL) sets this; task re-sends
+static volatile bool s_nvram_autosave_needed; // mlme_confirm(JOIN_OK) sets this; task saves after LoRaMacProcess()
 static uint8_t       s_otaa_dev_eui[8];
 static uint8_t       s_otaa_join_eui[8];
 static uint8_t       s_otaa_app_key[16];
@@ -281,6 +282,7 @@ static void mlme_confirm(MlmeConfirm_t *c) {
         esp_rom_printf("lorawan: OTAA join accepted\n");
         if (s_lora_obj) s_lora_obj->joined = true;
         s_otaa_active = false;
+        s_nvram_autosave_needed = true;
         xEventGroupSetBits(s_events, EVT_JOIN_DONE);
     } else {
         esp_rom_printf("lorawan: OTAA join attempt failed (status=%d), retrying\n",
@@ -308,6 +310,57 @@ static IRAM_ATTR void on_mac_process_notify(void) {
     }
 }
 
+// ---- NVS helpers (called from lorawan_task only) ----
+
+// Save full NVM context to ESP32 NVS. Returns true on success.
+// Called from CMD_NVRAM_SAVE (Python-triggered) and after a successful OTAA join.
+// CRCs are recomputed unconditionally: LoRaMacHandleNvm() only runs from
+// LoRaMacProcess() when MacState==IDLE, so there is a window where they are stale.
+static bool nvs_save_nvm_ctx(void) {
+    MibRequestConfirm_t mib;
+    mib.Type = MIB_NVM_CTXS;
+    LoRaMacStatus_t st = LoRaMacMibGetRequestConfirm(&mib);
+    if (st != LORAMAC_STATUS_OK) {
+        esp_rom_printf("lorawan: nvram_save: MIB_NVM_CTXS get failed: %d\n", (int)st);
+        return false;
+    }
+    LoRaMacNvmData_t *ctx = mib.Param.Contexts;
+
+#define NVM_UPDATE_CRC(grp) \
+    ctx->grp.Crc32 = Crc32((uint8_t *)&ctx->grp, \
+                            (uint16_t)(sizeof(ctx->grp) - sizeof(ctx->grp.Crc32)))
+    NVM_UPDATE_CRC(Crypto);
+    NVM_UPDATE_CRC(MacGroup1);
+    NVM_UPDATE_CRC(MacGroup2);
+    NVM_UPDATE_CRC(SecureElement);
+    NVM_UPDATE_CRC(RegionGroup1);
+    NVM_UPDATE_CRC(RegionGroup2);
+    NVM_UPDATE_CRC(ClassB);
+#undef NVM_UPDATE_CRC
+
+    esp_rom_printf("lorawan: nvram_save: FCntUp=%lu DevAddr=0x%08lx\n",
+                   (unsigned long)ctx->Crypto.FCntList.FCntUp,
+                   (unsigned long)ctx->MacGroup2.DevAddr);
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(LW_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        esp_rom_printf("lorawan: nvram_save: nvs_open failed: %d\n", (int)err);
+        return false;
+    }
+    err = nvs_set_blob(nvs, LW_NVS_KEY, ctx, sizeof(LoRaMacNvmData_t));
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    if (err != ESP_OK) {
+        esp_rom_printf("lorawan: nvram_save: NVS write failed: %d\n", (int)err);
+        return false;
+    }
+    esp_rom_printf("lorawan: nvram_save: saved %u bytes\n", (unsigned)sizeof(LoRaMacNvmData_t));
+    return true;
+}
+
 // ---- LoRaWAN task ----
 
 static void lorawan_task(void *arg) {
@@ -329,6 +382,13 @@ static void lorawan_task(void *arg) {
         // LoRaMacInitialization() + LoRaMacStart() succeed.
         if (s_mac_initialized) {
             LoRaMacProcess();
+        }
+
+        // Persist NVM immediately after a successful OTAA join so that DevNonce
+        // is never lost to a reset between join and the first Python nvram_save().
+        if (s_nvram_autosave_needed) {
+            s_nvram_autosave_needed = false;
+            nvs_save_nvm_ctx();
         }
 
         while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
@@ -557,57 +617,8 @@ static void lorawan_task(void *arg) {
             }
 
             case CMD_NVRAM_SAVE: {
-                mib.Type = MIB_NVM_CTXS;
-                LoRaMacStatus_t st = LoRaMacMibGetRequestConfirm(&mib);
-                if (st != LORAMAC_STATUS_OK) {
-                    esp_rom_printf("lorawan: nvram_save: MIB_NVM_CTXS get failed: %d\n", (int)st);
-                    xEventGroupSetBits(s_events, EVT_NVRAM_ERROR);
-                    break;
-                }
-                LoRaMacNvmData_t *ctx = mib.Param.Contexts;
-
-                // LoRaMacHandleNvm() updates CRCs, but only fires from LoRaMacProcess()
-                // when NvmHandle=1 and MacState==IDLE.  There is a race: Python calls
-                // nvram_save() as soon as mcps_confirm fires (EVT_TX_DONE), before
-                // LoRaMacProcess() has had a chance to run LoRaMacHandleNvm on the
-                // NEXT scheduler tick.  Recompute every CRC here, unconditionally,
-                // mirroring exactly what LoRaMacHandleNvm does.
-#define NVM_UPDATE_CRC(grp) \
-    ctx->grp.Crc32 = Crc32((uint8_t *)&ctx->grp, \
-                            (uint16_t)(sizeof(ctx->grp) - sizeof(ctx->grp.Crc32)))
-                NVM_UPDATE_CRC(Crypto);
-                NVM_UPDATE_CRC(MacGroup1);
-                NVM_UPDATE_CRC(MacGroup2);
-                NVM_UPDATE_CRC(SecureElement);
-                NVM_UPDATE_CRC(RegionGroup1);
-                NVM_UPDATE_CRC(RegionGroup2);
-                NVM_UPDATE_CRC(ClassB);
-#undef NVM_UPDATE_CRC
-
-                esp_rom_printf("lorawan: nvram_save: FCntUp=%lu DevAddr=0x%08lx\n",
-                               (unsigned long)ctx->Crypto.FCntList.FCntUp,
-                               (unsigned long)ctx->MacGroup2.DevAddr);
-
-                nvs_handle_t nvs;
-                esp_err_t err = nvs_open(LW_NVS_NAMESPACE, NVS_READWRITE, &nvs);
-                if (err != ESP_OK) {
-                    esp_rom_printf("lorawan: nvram_save: nvs_open failed: %d\n", (int)err);
-                    xEventGroupSetBits(s_events, EVT_NVRAM_ERROR);
-                    break;
-                }
-                err = nvs_set_blob(nvs, LW_NVS_KEY, ctx, sizeof(LoRaMacNvmData_t));
-                if (err == ESP_OK) {
-                    err = nvs_commit(nvs);
-                }
-                nvs_close(nvs);
-                if (err != ESP_OK) {
-                    esp_rom_printf("lorawan: nvram_save: NVS write failed: %d\n", (int)err);
-                    xEventGroupSetBits(s_events, EVT_NVRAM_ERROR);
-                } else {
-                    esp_rom_printf("lorawan: nvram_save: saved %u bytes\n",
-                                   (unsigned)sizeof(LoRaMacNvmData_t));
-                    xEventGroupSetBits(s_events, EVT_NVRAM_OK);
-                }
+                bool ok = nvs_save_nvm_ctx();
+                xEventGroupSetBits(s_events, ok ? EVT_NVRAM_OK : EVT_NVRAM_ERROR);
                 break;
             }
 
