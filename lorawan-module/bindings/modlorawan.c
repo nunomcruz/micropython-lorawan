@@ -1,5 +1,5 @@
 // modlorawan.c — LoRaWAN Python bindings
-// Phase 4, Session 7: lorawan_obj_t, __init__, join_abp, send
+// Phase 4, Sessions 7-8: lorawan_obj_t, __init__, join_abp, join_otaa, send, stats
 // FreeRTOS task owns all MAC calls; Python thread communicates via queue + event group.
 
 #include <stdint.h>
@@ -46,12 +46,14 @@
 #define EVT_INIT_ERROR  (1u << 1)
 #define EVT_TX_DONE     (1u << 2)
 #define EVT_TX_ERROR    (1u << 3)
+#define EVT_JOIN_DONE   (1u << 4)
 
 // ---- Command types ----
 
 typedef enum {
     CMD_INIT = 0,
     CMD_JOIN_ABP,
+    CMD_JOIN_OTAA,
     CMD_TX,
 } lorawan_cmd_t;
 
@@ -60,6 +62,12 @@ typedef struct {
     uint8_t  nwk_s_key[16];
     uint8_t  app_s_key[16];
 } cmd_join_abp_t;
+
+typedef struct {
+    uint8_t dev_eui[8];
+    uint8_t join_eui[8];
+    uint8_t app_key[16];
+} cmd_join_otaa_t;
 
 typedef struct {
     uint8_t  data[LW_PAYLOAD_MAX];
@@ -72,8 +80,9 @@ typedef struct {
 typedef struct {
     lorawan_cmd_t cmd;
     union {
-        cmd_join_abp_t join_abp;
-        cmd_tx_t       tx;
+        cmd_join_abp_t  join_abp;
+        cmd_join_otaa_t join_otaa;
+        cmd_tx_t        tx;
     };
 } lorawan_cmd_data_t;
 
@@ -103,6 +112,7 @@ typedef struct {
     uint32_t        tx_counter;
     uint32_t        tx_time_on_air;
     // Last downlink stats
+    uint32_t        rx_counter;
     int16_t         rssi;
     int8_t          snr;
 } lorawan_obj_t;
@@ -117,8 +127,15 @@ static TaskHandle_t       s_task_handle;
 static LoRaMacPrimitives_t s_mac_primitives;
 static LoRaMacCallback_t   s_mac_callbacks;
 
-static lorawan_obj_t *s_lora_obj;       // weak ref — valid while the object lives
+static lorawan_obj_t *s_lora_obj;        // weak ref — valid while the object lives
 static volatile bool  s_mac_initialized; // set true after LoRaMacInitialization() succeeds
+
+// OTAA join state — written by Python thread (join_otaa), read/cleared in lorawan_task
+static volatile bool s_otaa_active;       // join in progress; cleared on success or Python timeout
+static volatile bool s_otaa_retry_needed; // mlme_confirm(JOIN_FAIL) sets this; task re-sends
+static uint8_t       s_otaa_dev_eui[8];
+static uint8_t       s_otaa_join_eui[8];
+static uint8_t       s_otaa_app_key[16];
 
 // ---- LoRaMAC MAC-layer callbacks (run in the LoRaWAN task context) ----
 
@@ -137,13 +154,15 @@ static void mcps_confirm(McpsConfirm_t *c) {
 
 static void mcps_indication(McpsIndication_t *ind) {
     if (!ind || ind->Status != LORAMAC_EVENT_INFO_STATUS_OK) return;
-    if (!ind->RxData || ind->BufferSize == 0) return;
-    if (ind->Port == 0 || ind->Port >= 224) return;
 
     if (s_lora_obj) {
-        s_lora_obj->rssi = ind->Rssi;
-        s_lora_obj->snr  = ind->Snr;
+        s_lora_obj->rssi       = ind->Rssi;
+        s_lora_obj->snr        = ind->Snr;
+        s_lora_obj->rx_counter = ind->DownLinkCounter;
     }
+
+    if (!ind->RxData || ind->BufferSize == 0) return;
+    if (ind->Port == 0 || ind->Port >= 224) return;
 
     lorawan_rx_pkt_t pkt;
     pkt.len  = (ind->BufferSize <= LW_PAYLOAD_MAX) ? (uint8_t)ind->BufferSize : LW_PAYLOAD_MAX;
@@ -155,8 +174,23 @@ static void mcps_indication(McpsIndication_t *ind) {
 }
 
 static void mlme_confirm(MlmeConfirm_t *c) {
-    // OTAA join confirmation — Session 8
-    (void)c;
+    if (!c) return;
+    if (c->MlmeRequest != MLME_JOIN) return;
+
+    if (c->Status == LORAMAC_EVENT_INFO_STATUS_OK) {
+        esp_rom_printf("lorawan: OTAA join accepted\n");
+        if (s_lora_obj) s_lora_obj->joined = true;
+        s_otaa_active = false;
+        xEventGroupSetBits(s_events, EVT_JOIN_DONE);
+    } else {
+        esp_rom_printf("lorawan: OTAA join attempt failed (status=%d), retrying\n",
+                       (int)c->Status);
+        // Set flag; lorawan_task re-sends MLME_JOIN on next iteration so we
+        // stay out of a LoRaMAC callback when calling LoRaMacMlmeRequest.
+        if (s_otaa_active) {
+            s_otaa_retry_needed = true;
+        }
+    }
 }
 
 static void mlme_indication(MlmeIndication_t *ind) {
@@ -315,6 +349,53 @@ static void lorawan_task(void *arg) {
                 break;
             }
 
+            case CMD_JOIN_OTAA: {
+                // Store credentials for retry loop (mlme_confirm re-reads them).
+                memcpy(s_otaa_dev_eui,  cmd.join_otaa.dev_eui,  8);
+                memcpy(s_otaa_join_eui, cmd.join_otaa.join_eui, 8);
+                memcpy(s_otaa_app_key,  cmd.join_otaa.app_key,  16);
+
+                mib.Type = MIB_NETWORK_ACTIVATION;
+                mib.Param.NetworkActivation = ACTIVATION_TYPE_OTAA;
+                LoRaMacMibSetRequestConfirm(&mib);
+
+                mib.Type = MIB_DEV_EUI;
+                mib.Param.DevEui = s_otaa_dev_eui;
+                LoRaMacMibSetRequestConfirm(&mib);
+
+                mib.Type = MIB_JOIN_EUI;
+                mib.Param.JoinEui = s_otaa_join_eui;
+                LoRaMacMibSetRequestConfirm(&mib);
+
+                mib.Type = MIB_APP_KEY;
+                mib.Param.AppKey = s_otaa_app_key;
+                LoRaMacMibSetRequestConfirm(&mib);
+
+                s_otaa_active       = true;
+                s_otaa_retry_needed = false;
+
+                MlmeReq_t mlme;
+                mlme.Type                       = MLME_JOIN;
+                mlme.Req.Join.NetworkActivation = ACTIVATION_TYPE_OTAA;
+                mlme.Req.Join.Datarate          = DR_0;
+                LoRaMacStatus_t st = LoRaMacMlmeRequest(&mlme);
+                if (st != LORAMAC_STATUS_OK) {
+                    esp_rom_printf("lorawan: MLME_JOIN request error %d\n", (int)st);
+                    if (st == LORAMAC_STATUS_DUTYCYCLE_RESTRICTED) {
+                        // Will retry when duty-cycle clears; leave s_otaa_active set.
+                        s_otaa_retry_needed = true;
+                    } else {
+                        s_otaa_active = false;
+                    }
+                } else {
+                    esp_rom_printf("lorawan: OTAA join request sent\n");
+                }
+                // Signal Python that the request was accepted (or queued for retry).
+                // Python then waits separately on EVT_JOIN_DONE with its own timeout.
+                xEventGroupSetBits(s_events, EVT_COMPLETED);
+                break;
+            }
+
             case CMD_TX: {
                 LoRaMacTxInfo_t tx_info;
 
@@ -355,6 +436,27 @@ static void lorawan_task(void *arg) {
             default:
                 break;
             }
+        }
+
+        // OTAA retry: mlme_confirm set s_otaa_retry_needed after a failed join
+        // attempt.  Re-issue MLME_JOIN here (task context, not callback context).
+        // On DUTYCYCLE_RESTRICTED, MacProcessNotify will wake us again when the
+        // duty-cycle timer clears; leave s_otaa_retry_needed set so we try again.
+        if (s_otaa_retry_needed && s_otaa_active) {
+            MlmeReq_t mlme;
+            mlme.Type                        = MLME_JOIN;
+            mlme.Req.Join.NetworkActivation  = ACTIVATION_TYPE_OTAA;
+            mlme.Req.Join.Datarate           = DR_0;
+            LoRaMacStatus_t st = LoRaMacMlmeRequest(&mlme);
+            if (st == LORAMAC_STATUS_OK) {
+                s_otaa_retry_needed = false;
+            } else if (st != LORAMAC_STATUS_DUTYCYCLE_RESTRICTED) {
+                // Permanent MAC error — stop retrying so Python can timeout.
+                esp_rom_printf("lorawan: MLME_JOIN retry error %d\n", (int)st);
+                s_otaa_retry_needed = false;
+                s_otaa_active       = false;
+            }
+            // DUTYCYCLE_RESTRICTED: leave s_otaa_retry_needed = true, try again next wake.
         }
     }
 }
@@ -398,6 +500,7 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     self->tx_callback    = mp_const_none;
     self->tx_counter     = 0;
     self->tx_time_on_air = 0;
+    self->rx_counter     = 0;
     self->rssi           = 0;
     self->snr            = 0;
 
@@ -489,6 +592,66 @@ static mp_obj_t lorawan_join_abp(size_t n_args, const mp_obj_t *pos_args,
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_join_abp_obj, 1, lorawan_join_abp);
 
+static mp_obj_t lorawan_join_otaa(size_t n_args, const mp_obj_t *pos_args,
+                                   mp_map_t *kw_args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
+
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+
+    enum { ARG_dev_eui, ARG_join_eui, ARG_app_key, ARG_timeout };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_dev_eui,  MP_ARG_REQUIRED | MP_ARG_OBJ },
+        { MP_QSTR_join_eui, MP_ARG_REQUIRED | MP_ARG_OBJ },
+        { MP_QSTR_app_key,  MP_ARG_REQUIRED | MP_ARG_OBJ },
+        { MP_QSTR_timeout,  MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = 30} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
+                     MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+
+    mp_buffer_info_t dev_eui_buf, join_eui_buf, app_key_buf;
+    mp_get_buffer_raise(args[ARG_dev_eui].u_obj,  &dev_eui_buf,  MP_BUFFER_READ);
+    mp_get_buffer_raise(args[ARG_join_eui].u_obj, &join_eui_buf, MP_BUFFER_READ);
+    mp_get_buffer_raise(args[ARG_app_key].u_obj,  &app_key_buf,  MP_BUFFER_READ);
+
+    if (dev_eui_buf.len != 8 || join_eui_buf.len != 8) {
+        mp_raise_ValueError(MP_ERROR_TEXT("dev_eui and join_eui must be 8 bytes"));
+    }
+    if (app_key_buf.len != 16) {
+        mp_raise_ValueError(MP_ERROR_TEXT("app_key must be 16 bytes"));
+    }
+
+    int timeout_s = (int)args[ARG_timeout].u_int;
+    if (timeout_s <= 0) timeout_s = 30;
+
+    lorawan_cmd_data_t cmd;
+    cmd.cmd = CMD_JOIN_OTAA;
+    memcpy(cmd.join_otaa.dev_eui,  dev_eui_buf.buf,  8);
+    memcpy(cmd.join_otaa.join_eui, join_eui_buf.buf, 8);
+    memcpy(cmd.join_otaa.app_key,  app_key_buf.buf,  16);
+
+    // Phase 1: send command, wait for MAC to accept it.
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+
+    // Phase 2: wait for the join accept (or timeout).
+    // s_otaa_active remains set until mlme_confirm signals EVT_JOIN_DONE.
+    // On timeout, clear s_otaa_active so the retry loop stops.
+    xEventGroupClearBits(s_events, EVT_JOIN_DONE);
+    EventBits_t bits = xEventGroupWaitBits(s_events, EVT_JOIN_DONE,
+                                           pdTRUE, pdFALSE,
+                                           pdMS_TO_TICKS((uint32_t)timeout_s * 1000));
+
+    if (!(bits & EVT_JOIN_DONE)) {
+        s_otaa_active = false;  // stop retry loop
+        mp_raise_OSError(MP_ETIMEDOUT);
+    }
+
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_join_otaa_obj, 1, lorawan_join_otaa);
+
 static mp_obj_t lorawan_send(size_t n_args, const mp_obj_t *pos_args,
                               mp_map_t *kw_args) {
     lorawan_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
@@ -550,6 +713,8 @@ static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_send_obj, 1, lorawan_send);
 
 static mp_obj_t lorawan_joined_meth(mp_obj_t self_in) {
     lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    // self->joined is set by join_abp and by mlme_confirm(MLME_JOIN, OK).
+    // It is the authoritative flag; no need to query the MAC from the Python thread.
     return mp_obj_new_bool(self->joined);
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_joined_obj, lorawan_joined_meth);
@@ -562,15 +727,18 @@ static mp_obj_t lorawan_stats(mp_obj_t self_in) {
     mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_snr),
                       mp_obj_new_int(self->snr));
     mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_tx_counter),
-                      mp_obj_new_int(self->tx_counter));
+                      mp_obj_new_int_from_uint(self->tx_counter));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_rx_counter),
+                      mp_obj_new_int_from_uint(self->rx_counter));
     mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_tx_time_on_air),
-                      mp_obj_new_int(self->tx_time_on_air));
+                      mp_obj_new_int_from_uint(self->tx_time_on_air));
     return d;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_stats_obj, lorawan_stats);
 
 static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_join_abp),  MP_ROM_PTR(&lorawan_join_abp_obj) },
+    { MP_ROM_QSTR(MP_QSTR_join_otaa), MP_ROM_PTR(&lorawan_join_otaa_obj) },
     { MP_ROM_QSTR(MP_QSTR_send),      MP_ROM_PTR(&lorawan_send_obj) },
     { MP_ROM_QSTR(MP_QSTR_joined),    MP_ROM_PTR(&lorawan_joined_obj) },
     { MP_ROM_QSTR(MP_QSTR_stats),     MP_ROM_PTR(&lorawan_stats_obj) },
@@ -588,7 +756,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.2.0", 5);
+    return mp_obj_new_str("0.3.0", 5);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 

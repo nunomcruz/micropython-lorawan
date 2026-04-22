@@ -75,15 +75,19 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Fix busy-spin deadlock: `pdMS_TO_TICKS(10)` = 1 tick on 100 Hz — `pdMS_TO_TICKS(2)=0` caused non-blocking `ulTaskNotifyTake` which acquired `xKernelLock` at MHz rate, starving CPU0's `xQueueSend`.
 - [x] Add `datarate` kwarg to `send()` — DR_0..DR_5 constants exported; default DR_0 (SF12) for maximum uplink range
 - [x] Test: LoRaMacInitialization ✓, ABP join ✓, send() TX confirmed ✓ — packet transmitted on hardware
-- [ ] Test: ABP uplink appears on TTN console with correct payload  ← verify with SF12 if SF7 misses
+- [x] Test: ABP uplink received by TTN ✓ — TTN immediately scheduled a downlink (FCnt=0, UNCONFIRMED_DOWN)
+- [x] Fix LoRaWAN 1.0.4 MIC: LoRaMAC-node defaults to 1.1.1 MIC (two-key); TTN ABP expects 1.0.x (single-key). Set MIB_ABP_LORAWAN_VERSION=1.0.4 in join_abp.
 
-### Session 8: OTAA Join
+### Session 8: OTAA Join ✓
 
-- [ ] Implement join_otaa() — full join procedure with dev_eui, join_eui, app_key
-- [ ] Implement joined() — returns bool
-- [ ] Implement stats() — returns dict with rssi, snr, frame counters
-- [ ] Handle join timeout (blocking with timeout parameter)
-- [ ] Test: successful OTAA join on TTN, device shows as joined
+- [x] Implement join_otaa() — full join procedure with dev_eui, join_eui, app_key; retry loop via s_otaa_retry_needed flag; blocking wait with timeout parameter; raises OSError(ETIMEDOUT) on timeout
+- [x] Implement joined() — returns bool (set by join_abp or mlme_confirm MLME_JOIN OK)
+- [x] Implement stats() — returns dict with rssi, snr, tx_counter, rx_counter, tx_time_on_air
+- [x] Handle join timeout (blocking with timeout parameter)
+- [x] Add rx_counter to lorawan_obj_t; captured from McpsIndication.DownLinkCounter
+- [x] Implement mlme_confirm: MLME_JOIN OK → joined=true + EVT_JOIN_DONE; FAIL → s_otaa_retry_needed for task-context retry
+- [x] Compile clean — zero errors; firmware 1576 KB (no size regression)
+- [ ] Test: successful OTAA join on TTN, device shows as joined  ← needs hardware
 
 ### Session 9: Receive + Confirmed Messages
 
