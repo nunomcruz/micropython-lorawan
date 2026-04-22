@@ -17,6 +17,7 @@
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
 #include "nvs.h"
+#include "utilities.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"
@@ -564,6 +565,29 @@ static void lorawan_task(void *arg) {
                     break;
                 }
                 LoRaMacNvmData_t *ctx = mib.Param.Contexts;
+
+                // LoRaMacHandleNvm() updates CRCs, but only fires from LoRaMacProcess()
+                // when NvmHandle=1 and MacState==IDLE.  There is a race: Python calls
+                // nvram_save() as soon as mcps_confirm fires (EVT_TX_DONE), before
+                // LoRaMacProcess() has had a chance to run LoRaMacHandleNvm on the
+                // NEXT scheduler tick.  Recompute every CRC here, unconditionally,
+                // mirroring exactly what LoRaMacHandleNvm does.
+#define NVM_UPDATE_CRC(grp) \
+    ctx->grp.Crc32 = Crc32((uint8_t *)&ctx->grp, \
+                            (uint16_t)(sizeof(ctx->grp) - sizeof(ctx->grp.Crc32)))
+                NVM_UPDATE_CRC(Crypto);
+                NVM_UPDATE_CRC(MacGroup1);
+                NVM_UPDATE_CRC(MacGroup2);
+                NVM_UPDATE_CRC(SecureElement);
+                NVM_UPDATE_CRC(RegionGroup1);
+                NVM_UPDATE_CRC(RegionGroup2);
+                NVM_UPDATE_CRC(ClassB);
+#undef NVM_UPDATE_CRC
+
+                esp_rom_printf("lorawan: nvram_save: FCntUp=%lu DevAddr=0x%08lx\n",
+                               (unsigned long)ctx->Crypto.FCntList.FCntUp,
+                               (unsigned long)ctx->MacGroup2.DevAddr);
+
                 nvs_handle_t nvs;
                 esp_err_t err = nvs_open(LW_NVS_NAMESPACE, NVS_READWRITE, &nvs);
                 if (err != ESP_OK) {
@@ -646,8 +670,18 @@ static void lorawan_task(void *arg) {
                     if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK)
                         s_lora_obj->channels_tx_power = mib.Param.ChannelsTxPower;
                 }
-                esp_rom_printf("lorawan: nvram_restore: done, joined=%d\n",
-                               s_lora_obj ? (int)s_lora_obj->joined : 0);
+                // Read FCntUp back from the MAC to confirm the Crypto group was
+                // restored (CRC matched).  If FCntUp==0 here, the CRC was wrong.
+                mib.Type = MIB_NVM_CTXS;
+                if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK) {
+                    esp_rom_printf("lorawan: nvram_restore: FCntUp=%lu DevAddr=0x%08lx joined=%d\n",
+                                   (unsigned long)mib.Param.Contexts->Crypto.FCntList.FCntUp,
+                                   (unsigned long)mib.Param.Contexts->MacGroup2.DevAddr,
+                                   s_lora_obj ? (int)s_lora_obj->joined : 0);
+                } else {
+                    esp_rom_printf("lorawan: nvram_restore: done, joined=%d\n",
+                                   s_lora_obj ? (int)s_lora_obj->joined : 0);
+                }
                 xEventGroupSetBits(s_events, EVT_NVRAM_OK);
                 break;
             }
