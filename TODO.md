@@ -96,8 +96,11 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Implement on_rx(callback) — mcps_indication schedules lorawan_rx_trampoline via mp_sched_schedule; trampoline pops from s_rx_queue and calls callback(data, port, rssi, snr) in Python context
 - [x] Implement on_tx_done(callback) — mcps_confirm schedules lorawan_tx_trampoline; arg is True (confirmed: ACK received; unconfirmed: frame sent) or False (failure)
 - [x] Compile clean — zero errors, zero warnings; firmware 1614 KB
-- [ ] Test: receive scheduled downlink from TTN
-- [ ] Test: confirmed uplink with ACK
+- [x] Test: receive scheduled downlink from TTN ✓ — recv(timeout=10) returned (b'\x02\x03\x04\x05', 1, -105, 8)
+- [x] Test: confirmed uplink with ACK ✓ — stats()["last_tx_ack"] = True; on_tx_done callback fired with True
+- [x] Test: on_rx callback ✓ — lambda fired with (b'\x10\x11\x12\x13\x14\x15', 1, -104, 8)
+- [x] Test: on_tx_done callback ✓ — "tx_done: True" printed after unconfirmed send
+- Note: dev_nonce_too_small on TTN is expected without NVS persistence — fix in Session 10; workaround: reset device in TTN Console before each OTAA session
 
 ### Session 10: Persistence + ADR
 
