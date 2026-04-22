@@ -188,6 +188,12 @@ void SX126xSetOperatingMode( RadioOperatingModes_t mode );
  */
 extern SX126x_t SX126x;
 
+/*!
+ * \brief Initialises the SPI bus mutex for the SX126x.
+ *        Must be called once before SX126xIoInit().
+ */
+void sx126x_spi_mutex_init( void );
+
 #ifdef __cplusplus
 }
 #endif

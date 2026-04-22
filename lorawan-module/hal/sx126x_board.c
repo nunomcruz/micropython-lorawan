@@ -14,13 +14,40 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_rom_sys.h"
 
 // Current operating mode — written by driver, read back in board callbacks
 static RadioOperatingModes_t operating_mode = MODE_STDBY_RC;
 
+// Mutex protecting all SPI bus accesses.
+// Two FreeRTOS tasks concurrently access the radio SPI:
+//   - lorawan_task:   RadioIrqProcess() → SX126xGetIrqStatus()
+//   - esp_timer task: OnRxWindowNTimerEvent() → RxWindowSetup() → Radio.Rx()
+// Without this mutex, concurrent transactions corrupt the SPI stream.
+static SemaphoreHandle_t s_spi_mutex = NULL;
+
+void sx126x_spi_mutex_init(void)
+{
+    s_spi_mutex = xSemaphoreCreateMutex();
+}
+
+static inline void spi_lock(void)
+{
+    if (s_spi_mutex) xSemaphoreTake(s_spi_mutex, portMAX_DELAY);
+}
+
+static inline void spi_unlock(void)
+{
+    if (s_spi_mutex) xSemaphoreGive(s_spi_mutex);
+}
+
 // TCXO startup time in SX126x timer units (15.625 µs each).
-// 5 ms / 15.625 µs = 320 ticks — enough for the T-Beam 26 MHz TCXO.
-#define TCXO_TIMEOUT_TICKS  320U
+// 10 ms / 15.625 µs = 640 ticks. Meshtastic-validated value for the T-Beam
+// 26 MHz TCXO. 5 ms (320 ticks) was too short after Radio.Sleep() wakeup,
+// causing XOSC_START_ERR and fallback to RC oscillator (±15 ppm → TX rejected
+// by gateway). The SX1262 datasheet minimum is 500 µs + component startup.
+#define TCXO_TIMEOUT_TICKS  640U
 
 // WaitOnBusy hard timeout in microseconds (10 ms)
 #define BUSY_TIMEOUT_US     10000LL
@@ -110,8 +137,18 @@ void SX126xWakeup(void)
     SX126xWaitOnBusy();
 }
 
+static uint32_t s_last_freq_hz = 0;
+
 void SX126xWriteCommand(RadioCommands_t opcode, uint8_t *buffer, uint16_t size)
 {
+    // Capture frequency for TX diagnostic (PLL steps → Hz: freq = steps * 32e6 / 2^25)
+    if (opcode == RADIO_SET_RFFREQUENCY && size == 4) {
+        uint32_t steps = ((uint32_t)buffer[0] << 24) | ((uint32_t)buffer[1] << 16) |
+                         ((uint32_t)buffer[2] << 8)  | buffer[3];
+        s_last_freq_hz = (uint32_t)(((uint64_t)steps * 32000000ULL) >> 25);
+    }
+
+    spi_lock();
     SX126xWaitOnBusy();
     nss_low();
     SpiInOut(&SX126x.Spi, (uint16_t)opcode);
@@ -119,12 +156,14 @@ void SX126xWriteCommand(RadioCommands_t opcode, uint8_t *buffer, uint16_t size)
         SpiInOut(&SX126x.Spi, buffer[i]);
     }
     nss_high();
+    spi_unlock();
     // SX126x datasheet §14.3: BUSY goes high after NSS high; don't wait here —
     // the next WaitOnBusy call (at the start of the next command) will catch it.
 }
 
 uint8_t SX126xReadCommand(RadioCommands_t opcode, uint8_t *buffer, uint16_t size)
 {
+    spi_lock();
     SX126xWaitOnBusy();
     nss_low();
     SpiInOut(&SX126x.Spi, (uint16_t)opcode);
@@ -133,11 +172,13 @@ uint8_t SX126xReadCommand(RadioCommands_t opcode, uint8_t *buffer, uint16_t size
         buffer[i] = (uint8_t)SpiInOut(&SX126x.Spi, 0x00);
     }
     nss_high();
+    spi_unlock();
     return status;
 }
 
 void SX126xWriteRegisters(uint16_t address, uint8_t *buffer, uint16_t size)
 {
+    spi_lock();
     SX126xWaitOnBusy();
     nss_low();
     SpiInOut(&SX126x.Spi, RADIO_WRITE_REGISTER);
@@ -147,10 +188,12 @@ void SX126xWriteRegisters(uint16_t address, uint8_t *buffer, uint16_t size)
         SpiInOut(&SX126x.Spi, buffer[i]);
     }
     nss_high();
+    spi_unlock();
 }
 
 void SX126xReadRegisters(uint16_t address, uint8_t *buffer, uint16_t size)
 {
+    spi_lock();
     SX126xWaitOnBusy();
     nss_low();
     SpiInOut(&SX126x.Spi, RADIO_READ_REGISTER);
@@ -161,6 +204,7 @@ void SX126xReadRegisters(uint16_t address, uint8_t *buffer, uint16_t size)
         buffer[i] = (uint8_t)SpiInOut(&SX126x.Spi, 0x00);
     }
     nss_high();
+    spi_unlock();
 }
 
 void SX126xWriteRegister(uint16_t address, uint8_t value)
@@ -177,6 +221,7 @@ uint8_t SX126xReadRegister(uint16_t address)
 
 void SX126xWriteBuffer(uint8_t offset, uint8_t *buffer, uint8_t size)
 {
+    spi_lock();
     SX126xWaitOnBusy();
     nss_low();
     SpiInOut(&SX126x.Spi, RADIO_WRITE_BUFFER);
@@ -185,10 +230,12 @@ void SX126xWriteBuffer(uint8_t offset, uint8_t *buffer, uint8_t size)
         SpiInOut(&SX126x.Spi, buffer[i]);
     }
     nss_high();
+    spi_unlock();
 }
 
 void SX126xReadBuffer(uint8_t offset, uint8_t *buffer, uint8_t size)
 {
+    spi_lock();
     SX126xWaitOnBusy();
     nss_low();
     SpiInOut(&SX126x.Spi, RADIO_READ_BUFFER);
@@ -198,6 +245,7 @@ void SX126xReadBuffer(uint8_t offset, uint8_t *buffer, uint8_t size)
         buffer[i] = (uint8_t)SpiInOut(&SX126x.Spi, 0x00);
     }
     nss_high();
+    spi_unlock();
 }
 
 void SX126xSetRfTxPower(int8_t power)
@@ -207,6 +255,20 @@ void SX126xSetRfTxPower(int8_t power)
     // allows exceeding the region's regulatory limit at the user's responsibility.
     int8_t p = (g_tx_power_hw_override != LORAWAN_TX_POWER_NO_OVERRIDE)
                ? g_tx_power_hw_override : power;
+
+    // TX diagnostic: sync word, IRQ status, radio errors, and frequency.
+    // Sync word 0x3444 = public (LoRaWAN); 0x1424 = private.
+    // err bit 5 (0x0020) = XOSC_START_ERR: TCXO failed to start → RC oscillator used → frequency off.
+    uint8_t sw0 = SX126xReadRegister(0x0740);
+    uint8_t sw1 = SX126xReadRegister(0x0741);
+    uint16_t irq = 0;
+    SX126xReadCommand(RADIO_GET_IRQSTATUS, (uint8_t *)&irq, 2);
+    uint8_t err_buf[2] = {0};
+    SX126xReadCommand(RADIO_GET_ERROR, err_buf, 2);
+    uint16_t errs = ((uint16_t)err_buf[0] << 8) | err_buf[1];
+    esp_rom_printf("sx1262 TX: power=%d freq=%luHz syncword=0x%02x%02x irq=0x%04x err=0x%04x\n",
+                   (int)p, (unsigned long)s_last_freq_hz, sw0, sw1, (unsigned)irq, (unsigned)errs);
+
     SX126xSetTxParams(p, RADIO_RAMP_800_US);
 }
 

@@ -245,6 +245,10 @@ static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_tx_trampoline_obj, lorawan_tx_trampolin
 static void mcps_confirm(McpsConfirm_t *c) {
     if (!c) return;
 
+    esp_rom_printf("lorawan: mcps_confirm status=%d uplink=%lu toa=%lu\n",
+                   (int)c->Status, (unsigned long)c->UpLinkCounter,
+                   (unsigned long)c->TxTimeOnAir);
+
     bool tx_ok = (c->Status == LORAMAC_EVENT_INFO_STATUS_OK);
 
     if (tx_ok) {
@@ -415,6 +419,13 @@ static void lorawan_task(void *arg) {
         // initialised.  The CMD_INIT handler sets s_mac_initialized after
         // LoRaMacInitialization() + LoRaMacStart() succeed.
         if (s_mac_initialized) {
+            // SX126x: DIO1 ISR only sets IrqFired; RadioIrqProcess() reads the
+            // IRQ status register and calls RadioEvents->TxDone/RxDone which
+            // populate LoRaMacRadioEvents consumed by LoRaMacProcess().
+            // Must run before LoRaMacProcess() or TX_DONE is never seen by MAC,
+            // TX timeout fires, and McpsConfirm gets TX_TIMEOUT (→ "send failed").
+            // SX1276: IrqProcess is NULL — this is a no-op.
+            lorawan_radio_irq_process();
             LoRaMacProcess();
         }
 
@@ -945,6 +956,7 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     bool is_sx1276 = radio_forced ? is_sx1276_forced : (reg42 == 0x12);
 
     if (!is_sx1276) {
+        sx126x_spi_mutex_init();
         SX126xIoInit();
     }
 

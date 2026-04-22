@@ -25,3 +25,13 @@ void lorawan_radio_select(bool is_sx1276) {
         Radio = Radio_SX126x;
     }
 }
+
+// SX126x uses a polled IrqProcess: the DIO1 ISR only sets IrqFired, and
+// RadioIrqProcess() reads the IRQ status register and dispatches radio events.
+// SX1276 drives events directly from the ISR, so IrqProcess is NULL.
+// Must be called before LoRaMacProcess() on every task iteration.
+void lorawan_radio_irq_process(void) {
+    if (Radio.IrqProcess != NULL) {
+        Radio.IrqProcess();
+    }
+}
