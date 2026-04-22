@@ -110,8 +110,9 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Implement adr(enabled=None) — getter/setter for MIB_ADR
 - [x] Implement tx_power(power=None) — getter/setter for MIB_CHANNELS_TX_POWER (0=max, 7=min)
 - [x] Compile clean — zero errors; firmware 1616 KB (2 KB growth for NVM + getter/setter code)
-- [ ] Test: reboot without re-join, frame counter continues
-- [ ] Test: ADR adjusts data rate after several uplinks
+- [x] Test: reboot without re-join, frame counter continues — FCntUp=4 saved/restored, first uplink FCnt=5 accepted by TTN immediately
+- [x] Test: ADR jumps DR_0→DR_5 on first downlink after lw.adr(True); lw.datarate() tracks correctly
+- Note: nvram_save CRC fix required — LoRaMacHandleNvm runs lazily on next LoRaMacProcess tick; nvram_save recomputes all group CRCs explicitly before nvs_set_blob to avoid stale CRC causing RestoreNvmData to silently skip the Crypto group (FCntUp reset to 0)
 
 ## Phase 5 — Advanced Features (Sessions 11–15)
 
