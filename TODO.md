@@ -87,7 +87,7 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Add rx_counter to lorawan_obj_t; captured from McpsIndication.DownLinkCounter
 - [x] Implement mlme_confirm: MLME_JOIN OK → joined=true + EVT_JOIN_DONE; FAIL → s_otaa_retry_needed for task-context retry
 - [x] Compile clean — zero errors; firmware 1576 KB (no size regression)
-- [ ] Test: successful OTAA join on TTN, device shows as joined  ← needs hardware
+- [x] Test: OTAA join ✓, send() uplink ✓, stats() correct (tx_counter=1, rssi=-109, snr=6)
 
 ### Session 9: Receive + Confirmed Messages
 
