@@ -371,6 +371,14 @@ static void lorawan_task(void *arg) {
                 mib.Param.AppKey = s_otaa_app_key;
                 LoRaMacMibSetRequestConfirm(&mib);
 
+                // LoRaWAN 1.0.x has a single root key (AppKey); LoRaMAC-node v4.7.0
+                // always uses NwkKey for the Join Request MIC (LoRaMacCryptoPrepareJoinRequest
+                // hardcodes micComputationKeyID = NWK_KEY).  Set NwkKey = AppKey so the
+                // MIC matches what TTN expects for a 1.0.x-registered device.
+                mib.Type = MIB_NWK_KEY;
+                mib.Param.NwkKey = s_otaa_app_key;
+                LoRaMacMibSetRequestConfirm(&mib);
+
                 s_otaa_active       = true;
                 s_otaa_retry_needed = false;
 
