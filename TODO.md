@@ -102,11 +102,14 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Test: on_tx_done callback ✓ — "tx_done: True" printed after unconfirmed send
 - Note: dev_nonce_too_small on TTN is expected without NVS persistence — fix in Session 10; workaround: reset device in TTN Console before each OTAA session
 
-### Session 10: Persistence + ADR
+### Session 10: Persistence + ADR ✓
 
-- [ ] Implement nvram_save() — store session to ESP32 NVS
-- [ ] Implement nvram_restore() — restore session from NVS
-- [ ] Implement datarate(), adr(), tx_power() getters/setters
+- [x] Implement nvram_save() — store LoRaMacNvmData_t blob to ESP32 NVS via MIB_NVM_CTXS
+- [x] Implement nvram_restore() — restore from NVS, sync joined/DR/ADR/tx_power fields; raises OSError(ENOENT) if no saved session
+- [x] Implement datarate(dr=None) — getter/setter for MIB_CHANNELS_DATARATE; ADR-adjusted DR updated in mcps_confirm
+- [x] Implement adr(enabled=None) — getter/setter for MIB_ADR
+- [x] Implement tx_power(power=None) — getter/setter for MIB_CHANNELS_TX_POWER (0=max, 7=min)
+- [x] Compile clean — zero errors; firmware 1616 KB (2 KB growth for NVM + getter/setter code)
 - [ ] Test: reboot without re-join, frame counter continues
 - [ ] Test: ADR adjusts data rate after several uplinks
 

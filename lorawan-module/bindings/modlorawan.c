@@ -1,6 +1,8 @@
 // modlorawan.c — LoRaWAN Python bindings
-// Phase 4, Sessions 7-9: lorawan_obj_t, __init__, join_abp, join_otaa, send, stats,
-//                        recv, on_rx, on_tx_done, confirmed uplink ACK tracking.
+// Phase 4, Sessions 7-10: lorawan_obj_t, __init__, join_abp, join_otaa, send, stats,
+//                         recv, on_rx, on_tx_done, confirmed uplink ACK tracking,
+//                         nvram_save/restore (ESP32 NVS via MIB_NVM_CTXS),
+//                         datarate/adr/tx_power getters+setters.
 // FreeRTOS task owns all MAC calls; Python thread communicates via queue + event group.
 
 #include <stdint.h>
@@ -14,6 +16,7 @@
 #include "esp_attr.h"
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"
@@ -42,12 +45,18 @@
 // Max payload: DR5 EU868 = 222 bytes
 #define LW_PAYLOAD_MAX  222
 
+// NVS namespace and key for MAC context persistence
+#define LW_NVS_NAMESPACE  "lorawan"
+#define LW_NVS_KEY        "nvm_ctx"
+
 // Event group bits
-#define EVT_COMPLETED   (1u << 0)
-#define EVT_INIT_ERROR  (1u << 1)
-#define EVT_TX_DONE     (1u << 2)
-#define EVT_TX_ERROR    (1u << 3)
-#define EVT_JOIN_DONE   (1u << 4)
+#define EVT_COMPLETED    (1u << 0)
+#define EVT_INIT_ERROR   (1u << 1)
+#define EVT_TX_DONE      (1u << 2)
+#define EVT_TX_ERROR     (1u << 3)
+#define EVT_JOIN_DONE    (1u << 4)
+#define EVT_NVRAM_OK     (1u << 5)
+#define EVT_NVRAM_ERROR  (1u << 6)
 
 // ---- Command types ----
 
@@ -56,6 +65,9 @@ typedef enum {
     CMD_JOIN_ABP,
     CMD_JOIN_OTAA,
     CMD_TX,
+    CMD_NVRAM_SAVE,
+    CMD_NVRAM_RESTORE,
+    CMD_SET_PARAMS,
 } lorawan_cmd_t;
 
 typedef struct {
@@ -78,12 +90,23 @@ typedef struct {
     bool     confirmed;
 } cmd_tx_t;
 
+// set_params.type: 0=ADR, 1=DR, 2=TX_POWER
+typedef struct {
+    uint8_t type;
+    union {
+        bool   adr;
+        int8_t dr;
+        int8_t tx_power;
+    };
+} cmd_set_params_t;
+
 typedef struct {
     lorawan_cmd_t cmd;
     union {
         cmd_join_abp_t  join_abp;
         cmd_join_otaa_t join_otaa;
         cmd_tx_t        tx;
+        cmd_set_params_t set_params;
     };
 } lorawan_cmd_data_t;
 
@@ -117,6 +140,10 @@ typedef struct {
     uint32_t        rx_counter;
     int16_t         rssi;
     int8_t          snr;
+    // Cached MAC parameters (updated on init and after each TX when ADR is on)
+    int8_t          channels_datarate;
+    bool            adr_enabled;
+    int8_t          channels_tx_power;
 } lorawan_obj_t;
 
 // ---- Static FreeRTOS state (one LoRaWAN instance per firmware) ----
@@ -190,6 +217,16 @@ static void mcps_confirm(McpsConfirm_t *c) {
             s_lora_obj->tx_time_on_air = c->TxTimeOnAir;
             // AckReceived is only meaningful for MCPS_CONFIRMED frames.
             s_lora_obj->last_tx_ack    = c->AckReceived;
+
+            // When ADR is on the MAC may have adjusted the DR after this TX.
+            // Read it back so the Python datarate() getter stays accurate.
+            if (s_lora_obj->adr_enabled) {
+                MibRequestConfirm_t dr_mib;
+                dr_mib.Type = MIB_CHANNELS_DATARATE;
+                if (LoRaMacMibGetRequestConfirm(&dr_mib) == LORAMAC_STATUS_OK) {
+                    s_lora_obj->channels_datarate = dr_mib.Param.ChannelsDatarate;
+                }
+            }
         }
         xEventGroupSetBits(s_events, EVT_TX_DONE);
     } else {
@@ -357,6 +394,21 @@ static void lorawan_task(void *arg) {
                 mib.Param.Rx2DefaultChannel.Datarate  = DR_3;
                 LoRaMacMibSetRequestConfirm(&mib);
 
+                // Cache initial MAC parameter values into the Python object.
+                if (s_lora_obj) {
+                    mib.Type = MIB_ADR;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK)
+                        s_lora_obj->adr_enabled = mib.Param.AdrEnable;
+
+                    mib.Type = MIB_CHANNELS_DATARATE;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK)
+                        s_lora_obj->channels_datarate = mib.Param.ChannelsDatarate;
+
+                    mib.Type = MIB_CHANNELS_TX_POWER;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK)
+                        s_lora_obj->channels_tx_power = mib.Param.ChannelsTxPower;
+                }
+
                 s_mac_initialized = true;
                 if (s_lora_obj) s_lora_obj->initialized = true;
                 esp_rom_printf("lorawan: init done\n");
@@ -503,6 +555,114 @@ static void lorawan_task(void *arg) {
                 break;
             }
 
+            case CMD_NVRAM_SAVE: {
+                mib.Type = MIB_NVM_CTXS;
+                LoRaMacStatus_t st = LoRaMacMibGetRequestConfirm(&mib);
+                if (st != LORAMAC_STATUS_OK) {
+                    esp_rom_printf("lorawan: nvram_save: MIB_NVM_CTXS get failed: %d\n", (int)st);
+                    xEventGroupSetBits(s_events, EVT_NVRAM_ERROR);
+                    break;
+                }
+                LoRaMacNvmData_t *ctx = mib.Param.Contexts;
+                nvs_handle_t nvs;
+                esp_err_t err = nvs_open(LW_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+                if (err != ESP_OK) {
+                    esp_rom_printf("lorawan: nvram_save: nvs_open failed: %d\n", (int)err);
+                    xEventGroupSetBits(s_events, EVT_NVRAM_ERROR);
+                    break;
+                }
+                err = nvs_set_blob(nvs, LW_NVS_KEY, ctx, sizeof(LoRaMacNvmData_t));
+                if (err == ESP_OK) {
+                    err = nvs_commit(nvs);
+                }
+                nvs_close(nvs);
+                if (err != ESP_OK) {
+                    esp_rom_printf("lorawan: nvram_save: NVS write failed: %d\n", (int)err);
+                    xEventGroupSetBits(s_events, EVT_NVRAM_ERROR);
+                } else {
+                    esp_rom_printf("lorawan: nvram_save: saved %u bytes\n",
+                                   (unsigned)sizeof(LoRaMacNvmData_t));
+                    xEventGroupSetBits(s_events, EVT_NVRAM_OK);
+                }
+                break;
+            }
+
+            case CMD_NVRAM_RESTORE: {
+                // Static buffer: large struct; avoid stack allocation.
+                static LoRaMacNvmData_t s_restored_ctx;
+                nvs_handle_t nvs;
+                esp_err_t err = nvs_open(LW_NVS_NAMESPACE, NVS_READONLY, &nvs);
+                if (err != ESP_OK) {
+                    esp_rom_printf("lorawan: nvram_restore: nvs_open failed: %d\n", (int)err);
+                    xEventGroupSetBits(s_events, EVT_NVRAM_ERROR);
+                    break;
+                }
+                size_t size = sizeof(LoRaMacNvmData_t);
+                err = nvs_get_blob(nvs, LW_NVS_KEY, &s_restored_ctx, &size);
+                nvs_close(nvs);
+                if (err != ESP_OK) {
+                    esp_rom_printf("lorawan: nvram_restore: NVS read failed: %d\n", (int)err);
+                    xEventGroupSetBits(s_events, EVT_NVRAM_ERROR);
+                    break;
+                }
+                mib.Type = MIB_NVM_CTXS;
+                mib.Param.Contexts = &s_restored_ctx;
+                LoRaMacStatus_t st = LoRaMacMibSetRequestConfirm(&mib);
+                if (st != LORAMAC_STATUS_OK) {
+                    esp_rom_printf("lorawan: nvram_restore: MIB_NVM_CTXS set failed: %d\n", (int)st);
+                    xEventGroupSetBits(s_events, EVT_NVRAM_ERROR);
+                    break;
+                }
+                // Sync Python-side cached state from the restored MAC params.
+                if (s_lora_obj) {
+                    s_lora_obj->joined =
+                        (s_restored_ctx.MacGroup2.NetworkActivation != ACTIVATION_TYPE_NONE);
+
+                    mib.Type = MIB_CHANNELS_DATARATE;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK)
+                        s_lora_obj->channels_datarate = mib.Param.ChannelsDatarate;
+
+                    mib.Type = MIB_ADR;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK)
+                        s_lora_obj->adr_enabled = mib.Param.AdrEnable;
+
+                    mib.Type = MIB_CHANNELS_TX_POWER;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK)
+                        s_lora_obj->channels_tx_power = mib.Param.ChannelsTxPower;
+                }
+                esp_rom_printf("lorawan: nvram_restore: done, joined=%d\n",
+                               s_lora_obj ? (int)s_lora_obj->joined : 0);
+                xEventGroupSetBits(s_events, EVT_NVRAM_OK);
+                break;
+            }
+
+            case CMD_SET_PARAMS: {
+                switch (cmd.set_params.type) {
+                case 0: // ADR
+                    mib.Type = MIB_ADR;
+                    mib.Param.AdrEnable = cmd.set_params.adr;
+                    LoRaMacMibSetRequestConfirm(&mib);
+                    if (s_lora_obj) s_lora_obj->adr_enabled = cmd.set_params.adr;
+                    break;
+                case 1: // Datarate
+                    mib.Type = MIB_CHANNELS_DATARATE;
+                    mib.Param.ChannelsDatarate = cmd.set_params.dr;
+                    LoRaMacMibSetRequestConfirm(&mib);
+                    if (s_lora_obj) s_lora_obj->channels_datarate = cmd.set_params.dr;
+                    break;
+                case 2: // TX power
+                    mib.Type = MIB_CHANNELS_TX_POWER;
+                    mib.Param.ChannelsTxPower = cmd.set_params.tx_power;
+                    LoRaMacMibSetRequestConfirm(&mib);
+                    if (s_lora_obj) s_lora_obj->channels_tx_power = cmd.set_params.tx_power;
+                    break;
+                default:
+                    break;
+                }
+                xEventGroupSetBits(s_events, EVT_COMPLETED);
+                break;
+            }
+
             default:
                 break;
             }
@@ -531,13 +691,22 @@ static void lorawan_task(void *arg) {
     }
 }
 
-// ---- Internal helper ----
+// ---- Internal helpers ----
 
 static void send_cmd_wait(lorawan_cmd_data_t *cmd, EventBits_t wait_bits) {
     xEventGroupClearBits(s_events, wait_bits);
     xQueueSend(s_cmd_queue, cmd, portMAX_DELAY);
     xTaskNotifyGive(s_task_handle);
     xEventGroupWaitBits(s_events, wait_bits, pdTRUE, pdFALSE, portMAX_DELAY);
+}
+
+// Like send_cmd_wait but returns the EventBits_t so callers can distinguish
+// success from error bits (e.g. EVT_NVRAM_OK vs EVT_NVRAM_ERROR).
+static EventBits_t send_cmd_wait_result(lorawan_cmd_data_t *cmd, EventBits_t wait_bits) {
+    xEventGroupClearBits(s_events, wait_bits);
+    xQueueSend(s_cmd_queue, cmd, portMAX_DELAY);
+    xTaskNotifyGive(s_task_handle);
+    return xEventGroupWaitBits(s_events, wait_bits, pdTRUE, pdFALSE, portMAX_DELAY);
 }
 
 // ---- Python type: lorawan.LoRaWAN ----
@@ -561,19 +730,22 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     }
 
     lorawan_obj_t *self = mp_obj_malloc(lorawan_obj_t, type);
-    self->initialized    = false;
-    self->joined         = false;
-    self->is_sx1276      = true;
-    self->region         = (LoRaMacRegion_t)args[ARG_region].u_int;
-    self->device_class   = (DeviceClass_t)args[ARG_device_class].u_int;
-    self->rx_callback    = mp_const_none;
-    self->tx_callback    = mp_const_none;
-    self->tx_counter     = 0;
-    self->tx_time_on_air = 0;
-    self->last_tx_ack    = false;
-    self->rx_counter     = 0;
-    self->rssi           = 0;
-    self->snr            = 0;
+    self->initialized      = false;
+    self->joined           = false;
+    self->is_sx1276        = true;
+    self->region           = (LoRaMacRegion_t)args[ARG_region].u_int;
+    self->device_class     = (DeviceClass_t)args[ARG_device_class].u_int;
+    self->rx_callback      = mp_const_none;
+    self->tx_callback      = mp_const_none;
+    self->tx_counter       = 0;
+    self->tx_time_on_air   = 0;
+    self->last_tx_ack      = false;
+    self->rx_counter       = 0;
+    self->rssi             = 0;
+    self->snr              = 0;
+    self->channels_datarate = DR_0;
+    self->adr_enabled       = false;
+    self->channels_tx_power = 0;   // TX_POWER_0 = max power
 
     // Radio detection: bring up SX1276 HAL (GPIO + SPI), reset, read reg 0x42.
     // SX1276 version register returns 0x12; anything else means SX1262.
@@ -784,8 +956,7 @@ static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_send_obj, 1, lorawan_send);
 
 static mp_obj_t lorawan_joined_meth(mp_obj_t self_in) {
     lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    // self->joined is set by join_abp and by mlme_confirm(MLME_JOIN, OK).
-    // It is the authoritative flag; no need to query the MAC from the Python thread.
+    // self->joined is set by join_abp, by mlme_confirm(MLME_JOIN, OK), and by nvram_restore.
     return mp_obj_new_bool(self->joined);
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_joined_obj, lorawan_joined_meth);
@@ -867,15 +1038,111 @@ static mp_obj_t lorawan_on_tx_done(mp_obj_t self_in, mp_obj_t cb) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_on_tx_done_obj, lorawan_on_tx_done);
 
+// nvram_save() — persist MAC session to ESP32 NVS.
+// Saves the full LoRaMacNvmData_t blob (DevAddr, session keys, FCnt, region
+// params, ADR state) so that nvram_restore() can resume without re-joining.
+static mp_obj_t lorawan_nvram_save(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_NVRAM_SAVE };
+    EventBits_t bits = send_cmd_wait_result(&cmd, EVT_NVRAM_OK | EVT_NVRAM_ERROR);
+    if (bits & EVT_NVRAM_ERROR) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("nvram_save failed"));
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_nvram_save_obj, lorawan_nvram_save);
+
+// nvram_restore() — restore MAC session from ESP32 NVS.
+// After restore the device is marked joined and can send without re-joining.
+// Raises OSError(ENODATA) if no saved session exists.
+static mp_obj_t lorawan_nvram_restore(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_NVRAM_RESTORE };
+    EventBits_t bits = send_cmd_wait_result(&cmd, EVT_NVRAM_OK | EVT_NVRAM_ERROR);
+    if (bits & EVT_NVRAM_ERROR) {
+        mp_raise_OSError(MP_ENOENT);  // nothing saved yet, or NVS read error
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_nvram_restore_obj, lorawan_nvram_restore);
+
+// datarate(dr=None) — getter/setter for MIB_CHANNELS_DATARATE.
+// Getter returns the current DR (DR_0..DR_5).
+// Setter sets the DR; only effective when ADR is off.
+static mp_obj_t lorawan_datarate(size_t n_args, const mp_obj_t *args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    if (n_args == 1) {
+        return mp_obj_new_int(self->channels_datarate);
+    }
+    lorawan_cmd_data_t cmd;
+    cmd.cmd = CMD_SET_PARAMS;
+    cmd.set_params.type = 1;
+    cmd.set_params.dr = (int8_t)mp_obj_get_int(args[1]);
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_datarate_obj, 1, 2, lorawan_datarate);
+
+// adr(enabled=None) — getter/setter for MIB_ADR.
+static mp_obj_t lorawan_adr(size_t n_args, const mp_obj_t *args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    if (n_args == 1) {
+        return mp_obj_new_bool(self->adr_enabled);
+    }
+    lorawan_cmd_data_t cmd;
+    cmd.cmd = CMD_SET_PARAMS;
+    cmd.set_params.type = 0;
+    cmd.set_params.adr = mp_obj_is_true(args[1]);
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_adr_obj, 1, 2, lorawan_adr);
+
+// tx_power(power=None) — getter/setter for MIB_CHANNELS_TX_POWER.
+// 0 = TX_POWER_0 = max (EU868: 16 dBm EIRP), 7 = TX_POWER_7 = min.
+static mp_obj_t lorawan_tx_power(size_t n_args, const mp_obj_t *args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    if (n_args == 1) {
+        return mp_obj_new_int(self->channels_tx_power);
+    }
+    lorawan_cmd_data_t cmd;
+    cmd.cmd = CMD_SET_PARAMS;
+    cmd.set_params.type = 2;
+    cmd.set_params.tx_power = (int8_t)mp_obj_get_int(args[1]);
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_tx_power_obj, 1, 2, lorawan_tx_power);
+
 static const mp_rom_map_elem_t lorawan_locals_table[] = {
-    { MP_ROM_QSTR(MP_QSTR_join_abp),   MP_ROM_PTR(&lorawan_join_abp_obj) },
-    { MP_ROM_QSTR(MP_QSTR_join_otaa),  MP_ROM_PTR(&lorawan_join_otaa_obj) },
-    { MP_ROM_QSTR(MP_QSTR_send),       MP_ROM_PTR(&lorawan_send_obj) },
-    { MP_ROM_QSTR(MP_QSTR_recv),       MP_ROM_PTR(&lorawan_recv_obj) },
-    { MP_ROM_QSTR(MP_QSTR_joined),     MP_ROM_PTR(&lorawan_joined_obj) },
-    { MP_ROM_QSTR(MP_QSTR_stats),      MP_ROM_PTR(&lorawan_stats_obj) },
-    { MP_ROM_QSTR(MP_QSTR_on_rx),      MP_ROM_PTR(&lorawan_on_rx_obj) },
-    { MP_ROM_QSTR(MP_QSTR_on_tx_done), MP_ROM_PTR(&lorawan_on_tx_done_obj) },
+    { MP_ROM_QSTR(MP_QSTR_join_abp),       MP_ROM_PTR(&lorawan_join_abp_obj) },
+    { MP_ROM_QSTR(MP_QSTR_join_otaa),      MP_ROM_PTR(&lorawan_join_otaa_obj) },
+    { MP_ROM_QSTR(MP_QSTR_send),           MP_ROM_PTR(&lorawan_send_obj) },
+    { MP_ROM_QSTR(MP_QSTR_recv),           MP_ROM_PTR(&lorawan_recv_obj) },
+    { MP_ROM_QSTR(MP_QSTR_joined),         MP_ROM_PTR(&lorawan_joined_obj) },
+    { MP_ROM_QSTR(MP_QSTR_stats),          MP_ROM_PTR(&lorawan_stats_obj) },
+    { MP_ROM_QSTR(MP_QSTR_on_rx),          MP_ROM_PTR(&lorawan_on_rx_obj) },
+    { MP_ROM_QSTR(MP_QSTR_on_tx_done),     MP_ROM_PTR(&lorawan_on_tx_done_obj) },
+    { MP_ROM_QSTR(MP_QSTR_nvram_save),     MP_ROM_PTR(&lorawan_nvram_save_obj) },
+    { MP_ROM_QSTR(MP_QSTR_nvram_restore),  MP_ROM_PTR(&lorawan_nvram_restore_obj) },
+    { MP_ROM_QSTR(MP_QSTR_datarate),       MP_ROM_PTR(&lorawan_datarate_obj) },
+    { MP_ROM_QSTR(MP_QSTR_adr),            MP_ROM_PTR(&lorawan_adr_obj) },
+    { MP_ROM_QSTR(MP_QSTR_tx_power),       MP_ROM_PTR(&lorawan_tx_power_obj) },
 };
 static MP_DEFINE_CONST_DICT(lorawan_locals, lorawan_locals_table);
 
@@ -890,7 +1157,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.4.0", 5);
+    return mp_obj_new_str("0.5.0", 5);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 
