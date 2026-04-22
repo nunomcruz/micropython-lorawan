@@ -605,14 +605,37 @@ static void lorawan_task(void *arg) {
                     xEventGroupSetBits(s_events, EVT_NVRAM_ERROR);
                     break;
                 }
+
+                // RestoreNvmData() requires MacState == LORAMAC_STOPPED (not IDLE).
+                // Stop the MAC, restore, restart. This is safe because the Python
+                // thread is blocked in xEventGroupWaitBits so no TX can be queued.
+                LoRaMacStop();
+
                 mib.Type = MIB_NVM_CTXS;
                 mib.Param.Contexts = &s_restored_ctx;
                 LoRaMacStatus_t st = LoRaMacMibSetRequestConfirm(&mib);
+
+                // Always restart the MAC — we must not leave it stopped.
+                LoRaMacStart();
+
                 if (st != LORAMAC_STATUS_OK) {
                     esp_rom_printf("lorawan: nvram_restore: MIB_NVM_CTXS set failed: %d\n", (int)st);
                     xEventGroupSetBits(s_events, EVT_NVRAM_ERROR);
                     break;
                 }
+
+                // Re-apply TTN EU868 RX2 config: the restored MacGroup2 may have
+                // been saved with different values (or before CMD_INIT set them).
+                mib.Type = MIB_RX2_CHANNEL;
+                mib.Param.Rx2Channel.Frequency = 869525000;
+                mib.Param.Rx2Channel.Datarate  = DR_3;
+                LoRaMacMibSetRequestConfirm(&mib);
+
+                mib.Type = MIB_RX2_DEFAULT_CHANNEL;
+                mib.Param.Rx2DefaultChannel.Frequency = 869525000;
+                mib.Param.Rx2DefaultChannel.Datarate  = DR_3;
+                LoRaMacMibSetRequestConfirm(&mib);
+
                 // Sync Python-side cached state from the restored MAC params.
                 if (s_lora_obj) {
                     s_lora_obj->joined =
