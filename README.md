@@ -317,6 +317,80 @@ lorawan.DR_5   # SF7  / 125 kHz — maximum throughput
 
 ---
 
+## Raw LoRa — `tbeam` module
+
+The frozen `tbeam` module provides hardware auto-detection and access to the raw LoRa physical layer (MicroPython's `lora-sx127x` / `lora-sx126x` drivers). This is **completely separate** from the LoRaWAN MAC stack — no join, no frame counters, just raw RF packets.
+
+> **Important:** `tbeam.lora_modem()` and `lorawan.LoRaWAN()` both own the SPI bus and the radio hardware. They are mutually exclusive — do not use both at the same time. Reset the board to switch between them.
+
+### Hardware detection
+
+```python
+import tbeam
+
+hw = tbeam.detect()
+# HardwareInfo(radio='sx1262', pmu='axp192', irq=33, busy=32,
+#              gps_rx=34, gps_tx=12, oled=False)
+
+hw.radio    # 'sx1276' or 'sx1262'
+hw.pmu      # 'axp192', 'axp2101', or None (v0.7)
+hw.irq_pin  # radio IRQ GPIO
+hw.busy_pin # SX1262 BUSY GPIO, or None for SX1276
+hw.gps_rx   # GPS UART RX pin (ESP32 side)
+hw.gps_tx   # GPS UART TX pin (ESP32 side)
+hw.has_oled # True if SSD1306 found on I2C
+```
+
+`detect()` probes SPI, I2C, and optionally the GPS UART. Cache the result if calling multiple times — it takes 2–4 s on the first call.
+
+### Raw LoRa TX/RX
+
+```python
+import tbeam
+
+hw  = tbeam.detect()
+lm  = tbeam.lora_modem(hw)   # SX1276 or SX1262 SyncModem
+
+# Configure the radio (all fields optional — only set what changes)
+lm.configure({
+    "freq_khz":    868100,  # frequency in kHz
+    "sf":          7,       # spreading factor 7–12
+    "bw":          "125",   # bandwidth in kHz: "125", "250", "500"
+    "coding_rate": 5,       # 5=4/5, 6=4/6, 7=4/7, 8=4/8
+    "output_power": 14,     # TX power in dBm (SX1276 PA_BOOST: 2–20; SX1262: 2–22)
+    "preamble_len": 8,      # preamble symbols
+    "crc_en":      True,    # CRC on packet
+    "implicit_header": False,
+})
+
+# Transmit
+lm.send(b"hello world")
+
+# Receive — blocks up to timeout_ms milliseconds, returns bytes or None
+pkt = lm.recv(timeout_ms=5000)
+if pkt:
+    print("rx:", pkt, "rssi:", lm.last_rssi)
+```
+
+`lora_modem()` handles SX1262-specific initialisation automatically (DIO3 TCXO at 1.8V, DIO2 RF switch).
+
+### Other `tbeam` helpers
+
+```python
+# GPS UART (NEO-6M / NEO-M8N)
+uart = tbeam.gps_uart(hw)          # returns machine.UART, baudrate=9600
+line = uart.readline()
+
+# I2C bus (PMU, OLED, sensors)
+i2c = tbeam.i2c_bus()              # returns machine.I2C at 400 kHz
+
+# Low-level SPI + pin access (for custom driver use)
+spi  = tbeam.lora_spi(baudrate=10_000_000)
+pins = tbeam.lora_pins(hw)         # (cs, irq, rst) or (cs, irq, rst, busy)
+```
+
+---
+
 ## Examples
 
 ### OTAA sensor node (TTN, standard setup)
