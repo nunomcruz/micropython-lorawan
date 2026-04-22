@@ -89,12 +89,13 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Compile clean — zero errors; firmware 1576 KB (no size regression)
 - [x] Test: OTAA join ✓, send() uplink ✓, stats() correct (tx_counter=1, rssi=-109, snr=6)
 
-### Session 9: Receive + Confirmed Messages
+### Session 9: Receive + Confirmed Messages ✓
 
-- [ ] Implement recv() — blocking downlink with timeout
-- [ ] Implement confirmed uplink (confirmed=True in send())
-- [ ] Implement on_rx() callback — use mp_sched_schedule() to bridge to Python
-- [ ] Implement on_tx_done() callback
+- [x] Implement recv(timeout=10) — blocks on s_rx_queue; returns (data, port, rssi, snr) or None; timeout=0 polls without blocking
+- [x] Confirmed uplink already wired (MCPS_CONFIRMED in CMD_TX); added last_tx_ack field to lorawan_obj_t, captured from McpsConfirm.AckReceived; reported in stats()
+- [x] Implement on_rx(callback) — mcps_indication schedules lorawan_rx_trampoline via mp_sched_schedule; trampoline pops from s_rx_queue and calls callback(data, port, rssi, snr) in Python context
+- [x] Implement on_tx_done(callback) — mcps_confirm schedules lorawan_tx_trampoline; arg is True (confirmed: ACK received; unconfirmed: frame sent) or False (failure)
+- [x] Compile clean — zero errors, zero warnings; firmware 1614 KB
 - [ ] Test: receive scheduled downlink from TTN
 - [ ] Test: confirmed uplink with ACK
 

@@ -1,5 +1,6 @@
 // modlorawan.c — LoRaWAN Python bindings
-// Phase 4, Sessions 7-8: lorawan_obj_t, __init__, join_abp, join_otaa, send, stats
+// Phase 4, Sessions 7-9: lorawan_obj_t, __init__, join_abp, join_otaa, send, stats,
+//                        recv, on_rx, on_tx_done, confirmed uplink ACK tracking.
 // FreeRTOS task owns all MAC calls; Python thread communicates via queue + event group.
 
 #include <stdint.h>
@@ -105,12 +106,13 @@ typedef struct {
     bool            is_sx1276;
     LoRaMacRegion_t region;
     DeviceClass_t   device_class;
-    // Python callbacks (reserved for Session 9)
+    // Python callbacks
     mp_obj_t        rx_callback;
     mp_obj_t        tx_callback;
     // Last uplink stats
     uint32_t        tx_counter;
     uint32_t        tx_time_on_air;
+    bool            last_tx_ack;    // confirmed uplink: true if network ACKed
     // Last downlink stats
     uint32_t        rx_counter;
     int16_t         rssi;
@@ -137,18 +139,72 @@ static uint8_t       s_otaa_dev_eui[8];
 static uint8_t       s_otaa_join_eui[8];
 static uint8_t       s_otaa_app_key[16];
 
+// ---- Scheduler trampolines (run in MicroPython VM context) ----
+//
+// mp_sched_schedule schedules these from the LoRaWAN task (CPU1, no GIL).
+// They execute on the Python thread (CPU0, holds GIL), so it is safe to
+// allocate MicroPython objects and call Python functions here.
+
+// Called when a downlink packet has been pushed to s_rx_queue.
+// Pops one packet and invokes the stored on_rx callback.
+static mp_obj_t lorawan_rx_trampoline(mp_obj_t arg) {
+    (void)arg;
+    if (!s_lora_obj || s_lora_obj->rx_callback == mp_const_none || !s_rx_queue) {
+        return mp_const_none;
+    }
+    lorawan_rx_pkt_t pkt;
+    if (xQueueReceive(s_rx_queue, &pkt, 0) != pdTRUE) {
+        return mp_const_none;
+    }
+    mp_obj_t items[4];
+    items[0] = mp_obj_new_bytes(pkt.data, pkt.len);
+    items[1] = mp_obj_new_int(pkt.port);
+    items[2] = mp_obj_new_int(pkt.rssi);
+    items[3] = mp_obj_new_int(pkt.snr);
+    mp_call_function_1(s_lora_obj->rx_callback, mp_obj_new_tuple(4, items));
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_rx_trampoline_obj, lorawan_rx_trampoline);
+
+// Called when an uplink TX cycle completes.
+// arg is mp_const_true (success / ACK received) or mp_const_false (failure).
+static mp_obj_t lorawan_tx_trampoline(mp_obj_t arg) {
+    if (!s_lora_obj || s_lora_obj->tx_callback == mp_const_none) {
+        return mp_const_none;
+    }
+    mp_call_function_1(s_lora_obj->tx_callback, arg);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_tx_trampoline_obj, lorawan_tx_trampoline);
+
 // ---- LoRaMAC MAC-layer callbacks (run in the LoRaWAN task context) ----
 
 static void mcps_confirm(McpsConfirm_t *c) {
     if (!c) return;
-    if (c->Status == LORAMAC_EVENT_INFO_STATUS_OK) {
+
+    bool tx_ok = (c->Status == LORAMAC_EVENT_INFO_STATUS_OK);
+
+    if (tx_ok) {
         if (s_lora_obj) {
             s_lora_obj->tx_counter     = c->UpLinkCounter;
             s_lora_obj->tx_time_on_air = c->TxTimeOnAir;
+            // AckReceived is only meaningful for MCPS_CONFIRMED frames.
+            s_lora_obj->last_tx_ack    = c->AckReceived;
         }
         xEventGroupSetBits(s_events, EVT_TX_DONE);
     } else {
+        if (s_lora_obj) s_lora_obj->last_tx_ack = false;
         xEventGroupSetBits(s_events, EVT_TX_ERROR);
+    }
+
+    // Schedule Python on_tx_done callback if registered.
+    // For confirmed uplinks success = ACK received; for unconfirmed = frame sent.
+    if (s_lora_obj && s_lora_obj->tx_callback != mp_const_none) {
+        bool success = (c->McpsRequest == MCPS_CONFIRMED)
+                       ? (tx_ok && c->AckReceived)
+                       : tx_ok;
+        mp_sched_schedule(MP_OBJ_FROM_PTR(&lorawan_tx_trampoline_obj),
+                          success ? mp_const_true : mp_const_false);
     }
 }
 
@@ -171,6 +227,12 @@ static void mcps_indication(McpsIndication_t *ind) {
     pkt.snr  = ind->Snr;
     memcpy(pkt.data, ind->Buffer, pkt.len);
     xQueueSend(s_rx_queue, &pkt, 0);
+
+    // Schedule Python on_rx callback if registered.
+    // The trampoline pops from s_rx_queue and calls the callback in Python context.
+    if (s_lora_obj && s_lora_obj->rx_callback != mp_const_none) {
+        mp_sched_schedule(MP_OBJ_FROM_PTR(&lorawan_rx_trampoline_obj), mp_const_none);
+    }
 }
 
 static void mlme_confirm(MlmeConfirm_t *c) {
@@ -508,6 +570,7 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     self->tx_callback    = mp_const_none;
     self->tx_counter     = 0;
     self->tx_time_on_air = 0;
+    self->last_tx_ack    = false;
     self->rx_counter     = 0;
     self->rssi           = 0;
     self->snr            = 0;
@@ -740,16 +803,79 @@ static mp_obj_t lorawan_stats(mp_obj_t self_in) {
                       mp_obj_new_int_from_uint(self->rx_counter));
     mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_tx_time_on_air),
                       mp_obj_new_int_from_uint(self->tx_time_on_air));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_last_tx_ack),
+                      mp_obj_new_bool(self->last_tx_ack));
     return d;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_stats_obj, lorawan_stats);
 
+// recv(timeout=10) -> (data, port, rssi, snr) or None
+// Blocks until a downlink arrives or the timeout (seconds) expires.
+// Use timeout=0 to poll without blocking.
+static mp_obj_t lorawan_recv(size_t n_args, const mp_obj_t *pos_args,
+                              mp_map_t *kw_args) {
+    enum { ARG_timeout };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_timeout, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 10} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
+                     MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+
+    int timeout_s = (int)args[ARG_timeout].u_int;
+    TickType_t ticks = (timeout_s > 0)
+                       ? pdMS_TO_TICKS((uint32_t)timeout_s * 1000)
+                       : 0;
+
+    lorawan_rx_pkt_t pkt;
+    if (xQueueReceive(s_rx_queue, &pkt, ticks) != pdTRUE) {
+        return mp_const_none;
+    }
+
+    mp_obj_t items[4];
+    items[0] = mp_obj_new_bytes(pkt.data, pkt.len);
+    items[1] = mp_obj_new_int(pkt.port);
+    items[2] = mp_obj_new_int(pkt.rssi);
+    items[3] = mp_obj_new_int(pkt.snr);
+    return mp_obj_new_tuple(4, items);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_recv_obj, 1, lorawan_recv);
+
+// on_rx(callback) — register callback(data, port, rssi, snr) for incoming downlinks.
+// Pass None to deregister. Do not use together with recv() on the same object.
+static mp_obj_t lorawan_on_rx(mp_obj_t self_in, mp_obj_t cb) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (cb != mp_const_none && !mp_obj_is_callable(cb)) {
+        mp_raise_TypeError(MP_ERROR_TEXT("on_rx: callback must be callable or None"));
+    }
+    self->rx_callback = cb;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_on_rx_obj, lorawan_on_rx);
+
+// on_tx_done(callback) — register callback(success) for uplink completion.
+// For confirmed uplinks: success=True means ACK received from network.
+// For unconfirmed uplinks: success=True means frame was transmitted.
+// Pass None to deregister.
+static mp_obj_t lorawan_on_tx_done(mp_obj_t self_in, mp_obj_t cb) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (cb != mp_const_none && !mp_obj_is_callable(cb)) {
+        mp_raise_TypeError(MP_ERROR_TEXT("on_tx_done: callback must be callable or None"));
+    }
+    self->tx_callback = cb;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_on_tx_done_obj, lorawan_on_tx_done);
+
 static const mp_rom_map_elem_t lorawan_locals_table[] = {
-    { MP_ROM_QSTR(MP_QSTR_join_abp),  MP_ROM_PTR(&lorawan_join_abp_obj) },
-    { MP_ROM_QSTR(MP_QSTR_join_otaa), MP_ROM_PTR(&lorawan_join_otaa_obj) },
-    { MP_ROM_QSTR(MP_QSTR_send),      MP_ROM_PTR(&lorawan_send_obj) },
-    { MP_ROM_QSTR(MP_QSTR_joined),    MP_ROM_PTR(&lorawan_joined_obj) },
-    { MP_ROM_QSTR(MP_QSTR_stats),     MP_ROM_PTR(&lorawan_stats_obj) },
+    { MP_ROM_QSTR(MP_QSTR_join_abp),   MP_ROM_PTR(&lorawan_join_abp_obj) },
+    { MP_ROM_QSTR(MP_QSTR_join_otaa),  MP_ROM_PTR(&lorawan_join_otaa_obj) },
+    { MP_ROM_QSTR(MP_QSTR_send),       MP_ROM_PTR(&lorawan_send_obj) },
+    { MP_ROM_QSTR(MP_QSTR_recv),       MP_ROM_PTR(&lorawan_recv_obj) },
+    { MP_ROM_QSTR(MP_QSTR_joined),     MP_ROM_PTR(&lorawan_joined_obj) },
+    { MP_ROM_QSTR(MP_QSTR_stats),      MP_ROM_PTR(&lorawan_stats_obj) },
+    { MP_ROM_QSTR(MP_QSTR_on_rx),      MP_ROM_PTR(&lorawan_on_rx_obj) },
+    { MP_ROM_QSTR(MP_QSTR_on_tx_done), MP_ROM_PTR(&lorawan_on_tx_done_obj) },
 };
 static MP_DEFINE_CONST_DICT(lorawan_locals, lorawan_locals_table);
 
@@ -764,7 +890,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.3.0", 5);
+    return mp_obj_new_str("0.4.0", 5);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 
