@@ -84,7 +84,14 @@ def main():
         return
 
     try:
-        lw.clock_sync_request()  # emits the AppTimeReq uplink itself
+        # Force DR_0 (SF12/125) for the AppTimeReq. Without this, ADR may have
+        # ratcheted the DR up to DR_5 (SF7), and range-limited port-202 frames
+        # silently fail to reach the gateway (mlme_confirm fires with
+        # MLME_DEVICE_TIME status=4 and no sync callback). The DR override is
+        # scoped to this single AppTimeReq — LmhpClockSync restores the previous
+        # MIB_CHANNELS_DATARATE on the MCPS confirm, so subsequent telemetry
+        # uplinks keep the ADR-negotiated DR.
+        lw.clock_sync_request(datarate=lorawan.DR_0)
     except RuntimeError as e:
         print("clock_sync_request failed:", e)
         return
@@ -93,6 +100,23 @@ def main():
     sleep(2)
     print(f"network_time (snapshot): {format_gps(lw.network_time())}")
     print(f"synced_time (live):      {format_gps(lw.synced_time())}")
+
+    # ----- Bonus: synchronous link_check at DR_0 -----
+    # Default link_check() only queues the MAC command and relies on the next
+    # uplink to carry it. Use send_now=True to also emit an empty port-1 frame
+    # and block until the RX window closes; costs one extra uplink (FCntUp +1)
+    # but returns the fresh margin/gw_count in a single call. Pair with
+    # datarate=DR_0 for range-critical probes.
+    print("\n--- link_check (synchronous, DR_0) ---")
+    try:
+        info = lw.link_check(send_now=True, datarate=lorawan.DR_0)
+    except RuntimeError as e:
+        print("link_check failed:", e)
+        info = None
+    if info is None:
+        print("link_check: no answer (network did not send LinkCheckAns)")
+    else:
+        print(f"link margin: {info['margin']} dB, seen by {info['gw_count']} gateway(s)")
 
     lw.nvram_save()
 

@@ -361,6 +361,37 @@ The reason back-to-back `send()` calls *appear* to ignore the duty cycle is a ha
 - [x] Version bump 0.11.0 → 0.12.0 on lifecycle completion (lorawan.version() returns '0.12.0'). Compile clean, zero warnings; firmware 1644624 bytes.
 - [x] Version bump 0.12.0 → 0.13.0 on duty-cycle additions (`send(timeout=...)`, `duty_cycle()`, `time_until_tx()`). Compile clean, zero warnings; firmware 1645216 bytes (+592 B).
 
+### Session 18: DR control on MAC-command uplinks + explicit link_check send mode
+
+Two UX gaps surfaced from field testing on TTN at the EU868 cell edge:
+
+- [x] `clock_sync_request(*, datarate=None)` — optional DR override for the single
+      AppTimeReq uplink (port 202). When ADR ratchets the DR up to SF7, range-limited
+      AppTimeReq frames silently fail to reach the gateway (`MLME_DEVICE_TIME
+      status=4`). `LmhpClockSync` already snapshots and restores `MIB_CHANNELS_DATARATE`
+      around the MCPS confirm (`LmhpClockSync.c:339-341 / 205-208`), so the override
+      only affects that one AppTimeReq and does not leak into subsequent user uplinks.
+      New `dr_override` field on the cmd union carries the DR into the task loop;
+      the CMD_CLOCK_SYNC_REQUEST handler calls `LoRaMacMibSetRequestConfirm` before
+      `lorawan_clock_sync_app_time_req()`. `None` = keep current MIB (previous behaviour).
+- [x] `link_check(*, send_now=False, datarate=None)` — opt-in explicit uplink. The
+      previous `link_check()` only queued `MLME_LINK_CHECK` as a piggy-back, so calling
+      it repeatedly without a subsequent `send()` returned `None` forever — confusing
+      UX (the function is named like a synchronous probe). The piggy-back-only default
+      is preserved for callers that want to cheaply attach the MAC command to the next
+      telemetry uplink; `send_now=True` now also emits an empty unconfirmed port-1
+      frame, blocks on `EVT_TX_DONE`, and returns the fresh `{margin, gw_count}` in a
+      single call. `datarate=` is only meaningful with `send_now=True`; defaults to
+      `self->channels_datarate` (current MIB) when omitted. Raises `RuntimeError` on
+      `EVT_TX_ERROR` or 120 s timeout.
+- [x] README — both signatures updated with the new kwargs, including a worked
+      example of `link_check(send_now=True, datarate=DR_0)` and a note on the
+      behavioural change (default is still piggy-back-only; `send_now` is opt-in).
+- [x] `examples/time_sync.py` — new section demonstrating `clock_sync_request(datarate=DR_0)`
+      for robust cell-edge sync + an inline `link_check(send_now=True, datarate=DR_0)`
+      showing both the fresh answer and the airtime/FCntUp cost.
+- [x] Version bumped 0.16.0 → 0.17.0; compile clean, firmware 1646240 bytes.
+
 ### Session 17: Teardown ordering hardening (deinit safety)
 
 Follow-up to Session 16's hazard note ("An IRQ ISR firing mid-teardown will corrupt state"). Review of the `CMD_DEINIT` path found three subtle issues worth tightening before shipping the lifecycle story.

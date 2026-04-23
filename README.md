@@ -528,27 +528,39 @@ Registers a callback fired on every successful sync. Callback receives the GPS e
 
 Registers the `LmhpClockSync` application package (port 202). Returns `True` on success. Must be called once; safe to call before `join_otaa()`.
 
-#### `lw.clock_sync_request()`
+#### `lw.clock_sync_request(*, datarate=None)`
 
 Sends an `AppTimeReq` on port 202 (which also piggy-backs a MAC DeviceTimeReq). Unlike `request_device_time()`, this **does transmit an uplink** — no follow-up `send()` is required. Raises `RuntimeError` if the device is not joined or the package has not been enabled.
+
+- `datarate` (optional, `DR_0`..`DR_5`): forces `MIB_CHANNELS_DATARATE` for this single AppTimeReq. `LmhpClockSync` snapshots and restores the DR around the MCPS confirm, so the override does not leak into subsequent uplinks. Useful when ADR has ratcheted the DR up to SF7 and range-limited port-202 frames are being dropped at the gateway — pass `lorawan.DR_0` for the most robust sync.
 
 ---
 
 ### Link quality
 
-#### `lw.link_check()` → `dict | None`
+#### `lw.link_check(*, send_now=False, datarate=None)` → `dict | None`
 
-Queues an MLME LinkCheckReq (piggy-backs on the next uplink). Returns the most recent `LinkCheckAns` as `{"margin": N, "gw_count": N}`, or `None` if no answer has been received yet.
+Queues an MLME `LinkCheckReq` MAC command. Returns the most recent `LinkCheckAns` as `{"margin": N, "gw_count": N}`, or `None` if no answer has been received yet.
 
-Typical two-cycle pattern:
+Two modes:
+
+- **`send_now=False` (default)** — only queues the piggy-back. The `LinkCheckReq` rides on the **next** uplink the caller performs (`send(...)`, `clock_sync_request()`, etc.). Returns whatever is cached from a previous cycle — `None` until the first answer arrives. Cheapest mode; right when regular telemetry is already flowing.
 
 ```python
 lw.link_check()               # queue the request
-lw.send(b"")                  # carries LinkCheckReq
+lw.send(b"")                  # carries LinkCheckReq over the air
 result = lw.link_check()      # read the answer after RX window closes
 if result:
     print(f"margin={result['margin']} dB, seen by {result['gw_count']} gateways")
 ```
+
+- **`send_now=True`** — also emits an empty unconfirmed uplink on port 1 to carry the piggy-back, waits for the TX+RX cycle to complete, and returns the fresh answer in a single call. Costs one uplink of airtime and bumps `FCntUp` by one.
+
+```python
+result = lw.link_check(send_now=True, datarate=lorawan.DR_0)
+```
+
+- `datarate` (optional, `DR_0`..`DR_5`): only meaningful when `send_now=True`; sets the DR for that uplink. Defaults to the MAC's current `MIB_CHANNELS_DATARATE`. Pass `DR_0` for range-critical probes when ADR may have ratcheted the DR up to SF7.
 
 ---
 

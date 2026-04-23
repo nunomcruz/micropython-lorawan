@@ -219,6 +219,7 @@ typedef struct {
         uint8_t         mc_group;           // CMD_MC_REMOVE: 0..3
         cmd_frag_enable_t frag_enable;
         uint8_t         query_type;         // CMD_QUERY: LW_QUERY_*
+        int8_t          dr_override;        // CMD_CLOCK_SYNC_REQUEST: DR_0..DR_5; -1 = keep MIB
     };
 } lorawan_cmd_data_t;
 
@@ -1497,6 +1498,16 @@ static void lorawan_task(void *arg) {
                 // AppTimeReq uplink immediately through the shim's LmHandlerSend.
                 // Unlike request_device_time(), this already causes an uplink —
                 // no follow-up send() is required.
+                //
+                // Optional DR override: LmhpClockSync snapshots MIB_CHANNELS_DATARATE
+                // in DataratePrev before sending and restores it in OnMcpsConfirm,
+                // so mutating the MIB here only affects this one AppTimeReq.
+                if (cmd.dr_override >= 0) {
+                    MibRequestConfirm_t mib;
+                    mib.Type = MIB_CHANNELS_DATARATE;
+                    mib.Param.ChannelsDatarate = cmd.dr_override;
+                    LoRaMacMibSetRequestConfirm(&mib);
+                }
                 lorawan_clock_sync_app_time_req();
                 xEventGroupSetBits(s_events, EVT_COMPLETED);
                 break;
@@ -2828,25 +2839,83 @@ static mp_obj_t lorawan_network_time(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_network_time_obj, lorawan_network_time);
 
-// link_check() — queue an MLME_LINK_CHECK request and return the most recent
-// LinkCheckAns as {"margin": N, "gw_count": N}, or None if no answer has been
-// received yet. Mirrors the request_device_time() / network_time() pair, but
-// folded into one call since the result is tiny and has no dedicated event.
+// link_check(send_now=False, datarate=None) — queue an MLME_LINK_CHECK
+// request and return the most recent LinkCheckAns as
+// {"margin": N, "gw_count": N}, or None if no answer has been received yet.
+// Mirrors the request_device_time() / network_time() pair but folds queue
+// and readout into a single call since the result is tiny.
 //
-// The MLME queues a LinkCheckReq MAC command that piggy-backs on the next
-// uplink; the caller must trigger send() afterwards for the request to go
-// over the air. On the following cycle (after the RX window closes and
-// mlme_confirm fires), link_check() returns the fresh margin and gw_count.
-static mp_obj_t lorawan_link_check(mp_obj_t self_in) {
-    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+// Default behaviour (send_now=False): queues a LinkCheckReq MAC command that
+// piggy-backs on the *next* uplink; the caller must trigger send() afterwards
+// for the request to actually go over the air. Returns whatever is cached
+// from a previous cycle (None on first call). This is the cheapest mode —
+// useful when regular telemetry is flowing and the piggy-back costs nothing
+// extra, but confusing if you expect an immediate answer.
+//
+// With send_now=True, this function also emits an empty unconfirmed uplink
+// on port 1 to carry the piggy-back over the air, waits for the TX+RX cycle
+// to complete, and returns the fresh margin / gw_count (or None if the server
+// did not answer). The optional datarate (DR_0..DR_5) overrides the current
+// MIB_CHANNELS_DATARATE for just that uplink; pass DR_0 for range-critical
+// probes when ADR may have ratcheted the DR up to SF7. Costs one uplink of
+// airtime and bumps FCntUp by one.
+static mp_obj_t lorawan_link_check(size_t n_args, const mp_obj_t *pos_args,
+                                    mp_map_t *kw_args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
     if (!self->initialized) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
     }
     if (!self->joined) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not joined"));
     }
+
+    enum { ARG_send_now, ARG_datarate };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_send_now, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} },
+        { MP_QSTR_datarate, MP_ARG_KW_ONLY | MP_ARG_OBJ,  {.u_obj  = mp_const_none} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
+                     MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+
+    bool send_now = args[ARG_send_now].u_bool;
+    int8_t dr = -1;
+    if (args[ARG_datarate].u_obj != mp_const_none) {
+        int dr_int = mp_obj_get_int(args[ARG_datarate].u_obj);
+        if (dr_int < DR_0 || dr_int > DR_5) {
+            mp_raise_ValueError(MP_ERROR_TEXT("datarate must be DR_0..DR_5"));
+        }
+        dr = (int8_t)dr_int;
+    }
+
     lorawan_cmd_data_t cmd = { .cmd = CMD_REQUEST_LINK_CHECK };
     send_cmd_wait(&cmd, EVT_COMPLETED);
+
+    if (send_now) {
+        // Empty unconfirmed uplink carries the piggy-backed LinkCheckReq.
+        // mcps_confirm fires after RX2 closes; mlme_confirm for MLME_LINK_CHECK
+        // runs in the same callback chain (before mcps_confirm), so by the
+        // time EVT_TX_DONE is set, link_check_received has been updated if
+        // the network answered.
+        lorawan_cmd_data_t tx = { .cmd = CMD_TX };
+        tx.tx.len       = 0;
+        tx.tx.port      = 1;
+        tx.tx.confirmed = false;
+        tx.tx.datarate  = (dr >= 0) ? (uint8_t)dr : (uint8_t)self->channels_datarate;
+        xEventGroupClearBits(s_events, EVT_TX_DONE | EVT_TX_ERROR);
+        xQueueSend(s_cmd_queue, &tx, portMAX_DELAY);
+        xTaskNotifyGive(s_task_handle);
+        EventBits_t bits = xEventGroupWaitBits(s_events,
+                                               EVT_TX_DONE | EVT_TX_ERROR,
+                                               pdTRUE, pdFALSE,
+                                               pdMS_TO_TICKS(120000));
+        if (bits & EVT_TX_ERROR) {
+            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("link_check send failed"));
+        }
+        if (!(bits & EVT_TX_DONE)) {
+            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("link_check send timeout"));
+        }
+    }
 
     if (!self->link_check_received) {
         return mp_const_none;
@@ -2858,7 +2927,7 @@ static mp_obj_t lorawan_link_check(mp_obj_t self_in) {
                       mp_obj_new_int(self->link_check_gw_count));
     return d;
 }
-static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_link_check_obj, lorawan_link_check);
+static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_link_check_obj, 1, lorawan_link_check);
 
 // rejoin(type=0) — send a LoRaWAN 1.1 ReJoin-request frame.
 // type=0: announce presence; network may re-derive session keys (1.1 only).
@@ -2905,17 +2974,24 @@ static mp_obj_t lorawan_clock_sync_enable(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_clock_sync_enable_obj, lorawan_clock_sync_enable);
 
-// clock_sync_request() — trigger LmhpClockSyncAppTimeReq: emits an AppTimeReq
-// uplink on port 202 AND piggy-backs a MAC-layer DeviceTimeReq. Unlike
-// request_device_time() (which only queues a piggy-back MAC command), this
-// already causes an uplink to go out — no follow-up send() is required.
+// clock_sync_request(datarate=None) — trigger LmhpClockSyncAppTimeReq: emits
+// an AppTimeReq uplink on port 202 AND piggy-backs a MAC-layer DeviceTimeReq.
+// Unlike request_device_time() (which only queues a piggy-back MAC command),
+// this already causes an uplink to go out — no follow-up send() is required.
 //
 // The server's AppTimeAns or MAC-layer DeviceTimeAns arrives in the RX window
 // of that uplink; LmhpClockSync updates SysTime and invokes the shim's
 // OnSysTimeUpdate hook, which refreshes self.network_time_gps and fires the
 // registered on_time_sync callback.
-static mp_obj_t lorawan_clock_sync_request(mp_obj_t self_in) {
-    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+//
+// If datarate is provided (DR_0..DR_5), MIB_CHANNELS_DATARATE is set to it
+// for this single AppTimeReq. LmhpClockSync snapshots and restores the DR
+// around the confirm, so the override does not leak into subsequent uplinks.
+// Useful when ADR has ratcheted the DR up to SF7 and port-202 frames are
+// getting lost at the gateway — force DR_0 for range-critical syncs.
+static mp_obj_t lorawan_clock_sync_request(size_t n_args, const mp_obj_t *pos_args,
+                                            mp_map_t *kw_args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
     if (!self->initialized) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
     }
@@ -2926,11 +3002,30 @@ static mp_obj_t lorawan_clock_sync_request(mp_obj_t self_in) {
         mp_raise_msg(&mp_type_RuntimeError,
                      MP_ERROR_TEXT("clock sync not enabled; call clock_sync_enable() first"));
     }
+
+    enum { ARG_datarate };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_datarate, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
+                     MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+
+    int8_t dr = -1;
+    if (args[ARG_datarate].u_obj != mp_const_none) {
+        int dr_int = mp_obj_get_int(args[ARG_datarate].u_obj);
+        if (dr_int < DR_0 || dr_int > DR_5) {
+            mp_raise_ValueError(MP_ERROR_TEXT("datarate must be DR_0..DR_5"));
+        }
+        dr = (int8_t)dr_int;
+    }
+
     lorawan_cmd_data_t cmd = { .cmd = CMD_CLOCK_SYNC_REQUEST };
+    cmd.dr_override = dr;
     send_cmd_wait(&cmd, EVT_COMPLETED);
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_clock_sync_request_obj, lorawan_clock_sync_request);
+static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_clock_sync_request_obj, 1, lorawan_clock_sync_request);
 
 // synced_time() — return the corrected time as GPS epoch seconds (live, based
 // on SysTimeGet), or None if no sync has happened yet. Unlike network_time()
@@ -3438,7 +3533,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.16.0", 6);
+    return mp_obj_new_str("0.17.0", 6);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 
