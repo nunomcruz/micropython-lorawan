@@ -147,8 +147,18 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
       - Warning logged when override exceeds region regulatory limit
       - Version bumped to 0.6.0; compile clean — 1618 KB (+1 KB)
 - [x] End-to-end SX1262 test: join, uplink, downlink, confirmed, persistence — fixed sleep/wakeup bug (SX126xWakeup must update operating_mode to STDBY_RC; recursive SPI mutex; ensure_awake() in all SPI functions)
-- [ ] Class C support (`request_class(CLASS_C)`, continuous RX2 window)
-- [ ] Implement `on_class_change(callback)` — confirmed class transitions
+- [x] Class C support — `request_class(CLASS_A|CLASS_C)`, `device_class()`, `on_class_change(cb)`
+      - Class A <-> C via `MIB_DEVICE_CLASS` (instantaneous, synchronous). Dispatched through new `CMD_SET_CLASS` in the LoRaWAN task so the MAC is touched only from task context. No MLME confirm fires for this transition — task schedules `on_class_change(new_class)` via `mp_sched_schedule` immediately after the MIB set succeeds.
+      - `EVT_CLASS_OK` / `EVT_CLASS_ERROR` event bits mirror the NVRAM pattern for blocking `request_class()`. `class_callback` stored on `lorawan_obj_t`, init'd to `mp_const_none`.
+      - `CLASS_B` raises `NotImplementedError` (needs beacon acquisition, Session 13).
+      - Persistence: `MacGroup2.DeviceClass` is part of the NVM blob; `nvram_restore()` now reads `MIB_DEVICE_CLASS` back and syncs `self->device_class`. `LoRaMacInitialization()` does not force Class A — the restored class is honoured.
+      - Version 0.6.0 → 0.7.0; compile clean, zero warnings; firmware 1619 KB.
+      - **RxC window fix**: on first test, class C switched OK but `recv(timeout=30)` returned None despite TTN queueing a confirmed downlink. Root cause: LoRaMAC-node v4.7.0 has a **separate** `RxCChannel` (used by the Class C continuous listen) alongside `Rx2Channel`. `MIB_RX2_CHANNEL` only writes `Rx2Channel`. In `SwitchClass(CLASS_C)`, `OpenContinuousRxCWindow()` recomputes the RX config from `RxCChannel.Datarate` — which defaults to `PHY_DEF_RX2_DR` = DR_0 (SF12) in EU868 — so the radio ends up listening at SF12 while TTN transmits on DR_3 (SF9). Fix: `CMD_INIT` now also writes `MIB_RXC_CHANNEL` and `MIB_RXC_DEFAULT_CHANNEL` with the same (freq, DR) as RX2.
+      - Test: configure device as Class C on TTN, call `request_class(CLASS_C)`, schedule a downlink from TTN console and verify `recv()` gets it without a preceding uplink. Also test class persistence across reboot.
+- [ ] Configurable antenna gain (`antenna_gain` kwarg on `__init__`, default 0.0)
+      - Currently `EU868_DEFAULT_ANTENNA_GAIN = 2.15` in `RegionEU868.h` causes the MAC to subtract 2.15 from EIRP, so `tx_power()` reports 16 dBm but the radio only emits 13. With default 0.0, the radio emits the full EIRP.
+      - Implementation: add `antenna_gain` float kwarg to `__init__` (default 0.0); store in `lorawan_obj_t`; set `MIB_ANTENNA_GAIN` via `LoRaMacMibSetRequestConfirm` during init (after `LoRaMacInitialization`). Also expose as getter/setter: `lw.antenna_gain()` / `lw.antenna_gain(2.15)`.
+      - The MIB value is a `float`; `RegionCommonComputeTxPower()` in `RegionCommon.c:466` uses it as: `phyTxPower = floor(maxEirp - (index * 2) - antennaGain)`.
 - [ ] EU433 region support (enable REGION_EU433 in config)
 
 ### Session 12: Advanced MAC commands + time sync

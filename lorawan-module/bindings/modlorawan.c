@@ -4,7 +4,8 @@
 //                         nvram_save/restore (ESP32 NVS via MIB_NVM_CTXS),
 //                         datarate/adr/tx_power getters+setters.
 // Phase 5, Session 11:   runtime pin config; lorawan_version (1.0.4/1.1), rx2_dr/freq,
-//                         tx_power kwargs on __init__; nwk_key kwarg on join_otaa.
+//                         tx_power kwargs on __init__; nwk_key kwarg on join_otaa;
+//                         request_class / device_class / on_class_change (Class A <-> C).
 // FreeRTOS task owns all MAC calls; Python thread communicates via queue + event group.
 
 #include <stdint.h>
@@ -66,6 +67,8 @@
 #define EVT_JOIN_DONE    (1u << 4)
 #define EVT_NVRAM_OK     (1u << 5)
 #define EVT_NVRAM_ERROR  (1u << 6)
+#define EVT_CLASS_OK     (1u << 7)
+#define EVT_CLASS_ERROR  (1u << 8)
 
 // ---- Command types ----
 
@@ -77,6 +80,7 @@ typedef enum {
     CMD_NVRAM_SAVE,
     CMD_NVRAM_RESTORE,
     CMD_SET_PARAMS,
+    CMD_SET_CLASS,
 } lorawan_cmd_t;
 
 typedef struct {
@@ -117,6 +121,7 @@ typedef struct {
         cmd_join_otaa_t join_otaa;
         cmd_tx_t        tx;
         cmd_set_params_t set_params;
+        uint8_t         device_class; // CMD_SET_CLASS: DeviceClass_t value
     };
 } lorawan_cmd_data_t;
 
@@ -146,6 +151,7 @@ typedef struct {
     // Python callbacks
     mp_obj_t        rx_callback;
     mp_obj_t        tx_callback;
+    mp_obj_t        class_callback;
     // Last uplink stats
     uint32_t        tx_counter;
     uint32_t        tx_time_on_air;
@@ -239,6 +245,17 @@ static mp_obj_t lorawan_tx_trampoline(mp_obj_t arg) {
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_tx_trampoline_obj, lorawan_tx_trampoline);
+
+// Called when a device-class transition is confirmed.
+// arg is the new class as a small int (CLASS_A, CLASS_B, CLASS_C).
+static mp_obj_t lorawan_class_trampoline(mp_obj_t arg) {
+    if (!s_lora_obj || s_lora_obj->class_callback == mp_const_none) {
+        return mp_const_none;
+    }
+    mp_call_function_1(s_lora_obj->class_callback, arg);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_class_trampoline_obj, lorawan_class_trampoline);
 
 // ---- LoRaMAC MAC-layer callbacks (run in the LoRaWAN task context) ----
 
@@ -504,6 +521,23 @@ static void lorawan_task(void *arg) {
                 esp_rom_printf("lorawan: RX2 freq=%lu DR=%u\n",
                                (unsigned long)rx2_freq, (unsigned)rx2_dr);
 
+                // Class C RxC window is a separate channel (RxCChannel) that
+                // defaults to PHY_DEF_RX2_DR (DR_0 / SF12 in EU868). When we
+                // switch to Class C, OpenContinuousRxCWindow() recomputes the
+                // RX config from RxCChannel.Datarate and ignores the RX2 MIB,
+                // so the radio ends up listening at SF12 while TTN transmits
+                // at DR_3 (SF9). Mirror the RX2 settings into RxC so the
+                // continuous listen matches the network RX2 parameters.
+                mib.Type = MIB_RXC_CHANNEL;
+                mib.Param.RxCChannel.Frequency = rx2_freq;
+                mib.Param.RxCChannel.Datarate  = rx2_dr;
+                LoRaMacMibSetRequestConfirm(&mib);
+
+                mib.Type = MIB_RXC_DEFAULT_CHANNEL;
+                mib.Param.RxCDefaultChannel.Frequency = rx2_freq;
+                mib.Param.RxCDefaultChannel.Datarate  = rx2_dr;
+                LoRaMacMibSetRequestConfirm(&mib);
+
                 // Apply user-specified initial TX power (if non-default).
                 // channels_tx_power is a MAC index; 0 = max (16 dBm EU868).
                 if (s_lora_obj && s_lora_obj->channels_tx_power != 0) {
@@ -737,6 +771,12 @@ static void lorawan_task(void *arg) {
                     mib.Type = MIB_CHANNELS_TX_POWER;
                     if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK)
                         s_lora_obj->channels_tx_power = mib.Param.ChannelsTxPower;
+
+                    // Device class is stored in MacGroup2.DeviceClass; the MIB
+                    // getter returns the live value which mirrors NVM.
+                    mib.Type = MIB_DEVICE_CLASS;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK)
+                        s_lora_obj->device_class = mib.Param.Class;
                 }
                 // Read FCntUp back from the MAC to confirm the Crypto group was
                 // restored (CRC matched).  If FCntUp==0 here, the CRC was wrong.
@@ -778,6 +818,53 @@ static void lorawan_task(void *arg) {
                     break;
                 }
                 xEventGroupSetBits(s_events, EVT_COMPLETED);
+                break;
+            }
+
+            case CMD_SET_CLASS: {
+                // LoRaMAC-node v4.7.0 does not expose LoRaMacRequestClass / MLME_CLASS_C_SWITCH.
+                // Class A <-> Class C switches are done via MIB_DEVICE_CLASS and are
+                // instantaneous (see LmHandler.c: LmHandlerRequestClass).
+                // Class B requires DeviceTime + beacon acquisition (Session 13).
+                DeviceClass_t new_class = (DeviceClass_t)cmd.device_class;
+
+                if (new_class == CLASS_B) {
+                    esp_rom_printf("lorawan: CLASS_B switch not implemented yet\n");
+                    xEventGroupSetBits(s_events, EVT_CLASS_ERROR);
+                    break;
+                }
+
+                // MIB_DEVICE_CLASS set fails if current class is B and the target
+                // is anything other than A. We allow only A <-> C here.
+                mib.Type = MIB_DEVICE_CLASS;
+                LoRaMacMibGetRequestConfirm(&mib);
+                DeviceClass_t cur_class = mib.Param.Class;
+
+                if (cur_class == new_class) {
+                    // No-op: already in the requested class.
+                    xEventGroupSetBits(s_events, EVT_CLASS_OK);
+                    break;
+                }
+
+                mib.Type = MIB_DEVICE_CLASS;
+                mib.Param.Class = new_class;
+                LoRaMacStatus_t st = LoRaMacMibSetRequestConfirm(&mib);
+                if (st != LORAMAC_STATUS_OK) {
+                    esp_rom_printf("lorawan: MIB_DEVICE_CLASS set failed: %d\n", (int)st);
+                    xEventGroupSetBits(s_events, EVT_CLASS_ERROR);
+                    break;
+                }
+
+                if (s_lora_obj) {
+                    s_lora_obj->device_class = new_class;
+                    if (s_lora_obj->class_callback != mp_const_none) {
+                        mp_sched_schedule(MP_OBJ_FROM_PTR(&lorawan_class_trampoline_obj),
+                                          MP_OBJ_NEW_SMALL_INT((mp_int_t)new_class));
+                    }
+                }
+                esp_rom_printf("lorawan: device class -> %c\n",
+                               new_class == CLASS_A ? 'A' : (new_class == CLASS_B ? 'B' : 'C'));
+                xEventGroupSetBits(s_events, EVT_CLASS_OK);
                 break;
             }
 
@@ -881,6 +968,7 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     self->rx2_freq         = (uint32_t)args[ARG_rx2_freq].u_int;
     self->rx_callback      = mp_const_none;
     self->tx_callback      = mp_const_none;
+    self->class_callback   = mp_const_none;
     self->tx_counter       = 0;
     self->tx_time_on_air   = 0;
     self->last_tx_ack      = false;
@@ -1378,6 +1466,53 @@ static mp_obj_t lorawan_tx_power(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_tx_power_obj, 1, 2, lorawan_tx_power);
 
+// request_class(cls) — request a switch to CLASS_A or CLASS_C.
+// CLASS_B is not yet supported (requires beacon acquisition, Session 13).
+// LoRaMAC-node v4.7.0 performs A <-> C transitions synchronously via
+// MIB_DEVICE_CLASS; the on_class_change callback fires after success.
+static mp_obj_t lorawan_request_class(mp_obj_t self_in, mp_obj_t cls_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    int cls = mp_obj_get_int(cls_in);
+    if (cls != CLASS_A && cls != CLASS_B && cls != CLASS_C) {
+        mp_raise_ValueError(MP_ERROR_TEXT("class must be CLASS_A, CLASS_B or CLASS_C"));
+    }
+    if (cls == CLASS_B) {
+        mp_raise_NotImplementedError(MP_ERROR_TEXT("CLASS_B not implemented"));
+    }
+
+    lorawan_cmd_data_t cmd;
+    cmd.cmd = CMD_SET_CLASS;
+    cmd.device_class = (uint8_t)cls;
+    EventBits_t bits = send_cmd_wait_result(&cmd, EVT_CLASS_OK | EVT_CLASS_ERROR);
+    if (bits & EVT_CLASS_ERROR) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("class switch failed"));
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_request_class_obj, lorawan_request_class);
+
+// device_class() — returns the current device class (CLASS_A, CLASS_B, CLASS_C).
+static mp_obj_t lorawan_device_class(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    return mp_obj_new_int((int)self->device_class);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_device_class_obj, lorawan_device_class);
+
+// on_class_change(callback) — register callback(new_class) for class transitions.
+// Pass None to deregister.
+static mp_obj_t lorawan_on_class_change(mp_obj_t self_in, mp_obj_t cb) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (cb != mp_const_none && !mp_obj_is_callable(cb)) {
+        mp_raise_TypeError(MP_ERROR_TEXT("on_class_change: callback must be callable or None"));
+    }
+    self->class_callback = cb;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_on_class_change_obj, lorawan_on_class_change);
+
 static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_join_abp),       MP_ROM_PTR(&lorawan_join_abp_obj) },
     { MP_ROM_QSTR(MP_QSTR_join_otaa),      MP_ROM_PTR(&lorawan_join_otaa_obj) },
@@ -1392,6 +1527,9 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_datarate),       MP_ROM_PTR(&lorawan_datarate_obj) },
     { MP_ROM_QSTR(MP_QSTR_adr),            MP_ROM_PTR(&lorawan_adr_obj) },
     { MP_ROM_QSTR(MP_QSTR_tx_power),       MP_ROM_PTR(&lorawan_tx_power_obj) },
+    { MP_ROM_QSTR(MP_QSTR_request_class),  MP_ROM_PTR(&lorawan_request_class_obj) },
+    { MP_ROM_QSTR(MP_QSTR_device_class),   MP_ROM_PTR(&lorawan_device_class_obj) },
+    { MP_ROM_QSTR(MP_QSTR_on_class_change), MP_ROM_PTR(&lorawan_on_class_change_obj) },
 };
 static MP_DEFINE_CONST_DICT(lorawan_locals, lorawan_locals_table);
 
@@ -1406,7 +1544,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.6.0", 5);
+    return mp_obj_new_str("0.7.0", 5);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 
