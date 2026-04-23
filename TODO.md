@@ -171,10 +171,38 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 
 ### Session 12: Advanced MAC commands + time sync
 
-- [ ] Implement `request_device_time()` — MLME_DEVICE_TIME, sends DeviceTimeReq
-- [ ] Implement `network_time()` — returns GPS epoch seconds from last DeviceTimeAns
-- [ ] Implement `on_time_sync(callback)` — notification when time is received
-- [ ] Implement `link_check()` — MLME_LINK_CHECK, returns margin + gateway count
+- [x] Implement `request_device_time()` — MLME_DEVICE_TIME, sends DeviceTimeReq
+      - New `CMD_REQUEST_DEVICE_TIME` dispatched through the LoRaWAN task; the
+        MLME request only queues the DeviceTimeReq as a piggy-back MAC command,
+        so the caller must follow with `send()` to carry it over the air.
+      - `mlme_confirm()` gains a `MLME_DEVICE_TIME` case: on status OK it reads
+        `SysTimeGet()` (MAC has already applied `SysTimeSet` during RX), converts
+        to GPS epoch seconds (Unix - `UNIX_GPS_EPOCH_OFFSET`) and stores it on
+        `lorawan_obj_t.network_time_gps`, flagging `time_synced=true` for the
+        upcoming `network_time()` / `on_time_sync()` APIs.
+      - Version bumped 0.8.0 → 0.9.0; compile clean, firmware 1624 KB.
+- [x] Implement `network_time()` — returns GPS epoch seconds from last DeviceTimeAns
+      - Reads the `network_time_gps` snapshot captured in `mlme_confirm(MLME_DEVICE_TIME)`.
+        Returns `None` when `time_synced` is still false (no answer received yet).
+- [x] Implement `on_time_sync(callback)` — notification when time is received
+      - `time_sync_callback` added to `lorawan_obj_t`; registered via `on_time_sync(cb)`.
+      - `mlme_confirm(MLME_DEVICE_TIME, OK)` schedules `lorawan_time_sync_trampoline`
+        via `mp_sched_schedule`. The trampoline reads `network_time_gps` from the
+        object and allocates the Python int in VM context — the GPS epoch in 2026
+        (~1.4 B) exceeds the 31-bit `MP_OBJ_NEW_SMALL_INT` range, so passing it
+        through the scheduler arg would overflow.
+      - Version bumped 0.9.0 → 0.9.1; compile clean, firmware 1624 KB (unchanged).
+- [x] Implement `link_check()` — MLME_LINK_CHECK, returns margin + gateway count
+      - New `CMD_REQUEST_LINK_CHECK` dispatched through the LoRaWAN task; the
+        MLME request only queues the LinkCheckReq as a piggy-back MAC command,
+        so the caller must follow with `send()` to carry it over the air.
+      - `mlme_confirm()` gains a `MLME_LINK_CHECK` case: on status OK it caches
+        `DemodMargin` and `NbGateways` on `lorawan_obj_t`, flagging
+        `link_check_received=true` after the first successful answer.
+      - `link_check()` queues the MLME and returns the cached answer as
+        `{"margin": N, "gw_count": N}` (or `None` if no LinkCheckAns yet).
+        Typical pattern: `lw.link_check(); lw.send(b"p"); result = lw.link_check()`.
+      - Compile clean, firmware 1624 KB (unchanged).
 - [ ] Implement `rejoin(type=0|1|2)` — LoRaWAN 1.1 rejoin without full join
 - [ ] Register Clock Sync package (LmhpClockSync, port 202)
 - [ ] Implement `clock_sync_enable()`, `clock_sync_request()`, `synced_time()`

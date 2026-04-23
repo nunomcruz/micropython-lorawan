@@ -36,6 +36,7 @@
 #include "lorawan_config.h"
 #include "LoRaMac.h"
 #include "region/RegionEU868.h"
+#include "systime.h"
 
 // Note: we deliberately do NOT include sx1276-board.h / sx126x-board.h /
 // the chip-level sx1276.h / sx126x.h here.  Those headers define several
@@ -88,6 +89,8 @@ typedef enum {
     CMD_NVRAM_RESTORE,
     CMD_SET_PARAMS,
     CMD_SET_CLASS,
+    CMD_REQUEST_DEVICE_TIME,
+    CMD_REQUEST_LINK_CHECK,
 } lorawan_cmd_t;
 
 typedef struct {
@@ -160,6 +163,7 @@ typedef struct {
     mp_obj_t        rx_callback;
     mp_obj_t        tx_callback;
     mp_obj_t        class_callback;
+    mp_obj_t        time_sync_callback;
     // Last uplink stats
     uint32_t        tx_counter;
     uint32_t        tx_time_on_air;
@@ -177,6 +181,17 @@ typedef struct {
     // EU868 region default is 2.15 dBi; we default to 0.0 so the radio emits full EIRP
     // unless the user explicitly declares a gain.
     float           antenna_gain;
+    // Network time sync — populated by MLME_DEVICE_TIME confirm (DeviceTimeAns).
+    // network_time_gps is GPS epoch seconds captured at the moment the ans was
+    // processed; time_synced becomes true on first successful sync and stays true.
+    bool            time_synced;
+    uint32_t        network_time_gps;
+    // Link check — populated by MLME_LINK_CHECK confirm (LinkCheckAns).
+    // link_check_received stays true after the first successful answer; each
+    // new answer overwrites margin/gw_count.
+    bool            link_check_received;
+    uint8_t         link_check_margin;
+    uint8_t         link_check_gw_count;
 } lorawan_obj_t;
 
 // ---- Static FreeRTOS state (one LoRaWAN instance per firmware) ----
@@ -270,6 +285,23 @@ static mp_obj_t lorawan_class_trampoline(mp_obj_t arg) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_class_trampoline_obj, lorawan_class_trampoline);
 
+// Called when a DeviceTimeAns has been processed and the MAC system time
+// has been updated. Passes the GPS epoch seconds (uint32) to the callback.
+// We pass mp_const_none as the scheduler arg and read the timestamp from
+// the object here — allocating a Python int in the LoRaWAN task context
+// (no GIL) is not safe, and GPS epoch in 2026 exceeds the 31-bit small-int
+// range so MP_OBJ_NEW_SMALL_INT would overflow.
+static mp_obj_t lorawan_time_sync_trampoline(mp_obj_t arg) {
+    (void)arg;
+    if (!s_lora_obj || s_lora_obj->time_sync_callback == mp_const_none) {
+        return mp_const_none;
+    }
+    mp_obj_t t = mp_obj_new_int_from_uint(s_lora_obj->network_time_gps);
+    mp_call_function_1(s_lora_obj->time_sync_callback, t);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_time_sync_trampoline_obj, lorawan_time_sync_trampoline);
+
 // ---- LoRaMAC MAC-layer callbacks (run in the LoRaWAN task context) ----
 
 static void mcps_confirm(McpsConfirm_t *c) {
@@ -344,22 +376,73 @@ static void mcps_indication(McpsIndication_t *ind) {
 
 static void mlme_confirm(MlmeConfirm_t *c) {
     if (!c) return;
-    if (c->MlmeRequest != MLME_JOIN) return;
 
-    if (c->Status == LORAMAC_EVENT_INFO_STATUS_OK) {
-        esp_rom_printf("lorawan: OTAA join accepted\n");
-        if (s_lora_obj) s_lora_obj->joined = true;
-        s_otaa_active = false;
-        s_nvram_autosave_needed = true;
-        xEventGroupSetBits(s_events, EVT_JOIN_DONE);
-    } else {
-        esp_rom_printf("lorawan: OTAA join attempt failed (status=%d), retrying\n",
-                       (int)c->Status);
-        // Set flag; lorawan_task re-sends MLME_JOIN on next iteration so we
-        // stay out of a LoRaMAC callback when calling LoRaMacMlmeRequest.
-        if (s_otaa_active) {
-            s_otaa_retry_needed = true;
+    switch (c->MlmeRequest) {
+    case MLME_JOIN:
+        if (c->Status == LORAMAC_EVENT_INFO_STATUS_OK) {
+            esp_rom_printf("lorawan: OTAA join accepted\n");
+            if (s_lora_obj) s_lora_obj->joined = true;
+            s_otaa_active = false;
+            s_nvram_autosave_needed = true;
+            xEventGroupSetBits(s_events, EVT_JOIN_DONE);
+        } else {
+            esp_rom_printf("lorawan: OTAA join attempt failed (status=%d), retrying\n",
+                           (int)c->Status);
+            // Set flag; lorawan_task re-sends MLME_JOIN on next iteration so we
+            // stay out of a LoRaMAC callback when calling LoRaMacMlmeRequest.
+            if (s_otaa_active) {
+                s_otaa_retry_needed = true;
+            }
         }
+        break;
+
+    case MLME_DEVICE_TIME:
+        // DeviceTimeAns: the MAC has already called SysTimeSet() with the
+        // network time (Unix epoch, computed from the GPS-epoch payload plus
+        // UNIX_GPS_EPOCH_OFFSET).  SysTimeGet() now returns that value minus
+        // any milliseconds since the RX window, so the synced time is
+        // directly usable as GPS epoch seconds (SysTimeGet - offset).
+        if (c->Status == LORAMAC_EVENT_INFO_STATUS_OK) {
+            SysTime_t now = SysTimeGet();
+            uint32_t gps_epoch = (now.Seconds >= UNIX_GPS_EPOCH_OFFSET)
+                                 ? (now.Seconds - UNIX_GPS_EPOCH_OFFSET) : 0;
+            if (s_lora_obj) {
+                s_lora_obj->time_synced      = true;
+                s_lora_obj->network_time_gps = gps_epoch;
+                if (s_lora_obj->time_sync_callback != mp_const_none) {
+                    mp_sched_schedule(MP_OBJ_FROM_PTR(&lorawan_time_sync_trampoline_obj),
+                                      mp_const_none);
+                }
+            }
+            esp_rom_printf("lorawan: DeviceTimeAns OK, GPS epoch=%lu\n",
+                           (unsigned long)gps_epoch);
+        } else {
+            esp_rom_printf("lorawan: MLME_DEVICE_TIME failed (status=%d)\n",
+                           (int)c->Status);
+        }
+        break;
+
+    case MLME_LINK_CHECK:
+        // LinkCheckAns: the MAC extracts DemodMargin (link margin in dB from
+        // the gateway with the best SNR) and NbGateways (how many gateways
+        // received the last uplink carrying the LinkCheckReq). We cache both
+        // on the object so Python can retrieve them via link_check().
+        if (c->Status == LORAMAC_EVENT_INFO_STATUS_OK) {
+            if (s_lora_obj) {
+                s_lora_obj->link_check_received = true;
+                s_lora_obj->link_check_margin   = c->DemodMargin;
+                s_lora_obj->link_check_gw_count = c->NbGateways;
+            }
+            esp_rom_printf("lorawan: LinkCheckAns margin=%d gw_count=%d\n",
+                           (int)c->DemodMargin, (int)c->NbGateways);
+        } else {
+            esp_rom_printf("lorawan: MLME_LINK_CHECK failed (status=%d)\n",
+                           (int)c->Status);
+        }
+        break;
+
+    default:
+        break;
     }
 }
 
@@ -867,6 +950,44 @@ static void lorawan_task(void *arg) {
                 break;
             }
 
+            case CMD_REQUEST_LINK_CHECK: {
+                // MLME_LINK_CHECK queues a LinkCheckReq MAC command that
+                // piggy-backs on the next uplink. The network responds with
+                // LinkCheckAns in that uplink's RX window; mlme_confirm then
+                // fires with DemodMargin and NbGateways.
+                //
+                // Like request_device_time(), this call does NOT initiate an
+                // uplink — the caller must follow with send() so the piggy-
+                // backed request actually goes over the air.
+                MlmeReq_t mlme;
+                mlme.Type = MLME_LINK_CHECK;
+                LoRaMacStatus_t st = LoRaMacMlmeRequest(&mlme);
+                if (st != LORAMAC_STATUS_OK) {
+                    esp_rom_printf("lorawan: MLME_LINK_CHECK request error %d\n", (int)st);
+                }
+                xEventGroupSetBits(s_events, EVT_COMPLETED);
+                break;
+            }
+
+            case CMD_REQUEST_DEVICE_TIME: {
+                // MLME_DEVICE_TIME queues a DeviceTimeReq MAC command that
+                // piggy-backs on the next uplink.  The DeviceTimeAns arrives
+                // in the RX1/RX2 window of that uplink and is processed in
+                // LoRaMac.c (SysTimeSet + mlme_confirm fires with status OK).
+                //
+                // This call itself does NOT initiate an uplink — the user
+                // must call send() afterwards (or wait for the next scheduled
+                // send) to carry the piggy-backed request over the air.
+                MlmeReq_t mlme;
+                mlme.Type = MLME_DEVICE_TIME;
+                LoRaMacStatus_t st = LoRaMacMlmeRequest(&mlme);
+                if (st != LORAMAC_STATUS_OK) {
+                    esp_rom_printf("lorawan: MLME_DEVICE_TIME request error %d\n", (int)st);
+                }
+                xEventGroupSetBits(s_events, EVT_COMPLETED);
+                break;
+            }
+
             case CMD_SET_CLASS: {
                 // LoRaMAC-node v4.7.0 does not expose LoRaMacRequestClass / MLME_CLASS_C_SWITCH.
                 // Class A <-> Class C switches are done via MIB_DEVICE_CLASS and are
@@ -1038,9 +1159,10 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     int rx2_freq_arg = args[ARG_rx2_freq].u_int;
     self->rx2_dr   = (rx2_dr_arg   < 0) ? 0xFF : (uint8_t)rx2_dr_arg;
     self->rx2_freq = (rx2_freq_arg < 0) ? 0    : (uint32_t)rx2_freq_arg;
-    self->rx_callback      = mp_const_none;
-    self->tx_callback      = mp_const_none;
-    self->class_callback   = mp_const_none;
+    self->rx_callback        = mp_const_none;
+    self->tx_callback        = mp_const_none;
+    self->class_callback     = mp_const_none;
+    self->time_sync_callback = mp_const_none;
     self->tx_counter       = 0;
     self->tx_time_on_air   = 0;
     self->last_tx_ack      = false;
@@ -1069,6 +1191,12 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     self->antenna_gain = (args[ARG_antenna_gain].u_obj != mp_const_none)
                          ? mp_obj_get_float(args[ARG_antenna_gain].u_obj)
                          : 0.0f;
+
+    self->time_synced      = false;
+    self->network_time_gps = 0;
+    self->link_check_received = false;
+    self->link_check_margin   = 0;
+    self->link_check_gw_count = 0;
 
     // Apply pin overrides to g_lorawan_pins before any IoInit.
     // -1 means "keep T-Beam default" (set in pin_config.c initialiser).
@@ -1595,6 +1723,88 @@ static mp_obj_t lorawan_device_class(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_device_class_obj, lorawan_device_class);
 
+// request_device_time() — queue an MLME_DEVICE_TIME request.
+// Sends a DeviceTimeReq MAC command piggy-backed on the next uplink; the
+// network responds with DeviceTimeAns in the same RX window.  The LoRaMAC
+// stack processes the answer (SysTimeSet) and fires mlme_confirm with
+// MLME_DEVICE_TIME, which we capture into self.time_synced / self.network_time_gps.
+//
+// This function is non-blocking with respect to the actual time answer —
+// it only waits for the MAC to accept the MLME request.  The caller must
+// trigger an uplink (send()) afterwards so the DeviceTimeReq actually goes
+// over the air.
+static mp_obj_t lorawan_request_device_time(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    if (!self->joined) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not joined"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_REQUEST_DEVICE_TIME };
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_request_device_time_obj, lorawan_request_device_time);
+
+// network_time() — returns GPS epoch seconds from the last DeviceTimeAns,
+// or None if no sync has happened yet. The stored value is the epoch at the
+// moment the answer was processed; callers that need "now" should combine
+// this with a local tick offset. For most applications the granularity
+// (~second) is sufficient and reading again after a fresh sync is simpler.
+static mp_obj_t lorawan_network_time(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->time_synced) {
+        return mp_const_none;
+    }
+    return mp_obj_new_int_from_uint(self->network_time_gps);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_network_time_obj, lorawan_network_time);
+
+// link_check() — queue an MLME_LINK_CHECK request and return the most recent
+// LinkCheckAns as {"margin": N, "gw_count": N}, or None if no answer has been
+// received yet. Mirrors the request_device_time() / network_time() pair, but
+// folded into one call since the result is tiny and has no dedicated event.
+//
+// The MLME queues a LinkCheckReq MAC command that piggy-backs on the next
+// uplink; the caller must trigger send() afterwards for the request to go
+// over the air. On the following cycle (after the RX window closes and
+// mlme_confirm fires), link_check() returns the fresh margin and gw_count.
+static mp_obj_t lorawan_link_check(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    if (!self->joined) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not joined"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_REQUEST_LINK_CHECK };
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+
+    if (!self->link_check_received) {
+        return mp_const_none;
+    }
+    mp_obj_t d = mp_obj_new_dict(2);
+    mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_margin),
+                      mp_obj_new_int(self->link_check_margin));
+    mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_gw_count),
+                      mp_obj_new_int(self->link_check_gw_count));
+    return d;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_link_check_obj, lorawan_link_check);
+
+// on_time_sync(callback) — register callback(gps_epoch_seconds) for every
+// successful DeviceTimeAns. Pass None to deregister.
+static mp_obj_t lorawan_on_time_sync(mp_obj_t self_in, mp_obj_t cb) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (cb != mp_const_none && !mp_obj_is_callable(cb)) {
+        mp_raise_TypeError(MP_ERROR_TEXT("on_time_sync: callback must be callable or None"));
+    }
+    self->time_sync_callback = cb;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_on_time_sync_obj, lorawan_on_time_sync);
+
 // on_class_change(callback) — register callback(new_class) for class transitions.
 // Pass None to deregister.
 static mp_obj_t lorawan_on_class_change(mp_obj_t self_in, mp_obj_t cb) {
@@ -1625,6 +1835,10 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_request_class),  MP_ROM_PTR(&lorawan_request_class_obj) },
     { MP_ROM_QSTR(MP_QSTR_device_class),   MP_ROM_PTR(&lorawan_device_class_obj) },
     { MP_ROM_QSTR(MP_QSTR_on_class_change), MP_ROM_PTR(&lorawan_on_class_change_obj) },
+    { MP_ROM_QSTR(MP_QSTR_request_device_time), MP_ROM_PTR(&lorawan_request_device_time_obj) },
+    { MP_ROM_QSTR(MP_QSTR_network_time),   MP_ROM_PTR(&lorawan_network_time_obj) },
+    { MP_ROM_QSTR(MP_QSTR_link_check),     MP_ROM_PTR(&lorawan_link_check_obj) },
+    { MP_ROM_QSTR(MP_QSTR_on_time_sync),   MP_ROM_PTR(&lorawan_on_time_sync_obj) },
 };
 static MP_DEFINE_CONST_DICT(lorawan_locals, lorawan_locals_table);
 
@@ -1639,7 +1853,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.8.0", 5);
+    return mp_obj_new_str("0.9.1", 5);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 
