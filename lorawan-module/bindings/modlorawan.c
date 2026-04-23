@@ -519,20 +519,25 @@ static void lorawan_task(void *arg) {
                 LoRaMacMibSetRequestConfirm(&mib);
 
                 // RX2 window: use per-instance configuration.
-                // Default: 869.525 MHz / DR_3 (TTN EU868). Standard LoRaWAN uses DR_0.
+                // Region-specific defaults set in lorawan_make_new; freq=0 means
+                // "skip override, let the MAC use the region's PHY_DEF_RX2".
                 uint32_t rx2_freq = s_lora_obj ? s_lora_obj->rx2_freq : 869525000;
                 uint8_t  rx2_dr   = s_lora_obj ? s_lora_obj->rx2_dr   : DR_3;
-                mib.Type = MIB_RX2_CHANNEL;
-                mib.Param.Rx2Channel.Frequency = rx2_freq;
-                mib.Param.Rx2Channel.Datarate  = rx2_dr;
-                LoRaMacMibSetRequestConfirm(&mib);
+                if (rx2_freq != 0) {
+                    mib.Type = MIB_RX2_CHANNEL;
+                    mib.Param.Rx2Channel.Frequency = rx2_freq;
+                    mib.Param.Rx2Channel.Datarate  = rx2_dr;
+                    LoRaMacMibSetRequestConfirm(&mib);
 
-                mib.Type = MIB_RX2_DEFAULT_CHANNEL;
-                mib.Param.Rx2DefaultChannel.Frequency = rx2_freq;
-                mib.Param.Rx2DefaultChannel.Datarate  = rx2_dr;
-                LoRaMacMibSetRequestConfirm(&mib);
-                esp_rom_printf("lorawan: RX2 freq=%lu DR=%u\n",
-                               (unsigned long)rx2_freq, (unsigned)rx2_dr);
+                    mib.Type = MIB_RX2_DEFAULT_CHANNEL;
+                    mib.Param.Rx2DefaultChannel.Frequency = rx2_freq;
+                    mib.Param.Rx2DefaultChannel.Datarate  = rx2_dr;
+                    LoRaMacMibSetRequestConfirm(&mib);
+                    esp_rom_printf("lorawan: RX2 freq=%lu DR=%u\n",
+                                   (unsigned long)rx2_freq, (unsigned)rx2_dr);
+                } else {
+                    esp_rom_printf("lorawan: RX2 using region default\n");
+                }
 
                 // Class C continuous listen uses a separate RxCChannel (not Rx2Channel).
                 // In LoRaMAC-node v4.7.0 the RxCChannel defaults to PHY_DEF_RX2_DR
@@ -990,10 +995,12 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
         { MP_QSTR_busy,             MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
         // LoRaWAN protocol version — affects MIC computation and key derivation
         { MP_QSTR_lorawan_version,  MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = LORAWAN_V1_0_4} },
-        // RX2 window — default: TTN EU868 (869.525 MHz / DR_3 = SF9/125kHz)
-        // Standard LoRaWAN EU868 uses DR_0 (SF12). Pass rx2_dr=lorawan.DR_0 for standard networks.
-        { MP_QSTR_rx2_dr,           MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = DR_3} },
-        { MP_QSTR_rx2_freq,         MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = 869525000} },
+        // RX2 window — region-aware defaults (see rx2 resolution below).
+        // EU868: 869.525 MHz / DR_3 (TTN convention; standard LoRaWAN EU868 is DR_0).
+        // EU433: 434.665 MHz / DR_0 (EU433_RX_WND_2).
+        // Sentinel -1 means "use region default"; pass explicit values to override.
+        { MP_QSTR_rx2_dr,           MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_rx2_freq,         MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
         // TX power in dBm EIRP. None = use region maximum (16 dBm for EU868).
         // Internally converted to MAC TX_POWER index; getter also returns dBm.
         { MP_QSTR_tx_power,         MP_ARG_KW_ONLY  | MP_ARG_OBJ, {.u_obj = mp_const_none} },
@@ -1018,8 +1025,30 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     self->region           = (LoRaMacRegion_t)args[ARG_region].u_int;
     self->device_class     = (DeviceClass_t)args[ARG_device_class].u_int;
     self->lorawan_version  = (uint8_t)args[ARG_lorawan_version].u_int;
-    self->rx2_dr           = (uint8_t)args[ARG_rx2_dr].u_int;
-    self->rx2_freq         = (uint32_t)args[ARG_rx2_freq].u_int;
+
+    // RX2 defaults depend on region; sentinel -1 means "use region default".
+    int      rx2_dr_arg   = args[ARG_rx2_dr].u_int;
+    int      rx2_freq_arg = args[ARG_rx2_freq].u_int;
+    uint8_t  rx2_dr_def   = DR_0;
+    uint32_t rx2_freq_def = 0;
+    switch (self->region) {
+        case LORAMAC_REGION_EU868:
+            // TTN EU868 uses DR_3 (SF9) on 869.525 MHz; standard LoRaWAN is DR_0.
+            rx2_dr_def   = DR_3;
+            rx2_freq_def = 869525000;
+            break;
+        case LORAMAC_REGION_EU433:
+            rx2_dr_def   = DR_0;        // EU433_RX_WND_2_DR
+            rx2_freq_def = 434665000;   // EU433_RX_WND_2_FREQ
+            break;
+        default:
+            // Other regions: fall through with DR_0 / freq=0. freq=0 is invalid,
+            // so the CMD_INIT path below will skip MIB_RX2_CHANNEL and let the
+            // MAC use its region-default RX2 parameters.
+            break;
+    }
+    self->rx2_dr   = (rx2_dr_arg   < 0) ? rx2_dr_def   : (uint8_t)rx2_dr_arg;
+    self->rx2_freq = (rx2_freq_arg < 0) ? rx2_freq_def : (uint32_t)rx2_freq_arg;
     self->rx_callback      = mp_const_none;
     self->tx_callback      = mp_const_none;
     self->class_callback   = mp_const_none;

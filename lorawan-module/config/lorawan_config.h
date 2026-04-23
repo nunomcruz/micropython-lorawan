@@ -2,10 +2,13 @@
 #define LORAWAN_CONFIG_H
 
 /* Active regions (each adds ~10 KB flash).
- * REGION_EU868 is also set by micropython.cmake via -DREGION_EU868 so cmake
- * controls which regions are compiled; these lines serve as documentation. */
+ * Region selection is done by micropython.cmake via -DREGION_* compile defs;
+ * these lines serve as documentation of what's currently compiled in. */
 #ifndef REGION_EU868
 #define REGION_EU868
+#endif
+#ifndef REGION_EU433
+#define REGION_EU433
 #endif
 /* #define REGION_US915 */
 /* #define REGION_AU915 */

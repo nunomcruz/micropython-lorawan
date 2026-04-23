@@ -3,6 +3,7 @@ add_library(usermod_lorawan INTERFACE)
 # Compiler flags for LoRaMAC-node
 target_compile_definitions(usermod_lorawan INTERFACE
     REGION_EU868        # passes -DREGION_EU868 so Region.c includes RegionEU868.h
+    REGION_EU433        # 433 MHz band (amateur, ISM)
     SOFT_SE             # enables KeyList and NUM_OF_KEYS in secure-element-nvm.h
     # REGION_US915
     # REGION_AU915
@@ -46,6 +47,7 @@ target_sources(usermod_lorawan INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/mac/region/Region.c
     ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/mac/region/RegionCommon.c
     ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/mac/region/RegionEU868.c
+    ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/mac/region/RegionEU433.c
 )
 
 # Radio core drivers — both included via namespace wrappers.
