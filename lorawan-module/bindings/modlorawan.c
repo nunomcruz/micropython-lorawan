@@ -11,6 +11,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <limits.h>
 
@@ -109,6 +110,11 @@ typedef enum {
     CMD_CLOCK_SYNC_ENABLE,
     CMD_CLOCK_SYNC_REQUEST,
     CMD_PING_SLOT_PERIODICITY,
+    CMD_MC_ADD,
+    CMD_MC_RX_PARAMS,
+    CMD_MC_REMOVE,
+    CMD_REMOTE_MCAST_ENABLE,
+    CMD_FRAGMENTATION_ENABLE,
 } lorawan_cmd_t;
 
 typedef struct {
@@ -116,6 +122,27 @@ typedef struct {
     uint8_t  nwk_s_key[16];
     uint8_t  app_s_key[16];
 } cmd_join_abp_t;
+
+typedef struct {
+    uint8_t  group;            // 0..3
+    uint32_t addr;
+    uint8_t  mc_nwk_s_key[16];
+    uint8_t  mc_app_s_key[16];
+    uint32_t f_count_min;
+    uint32_t f_count_max;
+} cmd_mc_add_t;
+
+typedef struct {
+    uint8_t  group;            // 0..3
+    uint8_t  device_class;     // CLASS_B or CLASS_C
+    uint32_t frequency;        // Hz
+    int8_t   datarate;         // DR_0..DR_5
+    uint16_t periodicity;      // Class B only: 2^N s
+} cmd_mc_rx_params_t;
+
+typedef struct {
+    uint32_t buffer_size;
+} cmd_frag_enable_t;
 
 typedef struct {
     uint8_t dev_eui[8];
@@ -153,6 +180,10 @@ typedef struct {
         uint8_t         device_class;       // CMD_SET_CLASS: DeviceClass_t value
         uint8_t         rejoin_type;        // CMD_REQUEST_REJOIN: 0, 1 or 2
         uint8_t         ping_periodicity;   // CMD_PING_SLOT_PERIODICITY: 0..7
+        cmd_mc_add_t    mc_add;
+        cmd_mc_rx_params_t mc_rx_params;
+        uint8_t         mc_group;           // CMD_MC_REMOVE: 0..3
+        cmd_frag_enable_t frag_enable;
     };
 } lorawan_cmd_data_t;
 
@@ -164,7 +195,24 @@ typedef struct {
     uint8_t  port;
     int16_t  rssi;
     int8_t   snr;
+    bool     multicast;
 } lorawan_rx_pkt_t;
+
+// Local snapshot of multicast group state. The MAC holds the authoritative
+// copy in Nvm.MacGroup2.MulticastChannelList but exposes no getter, so we
+// mirror the key fields here for multicast_list() without touching internals.
+typedef struct {
+    bool     active;           // true once multicast_add succeeds
+    bool     is_remote;        // from IsRemotelySetup
+    bool     rx_params_set;    // true once multicast_rx_params succeeds
+    uint32_t addr;
+    uint32_t f_count_min;
+    uint32_t f_count_max;
+    DeviceClass_t rx_class;    // CLASS_B or CLASS_C (only valid if rx_params_set)
+    uint32_t rx_frequency;
+    int8_t   rx_datarate;
+    uint16_t rx_periodicity;   // Class B only
+} lorawan_mc_group_t;
 
 // ---- Python object ----
 
@@ -233,6 +281,20 @@ typedef struct {
     int8_t          beacon_snr;
     uint8_t         beacon_gw_info_desc;
     uint8_t         beacon_gw_info[6];
+    // Multicast — up to 4 local groups (LORAMAC_MAX_MC_CTX). The MAC holds the
+    // authoritative state and crypto material; we mirror only the metadata
+    // Python needs to answer multicast_list().
+    lorawan_mc_group_t mc_groups[4];
+    // Remote Multicast Setup (LmhpRemoteMcastSetup, port 200). Flips true once
+    // the package has been registered via remote_multicast_enable().
+    bool            remote_mcast_enabled;
+    // Fragmentation (LmhpFragmentation, port 201 — FUOTA base).
+    bool            fragmentation_enabled;
+    uint32_t        fragmentation_buffer_size; // size of the decoder buffer
+    uint32_t        fragmentation_last_size;   // size reported by on_done
+    int32_t         fragmentation_last_status; // status reported by on_done
+    mp_obj_t        fragmentation_progress_callback;
+    mp_obj_t        fragmentation_done_callback;
 } lorawan_obj_t;
 
 // ---- Static FreeRTOS state (one LoRaWAN instance per firmware) ----
@@ -303,12 +365,14 @@ static mp_obj_t lorawan_rx_trampoline(mp_obj_t arg) {
     if (xQueueReceive(s_rx_queue, &pkt, 0) != pdTRUE) {
         return mp_const_none;
     }
-    mp_obj_t items[4];
+    // (data, port, rssi, snr, multicast) — multicast flag added in Session 14.
+    mp_obj_t items[5];
     items[0] = mp_obj_new_bytes(pkt.data, pkt.len);
     items[1] = mp_obj_new_int(pkt.port);
     items[2] = mp_obj_new_int(pkt.rssi);
     items[3] = mp_obj_new_int(pkt.snr);
-    mp_call_function_1(s_lora_obj->rx_callback, mp_obj_new_tuple(4, items));
+    items[4] = mp_obj_new_bool(pkt.multicast);
+    mp_call_function_1(s_lora_obj->rx_callback, mp_obj_new_tuple(5, items));
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_rx_trampoline_obj, lorawan_rx_trampoline);
@@ -371,6 +435,83 @@ static mp_obj_t lorawan_beacon_trampoline(mp_obj_t arg) {
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_beacon_trampoline_obj, lorawan_beacon_trampoline);
+
+// Fragmentation progress — a full 4-tuple (counter, total, size, lost) would
+// overflow the scheduler arg, so we snapshot the values on a static buffer
+// (single-producer: the LoRaWAN task) and the trampoline reads them in VM
+// context. Last-one-wins semantics: if progress fires faster than Python can
+// dispatch we only keep the newest snapshot. Typical case: slow downlinks
+// every few seconds, not a concern in practice.
+static volatile uint16_t s_frag_progress_counter;
+static volatile uint16_t s_frag_progress_nb;
+static volatile uint8_t  s_frag_progress_size;
+static volatile uint16_t s_frag_progress_lost;
+
+static mp_obj_t lorawan_frag_progress_trampoline(mp_obj_t arg) {
+    (void)arg;
+    if (!s_lora_obj || s_lora_obj->fragmentation_progress_callback == mp_const_none) {
+        return mp_const_none;
+    }
+    mp_obj_t items[4];
+    items[0] = mp_obj_new_int(s_frag_progress_counter);
+    items[1] = mp_obj_new_int(s_frag_progress_nb);
+    items[2] = mp_obj_new_int(s_frag_progress_size);
+    items[3] = mp_obj_new_int(s_frag_progress_lost);
+    mp_call_function_1(s_lora_obj->fragmentation_progress_callback,
+                       mp_obj_new_tuple(4, items));
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_frag_progress_trampoline_obj,
+                                  lorawan_frag_progress_trampoline);
+
+static mp_obj_t lorawan_frag_done_trampoline(mp_obj_t arg) {
+    (void)arg;
+    if (!s_lora_obj || s_lora_obj->fragmentation_done_callback == mp_const_none) {
+        return mp_const_none;
+    }
+    // status=0 → success; >0 → number of missing fragments; -1 → ongoing; -2 → not started.
+    // size is the file size after reassembly; buffer is read back via
+    // lorawan_fragmentation_buffer() — exposed to Python via the
+    // fragmentation_data() method.
+    mp_obj_t items[2];
+    items[0] = mp_obj_new_int(s_lora_obj->fragmentation_last_status);
+    items[1] = mp_obj_new_int_from_uint(s_lora_obj->fragmentation_last_size);
+    mp_call_function_1(s_lora_obj->fragmentation_done_callback,
+                       mp_obj_new_tuple(2, items));
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_frag_done_trampoline_obj,
+                                  lorawan_frag_done_trampoline);
+
+// Called by lmhandler_shim.c from LmhpFragmentation's OnProgress callback.
+// Running in LoRaWAN task context (no GIL) so we can only snapshot values
+// and schedule the Python trampoline — no allocations here.
+void lorawan_on_fragmentation_progress(uint16_t frag_counter,
+                                        uint16_t frag_nb,
+                                        uint8_t  frag_size,
+                                        uint16_t frag_nb_lost) {
+    if (!s_lora_obj) return;
+    s_frag_progress_counter = frag_counter;
+    s_frag_progress_nb      = frag_nb;
+    s_frag_progress_size    = frag_size;
+    s_frag_progress_lost    = frag_nb_lost;
+    if (s_lora_obj->fragmentation_progress_callback != mp_const_none) {
+        mp_sched_schedule(MP_OBJ_FROM_PTR(&lorawan_frag_progress_trampoline_obj),
+                          mp_const_none);
+    }
+}
+
+void lorawan_on_fragmentation_done(int32_t status, uint32_t size) {
+    if (!s_lora_obj) return;
+    s_lora_obj->fragmentation_last_status = status;
+    s_lora_obj->fragmentation_last_size   = size;
+    esp_rom_printf("lorawan: fragmentation done status=%d size=%lu\n",
+                   (int)status, (unsigned long)size);
+    if (s_lora_obj->fragmentation_done_callback != mp_const_none) {
+        mp_sched_schedule(MP_OBJ_FROM_PTR(&lorawan_frag_done_trampoline_obj),
+                          mp_const_none);
+    }
+}
 
 // Called by lmhandler_shim.c whenever LmhpClockSync has applied a correction
 // from an AppTimeAns (port 202). SysTime has already been updated, so we just
@@ -464,10 +605,11 @@ static void mcps_indication(McpsIndication_t *ind) {
     if (ind->Port == 0 || ind->Port >= 224) return;
 
     lorawan_rx_pkt_t pkt;
-    pkt.len  = (ind->BufferSize <= LW_PAYLOAD_MAX) ? (uint8_t)ind->BufferSize : LW_PAYLOAD_MAX;
-    pkt.port = ind->Port;
-    pkt.rssi = ind->Rssi;
-    pkt.snr  = ind->Snr;
+    pkt.len       = (ind->BufferSize <= LW_PAYLOAD_MAX) ? (uint8_t)ind->BufferSize : LW_PAYLOAD_MAX;
+    pkt.port      = ind->Port;
+    pkt.rssi      = ind->Rssi;
+    pkt.snr       = ind->Snr;
+    pkt.multicast = (ind->Multicast != 0);
     memcpy(pkt.data, ind->Buffer, pkt.len);
     xQueueSend(s_rx_queue, &pkt, 0);
 
@@ -1400,6 +1542,139 @@ static void lorawan_task(void *arg) {
                 break;
             }
 
+            case CMD_MC_ADD: {
+                // Local multicast setup — keys provisioned by the app out of
+                // band. LoRaMacMcChannelSetup copies the key bytes into the
+                // soft-SE immediately, so the stack-local buffers we pass in
+                // don't need to outlive this call.
+                cmd_mc_add_t *a = &cmd.mc_add;
+                uint8_t nwk_key[16], app_key[16];
+                memcpy(nwk_key, a->mc_nwk_s_key, 16);
+                memcpy(app_key, a->mc_app_s_key, 16);
+
+                McChannelParams_t ch = {
+                    .IsRemotelySetup = false,
+                    .IsEnabled       = true,
+                    .GroupID         = (AddressIdentifier_t)a->group,
+                    .Address         = a->addr,
+                    .FCountMin       = a->f_count_min,
+                    .FCountMax       = a->f_count_max,
+                };
+                ch.McKeys.Session.McAppSKey = app_key;
+                ch.McKeys.Session.McNwkSKey = nwk_key;
+                // RxParams is configured separately via CMD_MC_RX_PARAMS. The
+                // MAC only validates RxParams inside LoRaMacMcChannelSetupRxParams,
+                // so zero-init here is fine.
+
+                LoRaMacStatus_t st = LoRaMacMcChannelSetup(&ch);
+                if (st == LORAMAC_STATUS_OK && s_lora_obj) {
+                    lorawan_mc_group_t *g = &s_lora_obj->mc_groups[a->group];
+                    g->active        = true;
+                    g->is_remote     = false;
+                    g->rx_params_set = false;
+                    g->addr          = a->addr;
+                    g->f_count_min   = a->f_count_min;
+                    g->f_count_max   = a->f_count_max;
+                    esp_rom_printf("lorawan: multicast group %u added addr=0x%08lx\n",
+                                   (unsigned)a->group, (unsigned long)a->addr);
+                    xEventGroupSetBits(s_events, EVT_COMPLETED);
+                } else {
+                    esp_rom_printf("lorawan: LoRaMacMcChannelSetup failed: %d\n", (int)st);
+                    xEventGroupSetBits(s_events, EVT_TX_ERROR); // reuse generic error bit
+                }
+                break;
+            }
+
+            case CMD_MC_RX_PARAMS: {
+                cmd_mc_rx_params_t *p = &cmd.mc_rx_params;
+                McRxParams_t rx;
+                rx.Class = (DeviceClass_t)p->device_class;
+                if (rx.Class == CLASS_B) {
+                    rx.Params.ClassB.Frequency   = p->frequency;
+                    rx.Params.ClassB.Datarate    = p->datarate;
+                    rx.Params.ClassB.Periodicity = p->periodicity;
+                } else {
+                    rx.Params.ClassC.Frequency = p->frequency;
+                    rx.Params.ClassC.Datarate  = p->datarate;
+                }
+                uint8_t status = 0;
+                LoRaMacStatus_t st = LoRaMacMcChannelSetupRxParams(
+                    (AddressIdentifier_t)p->group, &rx, &status);
+                if (st == LORAMAC_STATUS_OK && s_lora_obj) {
+                    lorawan_mc_group_t *g = &s_lora_obj->mc_groups[p->group];
+                    g->rx_params_set  = true;
+                    g->rx_class       = rx.Class;
+                    g->rx_frequency   = p->frequency;
+                    g->rx_datarate    = p->datarate;
+                    g->rx_periodicity = (rx.Class == CLASS_B) ? p->periodicity : 0;
+                    esp_rom_printf("lorawan: multicast group %u rx params %c freq=%lu DR=%d\n",
+                                   (unsigned)p->group,
+                                   rx.Class == CLASS_B ? 'B' : 'C',
+                                   (unsigned long)p->frequency, (int)p->datarate);
+                    xEventGroupSetBits(s_events, EVT_COMPLETED);
+                } else {
+                    esp_rom_printf("lorawan: LoRaMacMcChannelSetupRxParams failed: %d status=0x%02x\n",
+                                   (int)st, (unsigned)status);
+                    xEventGroupSetBits(s_events, EVT_TX_ERROR);
+                }
+                break;
+            }
+
+            case CMD_MC_REMOVE: {
+                uint8_t group = cmd.mc_group;
+                LoRaMacStatus_t st = LoRaMacMcChannelDelete((AddressIdentifier_t)group);
+                if (st == LORAMAC_STATUS_OK && s_lora_obj) {
+                    memset(&s_lora_obj->mc_groups[group], 0,
+                           sizeof(lorawan_mc_group_t));
+                    esp_rom_printf("lorawan: multicast group %u removed\n",
+                                   (unsigned)group);
+                    xEventGroupSetBits(s_events, EVT_COMPLETED);
+                } else {
+                    esp_rom_printf("lorawan: LoRaMacMcChannelDelete failed: %d\n", (int)st);
+                    xEventGroupSetBits(s_events, EVT_TX_ERROR);
+                }
+                break;
+            }
+
+            case CMD_REMOTE_MCAST_ENABLE: {
+                bool ok = lorawan_remote_mcast_setup_register();
+                if (s_lora_obj) s_lora_obj->remote_mcast_enabled = ok;
+                xEventGroupSetBits(s_events, ok ? EVT_COMPLETED : EVT_TX_ERROR);
+                break;
+            }
+
+            case CMD_FRAGMENTATION_ENABLE: {
+                uint32_t sz = cmd.frag_enable.buffer_size;
+                // Allocate via malloc (raw heap) — the MAC accesses this from
+                // the LoRaWAN task, which is outside MicroPython's GC scope.
+                // Leak-safe in practice: fragmentation_enable() is normally
+                // called once per boot. A second call with a larger buffer
+                // would leak the previous buffer, so reject that here.
+                if (s_lora_obj && s_lora_obj->fragmentation_enabled) {
+                    esp_rom_printf("lorawan: fragmentation already enabled\n");
+                    xEventGroupSetBits(s_events, EVT_TX_ERROR);
+                    break;
+                }
+                uint8_t *buf = (uint8_t *)malloc(sz);
+                if (buf == NULL) {
+                    esp_rom_printf("lorawan: fragmentation buffer alloc failed (%lu)\n",
+                                   (unsigned long)sz);
+                    xEventGroupSetBits(s_events, EVT_TX_ERROR);
+                    break;
+                }
+                memset(buf, 0, sz);
+                bool ok = lorawan_fragmentation_register(buf, sz);
+                if (ok && s_lora_obj) {
+                    s_lora_obj->fragmentation_enabled     = true;
+                    s_lora_obj->fragmentation_buffer_size = sz;
+                    xEventGroupSetBits(s_events, EVT_COMPLETED);
+                } else {
+                    free(buf);
+                    xEventGroupSetBits(s_events, EVT_TX_ERROR);
+                }
+                break;
+            }
+
             default:
                 break;
             }
@@ -1496,6 +1771,12 @@ static void lorawan_task(void *arg) {
             }
             // DUTYCYCLE_RESTRICTED: leave s_otaa_retry_needed = true, try again next wake.
         }
+
+        // Let every registered LmHandler package drain any deferred work
+        // (Remote Multicast Setup session-start class switches, Fragmentation
+        // BlockAckDelay replies). Safe to call unconditionally — no-op when
+        // no packages are registered.
+        lorawan_packages_process();
     }
 }
 
@@ -1635,6 +1916,15 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     self->beacon_snr            = 0;
     self->beacon_gw_info_desc   = 0;
     memset(self->beacon_gw_info, 0, sizeof(self->beacon_gw_info));
+
+    memset(self->mc_groups, 0, sizeof(self->mc_groups));
+    self->remote_mcast_enabled  = false;
+    self->fragmentation_enabled = false;
+    self->fragmentation_buffer_size = 0;
+    self->fragmentation_last_size   = 0;
+    self->fragmentation_last_status = 0;
+    self->fragmentation_progress_callback = mp_const_none;
+    self->fragmentation_done_callback     = mp_const_none;
 
     // Apply pin overrides to g_lorawan_pins before any IoInit.
     // -1 means "keep T-Beam default" (set in pin_config.c initialiser).
@@ -2422,6 +2712,256 @@ static mp_obj_t lorawan_on_class_change(mp_obj_t self_in, mp_obj_t cb) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_on_class_change_obj, lorawan_on_class_change);
 
+// multicast_add(group, addr, mc_nwk_s_key, mc_app_s_key, f_count_min=0, f_count_max=0xFFFFFFFF)
+// — local multicast setup (keys provisioned out-of-band). After add(),
+// configure RX params with multicast_rx_params() and switch class to C (or B).
+static mp_obj_t lorawan_multicast_add(size_t n_args, const mp_obj_t *pos_args,
+                                       mp_map_t *kw_args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    enum { ARG_group, ARG_addr, ARG_nwk_key, ARG_app_key,
+           ARG_fcnt_min, ARG_fcnt_max };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_group,         MP_ARG_REQUIRED | MP_ARG_INT },
+        { MP_QSTR_addr,          MP_ARG_REQUIRED | MP_ARG_INT },
+        { MP_QSTR_mc_nwk_s_key,  MP_ARG_REQUIRED | MP_ARG_OBJ },
+        { MP_QSTR_mc_app_s_key,  MP_ARG_REQUIRED | MP_ARG_OBJ },
+        { MP_QSTR_f_count_min,   MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = 0} },
+        // 0xFFFFFFFF doesn't fit in int32 so we default via INT_MAX and let
+        // the user pass a Python int for the full range.
+        { MP_QSTR_f_count_max,   MP_ARG_KW_ONLY  | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
+                     MP_ARRAY_SIZE(allowed), allowed, args);
+
+    int group = args[ARG_group].u_int;
+    if (group < 0 || group > 3) {
+        mp_raise_ValueError(MP_ERROR_TEXT("group must be 0..3"));
+    }
+    mp_buffer_info_t nwk_buf, app_buf;
+    mp_get_buffer_raise(args[ARG_nwk_key].u_obj, &nwk_buf, MP_BUFFER_READ);
+    mp_get_buffer_raise(args[ARG_app_key].u_obj, &app_buf, MP_BUFFER_READ);
+    if (nwk_buf.len != 16 || app_buf.len != 16) {
+        mp_raise_ValueError(MP_ERROR_TEXT("multicast keys must be 16 bytes"));
+    }
+
+    uint32_t fcnt_max = 0xFFFFFFFFu;
+    if (args[ARG_fcnt_max].u_obj != mp_const_none) {
+        fcnt_max = (uint32_t)mp_obj_get_int_truncated(args[ARG_fcnt_max].u_obj);
+    }
+
+    lorawan_cmd_data_t cmd = { .cmd = CMD_MC_ADD };
+    cmd.mc_add.group       = (uint8_t)group;
+    cmd.mc_add.addr        = (uint32_t)mp_obj_get_int_truncated(args[ARG_addr].u_obj);
+    cmd.mc_add.f_count_min = (uint32_t)args[ARG_fcnt_min].u_int;
+    cmd.mc_add.f_count_max = fcnt_max;
+    memcpy(cmd.mc_add.mc_nwk_s_key, nwk_buf.buf, 16);
+    memcpy(cmd.mc_add.mc_app_s_key, app_buf.buf, 16);
+
+    EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
+    if (bits & EVT_TX_ERROR) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("multicast_add failed"));
+    }
+    return mp_obj_new_int(group);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_multicast_add_obj, 1, lorawan_multicast_add);
+
+// multicast_rx_params(group, device_class, frequency, datarate, periodicity=None)
+// — configure the multicast RX window. Class C: only frequency+datarate.
+// Class B: also periodicity (0..7 → 2^N seconds between ping slots).
+static mp_obj_t lorawan_multicast_rx_params(size_t n_args, const mp_obj_t *pos_args,
+                                             mp_map_t *kw_args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    enum { ARG_group, ARG_class, ARG_freq, ARG_dr, ARG_periodicity };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_group,        MP_ARG_REQUIRED | MP_ARG_INT },
+        { MP_QSTR_device_class, MP_ARG_REQUIRED | MP_ARG_INT },
+        { MP_QSTR_frequency,    MP_ARG_REQUIRED | MP_ARG_INT },
+        { MP_QSTR_datarate,     MP_ARG_REQUIRED | MP_ARG_INT },
+        { MP_QSTR_periodicity,  MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = 0} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
+                     MP_ARRAY_SIZE(allowed), allowed, args);
+
+    int group = args[ARG_group].u_int;
+    int cls   = args[ARG_class].u_int;
+    if (group < 0 || group > 3) {
+        mp_raise_ValueError(MP_ERROR_TEXT("group must be 0..3"));
+    }
+    if (cls != CLASS_B && cls != CLASS_C) {
+        mp_raise_ValueError(
+            MP_ERROR_TEXT("device_class must be CLASS_B or CLASS_C for multicast"));
+    }
+
+    lorawan_cmd_data_t cmd = { .cmd = CMD_MC_RX_PARAMS };
+    cmd.mc_rx_params.group        = (uint8_t)group;
+    cmd.mc_rx_params.device_class = (uint8_t)cls;
+    cmd.mc_rx_params.frequency    = (uint32_t)args[ARG_freq].u_int;
+    cmd.mc_rx_params.datarate     = (int8_t)args[ARG_dr].u_int;
+    cmd.mc_rx_params.periodicity  = (uint16_t)args[ARG_periodicity].u_int;
+
+    EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
+    if (bits & EVT_TX_ERROR) {
+        mp_raise_msg(&mp_type_RuntimeError,
+                     MP_ERROR_TEXT("multicast_rx_params failed"));
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_multicast_rx_params_obj, 1,
+                                   lorawan_multicast_rx_params);
+
+// multicast_remove(group) — detach a group and clear its crypto state.
+static mp_obj_t lorawan_multicast_remove(mp_obj_t self_in, mp_obj_t group_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    int group = mp_obj_get_int(group_in);
+    if (group < 0 || group > 3) {
+        mp_raise_ValueError(MP_ERROR_TEXT("group must be 0..3"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_MC_REMOVE };
+    cmd.mc_group = (uint8_t)group;
+    EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
+    if (bits & EVT_TX_ERROR) {
+        mp_raise_msg(&mp_type_RuntimeError,
+                     MP_ERROR_TEXT("multicast_remove failed"));
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_multicast_remove_obj, lorawan_multicast_remove);
+
+// multicast_list() — returns list of active group dicts.
+static mp_obj_t lorawan_multicast_list(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    mp_obj_t list = mp_obj_new_list(0, NULL);
+    for (int i = 0; i < 4; i++) {
+        lorawan_mc_group_t *g = &self->mc_groups[i];
+        if (!g->active) continue;
+        mp_obj_t d = mp_obj_new_dict(0);
+        mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_group),
+                          mp_obj_new_int(i));
+        mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_addr),
+                          mp_obj_new_int_from_uint(g->addr));
+        mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_is_remote),
+                          mp_obj_new_bool(g->is_remote));
+        mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_f_count_min),
+                          mp_obj_new_int_from_uint(g->f_count_min));
+        mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_f_count_max),
+                          mp_obj_new_int_from_uint(g->f_count_max));
+        if (g->rx_params_set) {
+            mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_device_class),
+                              mp_obj_new_int((int)g->rx_class));
+            mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_frequency),
+                              mp_obj_new_int_from_uint(g->rx_frequency));
+            mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_datarate),
+                              mp_obj_new_int(g->rx_datarate));
+            if (g->rx_class == CLASS_B) {
+                mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_periodicity),
+                                  mp_obj_new_int(g->rx_periodicity));
+            }
+        }
+        mp_obj_list_append(list, d);
+    }
+    return list;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_multicast_list_obj, lorawan_multicast_list);
+
+// remote_multicast_enable() — register LmhpRemoteMcastSetup (port 200).
+// After registration the network server may provision groups remotely via
+// McGroupSetupReq / McGroupClassCSessionReq; the package forwards the class
+// switches to the MAC automatically (via LmHandlerRequestClass in the shim).
+static mp_obj_t lorawan_remote_multicast_enable(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_REMOTE_MCAST_ENABLE };
+    EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
+    if (bits & EVT_TX_ERROR) {
+        mp_raise_msg(&mp_type_RuntimeError,
+                     MP_ERROR_TEXT("remote_multicast_enable failed"));
+    }
+    return mp_obj_new_bool(self->remote_mcast_enabled);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_remote_multicast_enable_obj,
+                                  lorawan_remote_multicast_enable);
+
+// fragmentation_enable(buffer_size, on_progress=None, on_done=None) — register
+// LmhpFragmentation (port 201) for FUOTA-base support. Allocates a flat RAM
+// buffer that the FragDecoder writes fragments into; callbacks fire in
+// MicroPython context via mp_sched_schedule.
+//   on_progress(counter, nb, size, lost)
+//   on_done(status, size)       — status 0 = success; status > 0 = fragments lost
+static mp_obj_t lorawan_fragmentation_enable(size_t n_args, const mp_obj_t *pos_args,
+                                              mp_map_t *kw_args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    enum { ARG_buffer_size, ARG_on_progress, ARG_on_done };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_buffer_size, MP_ARG_REQUIRED | MP_ARG_INT },
+        { MP_QSTR_on_progress, MP_ARG_KW_ONLY  | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        { MP_QSTR_on_done,     MP_ARG_KW_ONLY  | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
+                     MP_ARRAY_SIZE(allowed), allowed, args);
+
+    int sz = args[ARG_buffer_size].u_int;
+    if (sz <= 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("buffer_size must be > 0"));
+    }
+    if (args[ARG_on_progress].u_obj != mp_const_none &&
+        !mp_obj_is_callable(args[ARG_on_progress].u_obj)) {
+        mp_raise_TypeError(MP_ERROR_TEXT("on_progress must be callable or None"));
+    }
+    if (args[ARG_on_done].u_obj != mp_const_none &&
+        !mp_obj_is_callable(args[ARG_on_done].u_obj)) {
+        mp_raise_TypeError(MP_ERROR_TEXT("on_done must be callable or None"));
+    }
+
+    self->fragmentation_progress_callback = args[ARG_on_progress].u_obj;
+    self->fragmentation_done_callback     = args[ARG_on_done].u_obj;
+
+    lorawan_cmd_data_t cmd = { .cmd = CMD_FRAGMENTATION_ENABLE };
+    cmd.frag_enable.buffer_size = (uint32_t)sz;
+    EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
+    if (bits & EVT_TX_ERROR) {
+        mp_raise_msg(&mp_type_RuntimeError,
+                     MP_ERROR_TEXT("fragmentation_enable failed"));
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_fragmentation_enable_obj, 1,
+                                   lorawan_fragmentation_enable);
+
+// fragmentation_data() — return the full reassembled buffer (bytes) after
+// on_done has fired, or None if fragmentation was never enabled. Caller is
+// expected to slice the buffer down to the size reported by on_done.
+static mp_obj_t lorawan_fragmentation_data(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->fragmentation_enabled) {
+        return mp_const_none;
+    }
+    uint32_t sz = 0;
+    const uint8_t *buf = lorawan_fragmentation_buffer(&sz);
+    if (buf == NULL || sz == 0) {
+        return mp_const_none;
+    }
+    return mp_obj_new_bytes(buf, (size_t)sz);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_fragmentation_data_obj,
+                                  lorawan_fragmentation_data);
+
 static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_join_abp),       MP_ROM_PTR(&lorawan_join_abp_obj) },
     { MP_ROM_QSTR(MP_QSTR_join_otaa),      MP_ROM_PTR(&lorawan_join_otaa_obj) },
@@ -2452,6 +2992,15 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_clock_sync_enable),  MP_ROM_PTR(&lorawan_clock_sync_enable_obj) },
     { MP_ROM_QSTR(MP_QSTR_clock_sync_request), MP_ROM_PTR(&lorawan_clock_sync_request_obj) },
     { MP_ROM_QSTR(MP_QSTR_synced_time),        MP_ROM_PTR(&lorawan_synced_time_obj) },
+    // Multicast (Session 14)
+    { MP_ROM_QSTR(MP_QSTR_multicast_add),       MP_ROM_PTR(&lorawan_multicast_add_obj) },
+    { MP_ROM_QSTR(MP_QSTR_multicast_rx_params), MP_ROM_PTR(&lorawan_multicast_rx_params_obj) },
+    { MP_ROM_QSTR(MP_QSTR_multicast_remove),    MP_ROM_PTR(&lorawan_multicast_remove_obj) },
+    { MP_ROM_QSTR(MP_QSTR_multicast_list),      MP_ROM_PTR(&lorawan_multicast_list_obj) },
+    { MP_ROM_QSTR(MP_QSTR_remote_multicast_enable),
+                                                 MP_ROM_PTR(&lorawan_remote_multicast_enable_obj) },
+    { MP_ROM_QSTR(MP_QSTR_fragmentation_enable), MP_ROM_PTR(&lorawan_fragmentation_enable_obj) },
+    { MP_ROM_QSTR(MP_QSTR_fragmentation_data),   MP_ROM_PTR(&lorawan_fragmentation_data_obj) },
 };
 static MP_DEFINE_CONST_DICT(lorawan_locals, lorawan_locals_table);
 
@@ -2466,7 +3015,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.10.0", 6);
+    return mp_obj_new_str("0.11.0", 6);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 

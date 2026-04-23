@@ -14,6 +14,9 @@
 #include "LmHandler.h"
 #include "LmhPackage.h"
 #include "LmhpClockSync.h"
+#include "LmhpRemoteMcastSetup.h"
+#include "LmhpFragmentation.h"
+#include "FragDecoder.h"
 #include "systime.h"
 
 #include "lmhandler_shim.h"
@@ -96,6 +99,12 @@ LmHandlerErrorStatus_t LmHandlerPackageRegister(uint8_t id, void *params) {
     case PACKAGE_ID_CLOCK_SYNC:
         pkg = LmphClockSyncPackageFactory();
         break;
+    case PACKAGE_ID_REMOTE_MCAST_SETUP:
+        pkg = LmhpRemoteMcastSetupPackageFactory();
+        break;
+    case PACKAGE_ID_FRAGMENTATION:
+        pkg = LmhpFragmentationPackageFactory();
+        break;
     default:
         return LORAMAC_HANDLER_ERROR;
     }
@@ -172,4 +181,103 @@ bool lorawan_clock_sync_app_time_req(void) {
         return false;
     }
     return true;
+}
+
+// ---- Remote Multicast Setup ----
+//
+// LmhpRemoteMcastSetup.c calls LmHandlerRequestClass() when a session starts
+// or stops to toggle the device class. We honour it from the package Process()
+// which runs in LoRaWAN task context, so touching MIB_DEVICE_CLASS directly
+// is safe (no callback context, single-threaded MAC).
+LmHandlerErrorStatus_t LmHandlerRequestClass(DeviceClass_t newClass) {
+    MibRequestConfirm_t mib;
+    mib.Type = MIB_DEVICE_CLASS;
+    mib.Param.Class = newClass;
+    LoRaMacStatus_t st = LoRaMacMibSetRequestConfirm(&mib);
+    return (st == LORAMAC_STATUS_OK)
+           ? LORAMAC_HANDLER_SUCCESS : LORAMAC_HANDLER_ERROR;
+}
+
+bool lorawan_remote_mcast_setup_register(void) {
+    return LmHandlerPackageRegister(PACKAGE_ID_REMOTE_MCAST_SETUP, NULL)
+           == LORAMAC_HANDLER_SUCCESS;
+}
+
+// ---- Fragmentation (FUOTA base) ----
+//
+// The fragmentation package stores received fragments via FragDecoder write
+// callbacks. We back the decoder with a flat RAM buffer: writes land in the
+// buffer, reads serve from it. After on_done fires the reassembled payload
+// is available via lorawan_fragmentation_buffer().
+
+static uint8_t *s_frag_buffer;
+static uint32_t s_frag_buffer_size;
+
+static int8_t frag_decoder_write(uint32_t addr, uint8_t *data, uint32_t size) {
+    if (s_frag_buffer == NULL || addr + size > s_frag_buffer_size) {
+        return -1;
+    }
+    memcpy(s_frag_buffer + addr, data, size);
+    return 0;
+}
+
+static int8_t frag_decoder_read(uint32_t addr, uint8_t *data, uint32_t size) {
+    if (s_frag_buffer == NULL || addr + size > s_frag_buffer_size) {
+        return -1;
+    }
+    memcpy(data, s_frag_buffer + addr, size);
+    return 0;
+}
+
+static LmhpFragmentationParams_t s_frag_params = {
+    .DecoderCallbacks = {
+        .FragDecoderWrite = frag_decoder_write,
+        .FragDecoderRead  = frag_decoder_read,
+    },
+    .OnProgress = NULL,
+    .OnDone     = NULL,
+};
+
+static void frag_on_progress(uint16_t frag_counter, uint16_t frag_nb,
+                              uint8_t frag_size, uint16_t frag_nb_lost) {
+    lorawan_on_fragmentation_progress(frag_counter, frag_nb,
+                                       frag_size, frag_nb_lost);
+}
+
+static void frag_on_done(int32_t status, uint32_t size) {
+    lorawan_on_fragmentation_done(status, size);
+}
+
+bool lorawan_fragmentation_register(uint8_t *buffer, uint32_t buffer_size) {
+    if (buffer == NULL || buffer_size == 0) {
+        return false;
+    }
+    s_frag_buffer      = buffer;
+    s_frag_buffer_size = buffer_size;
+
+    s_frag_params.OnProgress = frag_on_progress;
+    s_frag_params.OnDone     = frag_on_done;
+
+    return LmHandlerPackageRegister(PACKAGE_ID_FRAGMENTATION, &s_frag_params)
+           == LORAMAC_HANDLER_SUCCESS;
+}
+
+const uint8_t *lorawan_fragmentation_buffer(uint32_t *out_size) {
+    if (out_size) *out_size = s_frag_buffer_size;
+    return s_frag_buffer;
+}
+
+// ---- Package Process() fan-out ----
+//
+// Packages (Remote Mcast Setup, Fragmentation) use Process() to perform
+// delayed work queued from their OnMcpsIndication handlers — e.g. switching
+// class at session start, answering after a BlockAckDelay. Called from the
+// LoRaWAN task loop each iteration.
+void lorawan_packages_process(void) {
+    for (uint8_t i = 0; i < SHIM_PKG_MAX; i++) {
+        LmhPackage_t *pkg = s_packages[i];
+        if (pkg != NULL && pkg->Process != NULL) {
+            pkg->Process();
+        }
+    }
 }

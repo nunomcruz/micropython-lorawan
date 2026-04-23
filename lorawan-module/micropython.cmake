@@ -19,6 +19,9 @@ target_sources(usermod_lorawan INTERFACE
 # LmHandler application-layer packages (hosted by the shim, not the full LmHandler)
 target_sources(usermod_lorawan INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/apps/LoRaMac/common/LmHandler/packages/LmhpClockSync.c
+    ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/apps/LoRaMac/common/LmHandler/packages/LmhpRemoteMcastSetup.c
+    ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/apps/LoRaMac/common/LmHandler/packages/LmhpFragmentation.c
+    ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/apps/LoRaMac/common/LmHandler/packages/FragDecoder.c
 )
 
 # ESP32 HAL (implemented in Phase 3, Sessions 4–6)

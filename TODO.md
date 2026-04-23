@@ -278,18 +278,34 @@ Prerequisites: DeviceTimeReq must work (Session 12), timer HAL accuracy verified
 
 ### Session 14: Multicast (local + remote, Class B + C)
 
-- [ ] Implement `multicast_add(group, addr, mc_nwk_s_key, mc_app_s_key, ...)` — local setup, up to 4 groups
-- [ ] Implement `multicast_rx_params(group, device_class, frequency, datarate, ...)` — Class B (with periodicity) or Class C
-- [ ] Implement `multicast_remove(group)` — delete group
-- [ ] Implement `multicast_list()` — returns active groups with metadata
-- [ ] Ensure `on_rx(callback)` receives multicast downlinks with group info in metadata
-- [ ] Register Remote Multicast Setup package (LmhpRemoteMcastSetup) for server-driven configuration
-- [ ] Implement `remote_multicast_enable()` — server can then send McGroupSetupReq
-- [ ] Register Fragmentation package (LmhpFragmentation) with progress/done callbacks
-- [ ] Implement `fragmentation_enable(buffer_size, on_progress, on_done)` — for FUOTA
+- [x] Implement `multicast_add(group, addr, mc_nwk_s_key, mc_app_s_key, f_count_min=0, f_count_max=0xFFFFFFFF)` — local setup, up to 4 groups
+      - Dispatched via `CMD_MC_ADD` so `LoRaMacMcChannelSetup()` runs from task context with `IsRemotelySetup=false`. The MAC copies the session keys into the soft-SE immediately, so our stack-local key buffers don't need to outlive the call.
+      - Mirror fields (addr, fcnt range, is_remote=false) are kept on `lorawan_obj_t.mc_groups[0..3]` for `multicast_list()`; the MAC owns the authoritative copy in `Nvm.MacGroup2.MulticastChannelList` but exposes no getter.
+- [x] Implement `multicast_rx_params(group, device_class, frequency, datarate, periodicity=0)` — Class B (with periodicity) or Class C
+      - Dispatched via `CMD_MC_RX_PARAMS`; builds `McRxParams_t` with the Class B/C union selected by `device_class`. Python raises `ValueError` if the class is anything other than `CLASS_B` / `CLASS_C` (multicast does not apply to Class A).
+- [x] Implement `multicast_remove(group)` — delete group
+      - `CMD_MC_REMOVE` → `LoRaMacMcChannelDelete()` and clears the local mirror.
+- [x] Implement `multicast_list()` — returns active groups with metadata
+      - Returns a list of dicts `{group, addr, is_remote, f_count_min, f_count_max, device_class?, frequency?, datarate?, periodicity?}`. RX-param keys only appear after `multicast_rx_params()` has been called for the group.
+- [x] Ensure `on_rx(callback)` receives multicast downlinks with group info in metadata
+      - `lorawan_rx_pkt_t` gained a `multicast` flag fed from `McpsIndication.Multicast`. The Python tuple is now `(data, port, rssi, snr, multicast)` — 5-tuple is a breaking change from the 4-tuple in Sessions 9–13 but the multicast flag has to live somewhere and the dict option adds per-packet allocation overhead. `recv()` still returns the 4-tuple (keeping backwards compatibility for the polling path); only `on_rx` callbacks see the new shape.
+- [x] Register Remote Multicast Setup package (LmhpRemoteMcastSetup) for server-driven configuration
+      - Extended `lmhandler_shim.c`: new `LmHandlerPackageRegister(PACKAGE_ID_REMOTE_MCAST_SETUP)` branch plus a shim implementation of `LmHandlerRequestClass()` (direct `MIB_DEVICE_CLASS` set, safe to call from package `Process()` which runs in LoRaWAN task context).
+      - Added `lorawan_packages_process()` — called from the task main loop each iteration so Remote Mcast Setup can run its session-start / session-stop state transitions.
+- [x] Implement `remote_multicast_enable()` — server can then send McGroupSetupReq
+      - `CMD_REMOTE_MCAST_ENABLE` registers the package from task context; Python returns the resulting `remote_mcast_enabled` bool.
+      - `McGroupSetupReq`, `McGroupDeleteReq`, `McGroupClassCSessionReq` and `McGroupClassBSessionReq` are handled entirely by `LmhpRemoteMcastSetup.c` — no extra modlorawan.c glue needed. After session start the device switches to the negotiated class automatically via the shim's `LmHandlerRequestClass`.
+- [x] Register Fragmentation package (LmhpFragmentation) with progress/done callbacks
+      - Shim owns the FragDecoder memory-backed read/write callbacks (`FRAG_DECODER_FILE_HANDLING_NEW_API == 1`): a flat RAM buffer that `frag_decoder_write()` populates and `frag_decoder_read()` serves.
+      - `LmhpFragmentationParams_t` is populated with pointers to C-side `OnProgress` / `OnDone` adapters that forward to `lorawan_on_fragmentation_progress/done` in modlorawan.c. Those adapters snapshot arguments onto the active `lorawan_obj_t` and `mp_sched_schedule` the Python trampoline (allocation of the Python tuple happens in VM context).
+- [x] Implement `fragmentation_enable(buffer_size, on_progress, on_done)` — for FUOTA
+      - `CMD_FRAGMENTATION_ENABLE` mallocs the requested buffer (raw C heap, outside MicroPython's GC since the MAC writes to it from the LoRaWAN task) and calls `lorawan_fragmentation_register()`. Rejects a second call while already enabled (second-call would leak the previous buffer).
+      - `fragmentation_data()` returns the reassembled buffer as `bytes` after `on_done` has fired; caller slices to the reported size.
+- [x] Version bumped 0.10.0 → 0.11.0; compile clean, zero warnings; firmware 1643 KB (+11 KB for LmhpRemoteMcastSetup.c + LmhpFragmentation.c + FragDecoder.c + Session 14 Python glue).
 - [ ] Test: local multicast Class C — device receives on multicast address
 - [ ] Test: local multicast Class B — device receives on multicast ping slot
 - [ ] Test: remote multicast setup via LmhpRemoteMcastSetup (if server supports it)
+- [ ] Test: fragmentation session end-to-end (server pushes fragments, `on_done` fires with reassembled payload)
 
 ### Session 15: Documentation and examples
 
