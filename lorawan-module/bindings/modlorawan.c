@@ -518,23 +518,26 @@ static void lorawan_task(void *arg) {
                 mib.Param.Class = cls;
                 LoRaMacMibSetRequestConfirm(&mib);
 
-                // RX2 window: freq=0 means "no user override" — leave the MAC
-                // at the region's PHY_DEF_RX2 (standard LoRaWAN DR_0). TTN EU868
-                // users must pass rx2_dr=DR_3 and rx2_freq=869525000 at __init__.
+                // RX2 window: each field is independently overridable.
+                // rx2_freq=0 / rx2_dr=0xFF are sentinels meaning "not set";
+                // unset fields keep the region's PHY_DEF_RX2 value.
                 uint32_t rx2_freq = s_lora_obj ? s_lora_obj->rx2_freq : 0;
-                uint8_t  rx2_dr   = s_lora_obj ? s_lora_obj->rx2_dr   : DR_0;
-                if (rx2_freq != 0) {
+                uint8_t  rx2_dr   = s_lora_obj ? s_lora_obj->rx2_dr   : 0xFF;
+                if (rx2_freq != 0 || rx2_dr != 0xFF) {
                     mib.Type = MIB_RX2_CHANNEL;
-                    mib.Param.Rx2Channel.Frequency = rx2_freq;
-                    mib.Param.Rx2Channel.Datarate  = rx2_dr;
+                    LoRaMacMibGetRequestConfirm(&mib);
+                    if (rx2_freq != 0) mib.Param.Rx2Channel.Frequency = rx2_freq;
+                    if (rx2_dr != 0xFF) mib.Param.Rx2Channel.Datarate = rx2_dr;
+                    uint32_t eff_freq = mib.Param.Rx2Channel.Frequency;
+                    uint8_t  eff_dr   = mib.Param.Rx2Channel.Datarate;
                     LoRaMacMibSetRequestConfirm(&mib);
 
                     mib.Type = MIB_RX2_DEFAULT_CHANNEL;
-                    mib.Param.Rx2DefaultChannel.Frequency = rx2_freq;
-                    mib.Param.Rx2DefaultChannel.Datarate  = rx2_dr;
+                    mib.Param.Rx2DefaultChannel.Frequency = eff_freq;
+                    mib.Param.Rx2DefaultChannel.Datarate  = eff_dr;
                     LoRaMacMibSetRequestConfirm(&mib);
                     esp_rom_printf("lorawan: RX2 freq=%lu DR=%u\n",
-                                   (unsigned long)rx2_freq, (unsigned)rx2_dr);
+                                   (unsigned long)eff_freq, (unsigned)eff_dr);
                 } else {
                     esp_rom_printf("lorawan: RX2 using region default\n");
                 }
@@ -995,9 +998,10 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
         { MP_QSTR_busy,             MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
         // LoRaWAN protocol version — affects MIC computation and key derivation
         { MP_QSTR_lorawan_version,  MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = LORAWAN_V1_0_4} },
-        // RX2 window — defaults to the region's PHY_DEF_RX2 (standard LoRaWAN
-        // DR_0). For TTN EU868, override with rx2_dr=DR_3, rx2_freq=869525000.
-        // Must be set together.
+        // RX2 window — each field independently falls through to the region's
+        // PHY_DEF_RX2 (standard LoRaWAN DR_0 / region default freq). For TTN
+        // EU868, typically just rx2_dr=DR_3 is needed (the 869.525 MHz freq
+        // matches the EU868 default).
         { MP_QSTR_rx2_dr,           MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
         { MP_QSTR_rx2_freq,         MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
         // TX power in dBm EIRP. None = use region maximum (16 dBm for EU868).
@@ -1025,17 +1029,14 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     self->device_class     = (DeviceClass_t)args[ARG_device_class].u_int;
     self->lorawan_version  = (uint8_t)args[ARG_lorawan_version].u_int;
 
-    // RX2 override: by default, fall through to the MAC's region default
-    // (PHY_DEF_RX2 = standard LoRaWAN DR_0). freq=0 signals "no override" in
-    // CMD_INIT. TTN EU868 needs DR_3 on 869.525 MHz — pass both kwargs
-    // explicitly. Partial overrides are rejected because the region default
-    // freq is region-dependent and not known at this point.
+    // RX2 override: each kwarg is independent. Unset fields fall through to
+    // the MAC's PHY_DEF_RX2 (standard LoRaWAN DR_0 / region default freq).
+    // TTN EU868 users typically only need rx2_dr=DR_3 — the 869.525 MHz freq
+    // is already the EU868 region default. Sentinel: rx2_dr=0xFF, rx2_freq=0
+    // mean "not overridden".
     int rx2_dr_arg   = args[ARG_rx2_dr].u_int;
     int rx2_freq_arg = args[ARG_rx2_freq].u_int;
-    if ((rx2_dr_arg < 0) != (rx2_freq_arg < 0)) {
-        mp_raise_ValueError(MP_ERROR_TEXT("rx2_dr and rx2_freq must be set together"));
-    }
-    self->rx2_dr   = (rx2_dr_arg   < 0) ? DR_0 : (uint8_t)rx2_dr_arg;
+    self->rx2_dr   = (rx2_dr_arg   < 0) ? 0xFF : (uint8_t)rx2_dr_arg;
     self->rx2_freq = (rx2_freq_arg < 0) ? 0    : (uint32_t)rx2_freq_arg;
     self->rx_callback      = mp_const_none;
     self->tx_callback      = mp_const_none;
