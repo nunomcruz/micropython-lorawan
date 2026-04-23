@@ -521,22 +521,16 @@ static void lorawan_task(void *arg) {
                 esp_rom_printf("lorawan: RX2 freq=%lu DR=%u\n",
                                (unsigned long)rx2_freq, (unsigned)rx2_dr);
 
-                // Class C RxC window is a separate channel (RxCChannel) that
-                // defaults to PHY_DEF_RX2_DR (DR_0 / SF12 in EU868). When we
-                // switch to Class C, OpenContinuousRxCWindow() recomputes the
-                // RX config from RxCChannel.Datarate and ignores the RX2 MIB,
-                // so the radio ends up listening at SF12 while TTN transmits
-                // at DR_3 (SF9). Mirror the RX2 settings into RxC so the
-                // continuous listen matches the network RX2 parameters.
-                mib.Type = MIB_RXC_CHANNEL;
-                mib.Param.RxCChannel.Frequency = rx2_freq;
-                mib.Param.RxCChannel.Datarate  = rx2_dr;
-                LoRaMacMibSetRequestConfirm(&mib);
-
-                mib.Type = MIB_RXC_DEFAULT_CHANNEL;
-                mib.Param.RxCDefaultChannel.Frequency = rx2_freq;
-                mib.Param.RxCDefaultChannel.Datarate  = rx2_dr;
-                LoRaMacMibSetRequestConfirm(&mib);
+                // Class C continuous listen uses a separate RxCChannel (not Rx2Channel).
+                // In LoRaMAC-node v4.7.0 the RxCChannel defaults to PHY_DEF_RX2_DR
+                // / PHY_DEF_RX2_FREQUENCY, which for EU868 is DR_0 (SF12) / 869.525 MHz —
+                // matching TTN's Class C downlink scheduling. Do NOT mirror rx2_dr into
+                // RxCChannel: TTN sends Class A RX2 at DR_3 but Class C at DR_0, so they
+                // must not share the same DR. If a non-TTN network needs a different
+                // Class C DR, add an rxc_dr kwarg; for now rely on the LoRaMAC defaults.
+                //
+                // After an OTAA JoinAccept, LoRaMac.c:1034 updates RxCChannel.Datarate
+                // from DLSettings so the negotiated RX2 DR applies to both windows.
 
                 // Apply user-specified initial TX power (if non-default).
                 // channels_tx_power is a MAC index; 0 = max (16 dBm EU868).
@@ -864,6 +858,17 @@ static void lorawan_task(void *arg) {
                 }
                 esp_rom_printf("lorawan: device class -> %c\n",
                                new_class == CLASS_A ? 'A' : (new_class == CLASS_B ? 'B' : 'C'));
+
+                // Diagnostic: log the actual RxC params the MAC is using for the
+                // continuous listen, so a SF mismatch with the network can be spotted.
+                if (new_class == CLASS_C) {
+                    mib.Type = MIB_RXC_CHANNEL;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK) {
+                        esp_rom_printf("lorawan: RxC freq=%lu DR=%u\n",
+                                       (unsigned long)mib.Param.RxCChannel.Frequency,
+                                       (unsigned)mib.Param.RxCChannel.Datarate);
+                    }
+                }
                 xEventGroupSetBits(s_events, EVT_CLASS_OK);
                 break;
             }
