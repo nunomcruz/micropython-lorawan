@@ -35,3 +35,9 @@ void lorawan_radio_irq_process(void) {
         Radio.IrqProcess();
     }
 }
+
+void lorawan_radio_sleep(void) {
+    if (Radio.Sleep != NULL) {
+        Radio.Sleep();
+    }
+}

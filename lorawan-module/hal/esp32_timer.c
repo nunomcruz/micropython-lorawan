@@ -235,6 +235,23 @@ void TimerIrqHandler(void) {
 void TimerProcess(void) {
 }
 
+// Stop and delete the shared esp_timer, and drop all queued LoRaMAC timer
+// entries. Called from modlorawan.c's deinit path — after LoRaMacDeInit
+// has stopped the known MAC timers, this finishes the job so a stray
+// hw_timer_cb can't fire into a freed object.
+void lorawan_timer_deinit(void) {
+    taskENTER_CRITICAL(&s_timer_mux);
+    s_list_head = NULL;
+    s_start_us  = 0;
+    taskEXIT_CRITICAL(&s_timer_mux);
+
+    if (s_hw_timer) {
+        esp_timer_stop(s_hw_timer);
+        esp_timer_delete(s_hw_timer);
+        s_hw_timer = NULL;
+    }
+}
+
 // ---- internal helpers -------------------------------------------------------
 
 // Returns milliseconds elapsed since the hw timer was last armed.

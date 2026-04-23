@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_rom_sys.h"
@@ -280,4 +281,23 @@ void lorawan_packages_process(void) {
             pkg->Process();
         }
     }
+}
+
+// Drop every registered package and release buffers the shim owns so a later
+// lorawan.LoRaWAN(...) can re-register packages cleanly. The fragmentation
+// RAM buffer is malloc'd by modlorawan.c's CMD_FRAGMENTATION_ENABLE and
+// handed over to this layer via lorawan_fragmentation_register(); we free it
+// here to centralise ownership.
+void lorawan_packages_deinit(void) {
+    for (uint8_t i = 0; i < SHIM_PKG_MAX; i++) {
+        s_packages[i] = NULL;
+    }
+    if (s_frag_buffer) {
+        free(s_frag_buffer);
+        s_frag_buffer = NULL;
+    }
+    s_frag_buffer_size        = 0;
+    s_frag_params.OnProgress  = NULL;
+    s_frag_params.OnDone      = NULL;
+    memset(s_pkg_buffer, 0, sizeof(s_pkg_buffer));
 }

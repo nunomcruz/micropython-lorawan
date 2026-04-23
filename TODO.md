@@ -315,6 +315,49 @@ Prerequisites: DeviceTimeReq must work (Session 12), timer HAL accuracy verified
 - [x] Example scripts: `time_sync.py`, `class_b_beacon.py`, `multicast_receiver.py` — all demonstrate the relevant callback (`on_time_sync`, `on_beacon`, `on_rx`-with-multicast-flag). `class_b_beacon.py` walks the full flow: join → DeviceTimeReq → set ping-slot periodicity → request CLASS_B → wait for `BEACON_LOCKED` state. `multicast_receiver.py` uses local group provisioning (keys in-script) and Class C continuous listen.
 - [x] `lorawan-module/examples/README.md` index with a pointer to each script and notes on LNS prerequisites (Class B beacon support, multicast API availability).
 
+### Session 16: API polish (deinit, soft-reset safety, missing getters)
+
+Gaps found while reviewing the Python surface against the MAC capabilities. The `deinit` path is the reported pain point: after `Ctrl-D` in the REPL, `s_task_handle` stays alive (the FreeRTOS task is outside the MicroPython heap) while `s_lora_obj` becomes a dangling pointer to freed memory — the next RX/timer callback dereferences garbage and may crash. The rest are small but load-bearing: the MAC already knows the answers, we just don't expose them.
+
+#### Lifecycle
+
+- [x] `lw.deinit()` — ordered teardown dispatched through a new `CMD_DEINIT`. The LoRaWAN task calls `LoRaMacDeInitialization()` (falling back to `lorawan_radio_sleep()` if the MAC is mid-TX/RX), drops LmHandler package registrations and the FUOTA buffer (`lorawan_packages_deinit()`), runs `SX1276IoDeInit()` / `SX126xIoDeInit()` to deregister DIO ISRs + free the SPI bus, calls new `lorawan_timer_deinit()` (stops+deletes the shared `esp_timer` backing the LoRaMAC timer list) and `sx126x_spi_mutex_deinit()`, then `vTaskDelete(NULL)`. Python side then deletes `s_cmd_queue` / `s_rx_queue` / `s_events` and clears all statics. Idempotent. After `deinit()` a fresh `lorawan.LoRaWAN(...)` works in the same REPL session.
+- [x] Soft-reset hook — implemented via finaliser-backed allocation (`mp_obj_malloc_with_finaliser`) + `{ __del__ → deinit }` in locals_dict. `gc_sweep_all()` (ports/esp32/main.c:212) runs during soft-reset and fires the finaliser automatically — matches the pattern already used by `machine.I2S`, `machine.I2CTarget`, `modtls` etc. Avoids having to touch `ports/esp32/main.c` with a lorawan-specific deinit call (ESP32 port has no `MICROPY_BOARD_START_SOFT_RESET` hook).
+- [x] `__enter__` / `__exit__` — `__enter__` returns self; `__exit__` delegates to `deinit()` regardless of exception state. `with lorawan.LoRaWAN(...) as lw:` now guarantees cleanup on scope exit.
+
+#### Missing getters (MIB already has the answer)
+
+- [ ] `lw.dev_addr()` — returns the current 32-bit DevAddr. After OTAA this is the server-assigned value; useful for debugging and for matching against traffic captures. `MIB_DEV_ADDR`.
+- [ ] `lw.region()` — returns the `LORAMAC_REGION_*` the object was constructed with. Stored on `lorawan_obj_t.region` already; just needs the binding.
+- [ ] `lw.max_payload_len()` — returns the max app payload size for the current DR, accounting for MAC commands already queued. `LoRaMacQueryTxPossible()` returns `LORAMAC_STATUS_OK` with `Size`. Today `send()` fails late with `LENGTH_ERROR`; exposing this lets callers slice before submitting.
+
+#### Duty cycle
+
+Confirmed: duty cycle IS enforced. `EU868_DUTY_CYCLE_ENABLED = 1` in `RegionEU868.h:125` is applied at init via `MacGroup2.DutyCycleOn`. Every uplink past the first is gated by the regional band timers.
+
+The reason back-to-back `send()` calls *appear* to ignore the duty cycle is a hard-coded 10 s wait in `send()`: `xEventGroupWaitBits(..., pdMS_TO_TICKS(10000))` at `modlorawan.c:2171`. In LoRaMAC-node v4.7.0, when the MAC is restricted it returns `LORAMAC_STATUS_OK` (not an error) and schedules an internal `TxDelayedTimer` to fire when the band clears — typically tens of seconds on EU868 at low DR. Our `send()` gives up at 10 s with `RuntimeError("send timeout")` while the frame is still queued inside the MAC, and it transmits later *on its own* (user sees `tx_counter` advance with no Python call in between).
+
+- [ ] `send(..., timeout=None)` — make the wait configurable. `None` (or `timeout=0`, whichever is more MicroPython-idiomatic) = block as long as needed; any positive value = per-call cap. Default should probably go up to ~120 s so a duty-cycled DR_0 uplink still completes in one call.
+- [ ] `lw.duty_cycle([enabled])` — getter/setter via `MIB_CHANNELS_DUTY_CYCLE`. On by default for compliance; explicit `duty_cycle(False)` for bench testing on a private gateway (illegal on the public band but essential for iterating without the 1 % throttle).
+- [ ] `lw.time_until_tx()` — returns ms until the next uplink is allowed on the current channel (`LoRaMacQueryTxPossible` exposes `DutyCycleWaitTime`; on the McpsRequest path it's also on `ReqReturn.DutyCycleWaitTime`). Lets the caller choose between waiting, lowering DR, or giving up — instead of a blind block.
+- [ ] README — document the current duty-cycle behaviour (enforced, async via `TxDelayedTimer`, why `send()` timeouts appear suspicious) alongside the new `timeout` kwarg.
+
+#### Channel management (optional — needed if anyone deploys outside TTN defaults)
+
+- [ ] `lw.add_channel(index, freq, dr_min, dr_max)` — wraps `MIB_CHANNELS` + `LoRaMacChannelAdd`. Only meaningful on regions with dynamic channels (EU868, EU433).
+- [ ] `lw.remove_channel(index)` — `LoRaMacChannelRemove`.
+- [ ] `lw.channels()` — list of active channels with their params (from `MIB_CHANNELS`).
+
+#### Stats expansion
+
+- [ ] Extend `stats()` dict with `last_tx_dr`, `last_tx_freq`, `last_tx_power` (snapshot at TX start from `McpsConfirm` / MIB). Currently the user can track DR via `datarate()` but that's the *next* DR, not the last TX DR post-ADR.
+
+#### Documentation
+
+- [ ] README — new "Lifecycle" section covering `deinit()` and the soft-reset caveat.
+- [ ] README — note the duty-cycle default and how to disable for bench testing.
+- [x] Version bump 0.11.0 → 0.12.0 on lifecycle completion (lorawan.version() returns '0.12.0'). Compile clean, zero warnings; firmware 1644624 bytes.
+
 ## Notes
 
 - TCXO register: T-Beam uses crystal (0x09), NOT TCXO (0x19). Wrong value = radio doesn't work.

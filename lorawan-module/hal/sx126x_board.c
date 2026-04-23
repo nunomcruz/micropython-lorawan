@@ -28,9 +28,27 @@ static RadioOperatingModes_t operating_mode = MODE_STDBY_RC;
 // Without this mutex, concurrent transactions corrupt the SPI stream.
 static SemaphoreHandle_t s_spi_mutex = NULL;
 
+// Last frequency set via RADIO_SET_RFFREQUENCY. Captured for the TX diagnostic
+// log in SX126xSetRfTxPower; reset on deinit so a reused module doesn't
+// report a stale frequency from a previous session.
+static uint32_t s_last_freq_hz = 0;
+
 void sx126x_spi_mutex_init(void)
 {
     s_spi_mutex = xSemaphoreCreateRecursiveMutex();
+}
+
+// Release the recursive SPI mutex and reset state that SX126xIoInit assumes
+// at default. Called on module deinit so a subsequent lorawan.LoRaWAN(...)
+// starts from a clean slate.
+void sx126x_spi_mutex_deinit(void)
+{
+    if (s_spi_mutex) {
+        vSemaphoreDelete(s_spi_mutex);
+        s_spi_mutex = NULL;
+    }
+    operating_mode = MODE_STDBY_RC;
+    s_last_freq_hz = 0;
 }
 
 // Bring up the SX126x HAL.  Wrapper exposed via radio_select.h so callers
@@ -160,8 +178,6 @@ static inline void ensure_awake(void)
         SX126xAntSwOn();
     }
 }
-
-static uint32_t s_last_freq_hz = 0;
 
 void SX126xWriteCommand(RadioCommands_t opcode, uint8_t *buffer, uint16_t size)
 {

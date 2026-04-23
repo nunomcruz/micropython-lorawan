@@ -71,6 +71,12 @@ const uint8_t *lorawan_fragmentation_buffer(uint32_t *out_size);
 // Must be called from the LoRaWAN task main loop.
 void lorawan_packages_process(void);
 
+// Clear the package registry and release any shim-owned buffers (currently
+// the fragmentation RAM buffer allocated via fragmentation_enable()). Called
+// from modlorawan.c's deinit path so the next lorawan.LoRaWAN(...) starts
+// from a clean slate.
+void lorawan_packages_deinit(void);
+
 // LmHandler shim for Class change — used by LmhpRemoteMcastSetup to flip
 // to Class C at session start and back to Class A at session end.  This
 // runs from package Process() which the task invokes, so it is safe to

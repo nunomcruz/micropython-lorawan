@@ -29,4 +29,11 @@ uint8_t lorawan_radio_probe_reg42(void);
 // during MAC init).
 void lorawan_radio_init_sx126x(void);
 
+// Force the active radio into sleep via the current Radio table.
+// Used by the deinit path when LoRaMacDeInitialization() returns BUSY —
+// the MAC couldn't cleanly stop (TX/RX in flight), so we quiesce the
+// radio here before tearing down the SPI bus and GPIO ISRs.  No-op if
+// no radio table has been selected yet.
+void lorawan_radio_sleep(void);
+
 #endif /* RADIO_SELECT_H */

@@ -7,6 +7,9 @@
 //                         tx_power kwargs on __init__; nwk_key kwarg on join_otaa;
 //                         request_class / device_class / on_class_change (Class A <-> C);
 //                         antenna_gain kwarg + getter/setter (MIB_ANTENNA_GAIN).
+// Phase 5, Session 16:   lifecycle — deinit() / __del__ / __enter__ / __exit__.
+//                         Finaliser-backed allocation so the GC sweep during
+//                         soft-reset tears down the FreeRTOS task + radio HAL.
 // FreeRTOS task owns all MAC calls; Python thread communicates via queue + event group.
 
 #include <stdint.h>
@@ -43,6 +46,19 @@
 // Declared in hal/esp32_board.c. Not in loramac-node's board.h — the MAC's
 // GetTemperatureLevel callback is plugged in via s_mac_callbacks directly.
 float BoardGetTemperatureLevel(void);
+void BoardDeInitMcu(void);
+
+// Radio HAL teardown. Declared in loramac-node/src/boards/sx*-board.h, but
+// those headers collide with each other so we redeclare the two entry
+// points we need here (same pattern as BoardGetTemperatureLevel above).
+void SX1276IoDeInit(void);
+void SX126xIoDeInit(void);
+
+// HAL teardown helpers: stop/delete the shared esp_timer backing LoRaMAC's
+// timer list, and release the SX126x recursive SPI mutex. Declared in
+// hal/esp32_timer.c and hal/sx126x_board.c respectively.
+void lorawan_timer_deinit(void);
+void sx126x_spi_mutex_deinit(void);
 
 // Note: we deliberately do NOT include sx1276-board.h / sx126x-board.h /
 // the chip-level sx1276.h / sx126x.h here.  Those headers define several
@@ -115,6 +131,7 @@ typedef enum {
     CMD_MC_REMOVE,
     CMD_REMOTE_MCAST_ENABLE,
     CMD_FRAGMENTATION_ENABLE,
+    CMD_DEINIT,
 } lorawan_cmd_t;
 
 typedef struct {
@@ -1643,6 +1660,64 @@ static void lorawan_task(void *arg) {
                 break;
             }
 
+            case CMD_DEINIT: {
+                // Ordered teardown from task context so MAC / radio state is
+                // only ever touched from here.  If the MAC is in the middle
+                // of a TX or RX window LoRaMacDeInitialization returns BUSY;
+                // we still force the radio to sleep and proceed with the
+                // HAL-level teardown below — the task is about to exit so
+                // any lingering MAC state becomes irrelevant.
+                if (s_mac_initialized) {
+                    LoRaMacStatus_t ds = LoRaMacDeInitialization();
+                    if (ds != LORAMAC_STATUS_OK) {
+                        // MAC was mid-TX/RX; force-quiesce the radio before
+                        // the SPI bus goes away.
+                        lorawan_radio_sleep();
+                    }
+                }
+
+                // Drop LmHandler package registrations and release the
+                // shim-owned fragmentation buffer.
+                lorawan_packages_deinit();
+
+                // Deregister radio DIO ISRs and free the SPI bus.
+                bool is_sx1276_local = s_lora_obj ? s_lora_obj->is_sx1276 : true;
+                if (is_sx1276_local) {
+                    SX1276IoDeInit();
+                } else {
+                    SX126xIoDeInit();
+                    sx126x_spi_mutex_deinit();
+                }
+
+                // Stop+delete the shared esp_timer so no stray LoRaMAC
+                // timer callback can fire after the task is gone.
+                lorawan_timer_deinit();
+
+                BoardDeInitMcu();
+
+                s_mac_initialized       = false;
+                s_otaa_active           = false;
+                s_otaa_retry_needed     = false;
+                s_nvram_autosave_needed = false;
+                s_classb_active             = false;
+                s_classb_need_ping_slot_req = false;
+                s_classb_need_switch_class  = false;
+                s_classb_need_device_time_req = false;
+
+                // Signal the Python side; it will drop the queues and event
+                // group after we are gone.
+                xEventGroupSetBits(s_events, EVT_COMPLETED);
+
+                // Self-delete. FreeRTOS' idle task reclaims the TCB/stack.
+                // The for-loop below is unreachable but guards against any
+                // port where vTaskDelete returns control briefly before the
+                // scheduler tears the task down.
+                vTaskDelete(NULL);
+                for (;;) {
+                    vTaskDelay(portMAX_DELAY);
+                }
+            }
+
             case CMD_FRAGMENTATION_ENABLE: {
                 uint32_t sz = cmd.frag_enable.buffer_size;
                 // Allocate via malloc (raw heap) — the MAC accesses this from
@@ -1848,7 +1923,11 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
                      MP_ERROR_TEXT("LoRaWAN already initialized; reset first"));
     }
 
-    lorawan_obj_t *self = mp_obj_malloc(lorawan_obj_t, type);
+    // Finaliser-backed allocation so the GC's sweep during soft-reset
+    // (gc_sweep_all in ports/esp32/main.c) fires __del__ → deinit()
+    // automatically. Without this, Ctrl-D leaves the FreeRTOS task alive
+    // and dereferencing a freed lorawan_obj_t on the next radio IRQ.
+    lorawan_obj_t *self = mp_obj_malloc_with_finaliser(lorawan_obj_t, type);
     self->initialized      = false;
     self->joined           = false;
     self->is_sx1276        = true;
@@ -2962,6 +3041,63 @@ static mp_obj_t lorawan_fragmentation_data(mp_obj_t self_in) {
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_fragmentation_data_obj,
                                   lorawan_fragmentation_data);
 
+// deinit() — ordered teardown so a fresh lorawan.LoRaWAN(...) can be
+// created in the same REPL session. Idempotent: calling after the task has
+// already been torn down is a no-op. Also wired as __del__ on the type so
+// the GC sweep that runs during soft-reset (Ctrl-D in REPL) fires it
+// automatically, matching the pattern used by machine.I2S, I2CTarget etc.
+static mp_obj_t lorawan_deinit(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+
+    // Already torn down — nothing to do.
+    if (s_task_handle == NULL) {
+        if (self) self->initialized = false;
+        return mp_const_none;
+    }
+
+    // Dispatch CMD_DEINIT; the task handles the MAC + HAL teardown and
+    // self-deletes via vTaskDelete(NULL). We wait bounded — even if the
+    // MAC was stuck on a TX/RX the task still reaches vTaskDelete.
+    lorawan_cmd_data_t cmd = { .cmd = CMD_DEINIT };
+    xEventGroupClearBits(s_events, EVT_COMPLETED);
+    xQueueSend(s_cmd_queue, &cmd, portMAX_DELAY);
+    xTaskNotifyGive(s_task_handle);
+    xEventGroupWaitBits(s_events, EVT_COMPLETED,
+                        pdTRUE, pdFALSE, pdMS_TO_TICKS(2000));
+
+    // Give FreeRTOS' idle task one tick to actually reclaim the TCB
+    // before we delete the primitives the (now-dead) task was using.
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    if (s_cmd_queue) { vQueueDelete(s_cmd_queue); s_cmd_queue = NULL; }
+    if (s_rx_queue)  { vQueueDelete(s_rx_queue);  s_rx_queue  = NULL; }
+    if (s_events)    { vEventGroupDelete(s_events); s_events = NULL; }
+
+    s_task_handle = NULL;
+    s_lora_obj    = NULL;
+
+    // Clear the hardware TX-power override too — a fresh LoRaWAN() should
+    // start with MAC-driven TX power unless the user re-requests override.
+    g_tx_power_hw_override = LORAWAN_TX_POWER_NO_OVERRIDE;
+
+    if (self) self->initialized = false;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_deinit_obj, lorawan_deinit);
+
+// `with lorawan.LoRaWAN(...) as lw:` support — __exit__ guarantees deinit()
+// on scope exit even if the block raised.
+static mp_obj_t lorawan_enter(mp_obj_t self_in) {
+    return self_in;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_enter_obj, lorawan_enter);
+
+static mp_obj_t lorawan_exit(size_t n_args, const mp_obj_t *args) {
+    (void)n_args;
+    return lorawan_deinit(args[0]);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_exit_obj, 1, 4, lorawan_exit);
+
 static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_join_abp),       MP_ROM_PTR(&lorawan_join_abp_obj) },
     { MP_ROM_QSTR(MP_QSTR_join_otaa),      MP_ROM_PTR(&lorawan_join_otaa_obj) },
@@ -3001,6 +3137,12 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
                                                  MP_ROM_PTR(&lorawan_remote_multicast_enable_obj) },
     { MP_ROM_QSTR(MP_QSTR_fragmentation_enable), MP_ROM_PTR(&lorawan_fragmentation_enable_obj) },
     { MP_ROM_QSTR(MP_QSTR_fragmentation_data),   MP_ROM_PTR(&lorawan_fragmentation_data_obj) },
+    // Lifecycle (Session 16). __del__ fires on GC sweep, including the
+    // sweep done by the ESP32 port during soft-reset (Ctrl-D in REPL).
+    { MP_ROM_QSTR(MP_QSTR_deinit),               MP_ROM_PTR(&lorawan_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR___del__),              MP_ROM_PTR(&lorawan_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR___enter__),            MP_ROM_PTR(&lorawan_enter_obj) },
+    { MP_ROM_QSTR(MP_QSTR___exit__),             MP_ROM_PTR(&lorawan_exit_obj) },
 };
 static MP_DEFINE_CONST_DICT(lorawan_locals, lorawan_locals_table);
 
@@ -3015,7 +3157,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.11.0", 6);
+    return mp_obj_new_str("0.12.0", 6);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 
