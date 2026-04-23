@@ -203,7 +203,19 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
         `{"margin": N, "gw_count": N}` (or `None` if no LinkCheckAns yet).
         Typical pattern: `lw.link_check(); lw.send(b"p"); result = lw.link_check()`.
       - Compile clean, firmware 1624 KB (unchanged).
-- [ ] Implement `rejoin(type=0|1|2)` — LoRaWAN 1.1 rejoin without full join
+- [x] Implement `rejoin(type=0|1|2)` — LoRaWAN 1.1 rejoin without full join
+      - New `CMD_REQUEST_REJOIN` dispatched through the LoRaWAN task; maps
+        type 0/1/2 to `MLME_REJOIN_0/1/2` and calls `LoRaMacMlmeRequest`.
+      - Unlike `link_check()` / `request_device_time()` (piggy-back), a
+        rejoin is itself an uplink (`SendReJoinReq` → `ScheduleTx`), so no
+        follow-up `send()` is needed.
+      - `mlme_confirm` logs `MLME_REJOIN_*` outcomes; the optional
+        Join-Accept (type 1) is processed internally by the MAC and
+        re-derives session keys.
+      - Python API: `lw.rejoin()` (defaults to type 0), `lw.rejoin(1)`,
+        `lw.rejoin(2)`. Raises `RuntimeError` if not joined, `ValueError`
+        if type is outside 0–2. Meaningful only for LoRaWAN 1.1.
+      - Version bumped 0.9.1 → 0.9.2; compile clean, firmware 1624 KB.
 - [ ] Register Clock Sync package (LmhpClockSync, port 202)
 - [ ] Implement `clock_sync_enable()`, `clock_sync_request()`, `synced_time()`
 - [ ] Test: DeviceTimeReq on TTN, verify epoch matches real time

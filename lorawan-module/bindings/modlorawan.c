@@ -91,6 +91,7 @@ typedef enum {
     CMD_SET_CLASS,
     CMD_REQUEST_DEVICE_TIME,
     CMD_REQUEST_LINK_CHECK,
+    CMD_REQUEST_REJOIN,
 } lorawan_cmd_t;
 
 typedef struct {
@@ -133,6 +134,7 @@ typedef struct {
         cmd_tx_t        tx;
         cmd_set_params_t set_params;
         uint8_t         device_class; // CMD_SET_CLASS: DeviceClass_t value
+        uint8_t         rejoin_type;  // CMD_REQUEST_REJOIN: 0, 1 or 2
     };
 } lorawan_cmd_data_t;
 
@@ -437,6 +439,24 @@ static void mlme_confirm(MlmeConfirm_t *c) {
                            (int)c->DemodMargin, (int)c->NbGateways);
         } else {
             esp_rom_printf("lorawan: MLME_LINK_CHECK failed (status=%d)\n",
+                           (int)c->Status);
+        }
+        break;
+
+    case MLME_REJOIN_0:
+    case MLME_REJOIN_1:
+    case MLME_REJOIN_2:
+        // ReJoin-request was transmitted. For types 0 and 2 the network
+        // answer is optional; for type 1 (periodic, LoRaWAN 1.1) the
+        // network may reply with a Join-Accept that re-derives session
+        // keys. The MAC handles key re-derivation internally; here we
+        // just log the outcome.
+        if (c->Status == LORAMAC_EVENT_INFO_STATUS_OK) {
+            esp_rom_printf("lorawan: ReJoin type %d accepted\n",
+                           (int)(c->MlmeRequest - MLME_REJOIN_0));
+        } else {
+            esp_rom_printf("lorawan: ReJoin type %d failed (status=%d)\n",
+                           (int)(c->MlmeRequest - MLME_REJOIN_0),
                            (int)c->Status);
         }
         break;
@@ -983,6 +1003,33 @@ static void lorawan_task(void *arg) {
                 LoRaMacStatus_t st = LoRaMacMlmeRequest(&mlme);
                 if (st != LORAMAC_STATUS_OK) {
                     esp_rom_printf("lorawan: MLME_DEVICE_TIME request error %d\n", (int)st);
+                }
+                xEventGroupSetBits(s_events, EVT_COMPLETED);
+                break;
+            }
+
+            case CMD_REQUEST_REJOIN: {
+                // MLME_REJOIN_{0,1,2} sends a ReJoin-request frame over the
+                // air (SendReJoinReq → ScheduleTx), unlike DeviceTimeReq /
+                // LinkCheckReq which only piggy-back. No follow-up send() is
+                // required — the ReJoin frame is the uplink.
+                //
+                // Type 0: announce presence, may trigger re-keying (1.1 only).
+                // Type 1: periodic, carries JoinEUI+DevEUI, may receive Join-Accept.
+                // Type 2: trigger session key refresh (1.1 only).
+                MlmeReq_t mlme;
+                switch (cmd.rejoin_type) {
+                case 0:  mlme.Type = MLME_REJOIN_0; break;
+                case 1:  mlme.Type = MLME_REJOIN_1; break;
+                default: mlme.Type = MLME_REJOIN_2; break;
+                }
+                LoRaMacStatus_t st = LoRaMacMlmeRequest(&mlme);
+                if (st != LORAMAC_STATUS_OK) {
+                    esp_rom_printf("lorawan: MLME_REJOIN_%u request error %d\n",
+                                   (unsigned)cmd.rejoin_type, (int)st);
+                } else {
+                    esp_rom_printf("lorawan: ReJoin type %u request sent\n",
+                                   (unsigned)cmd.rejoin_type);
                 }
                 xEventGroupSetBits(s_events, EVT_COMPLETED);
                 break;
@@ -1793,6 +1840,36 @@ static mp_obj_t lorawan_link_check(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_link_check_obj, lorawan_link_check);
 
+// rejoin(type=0) — send a LoRaWAN 1.1 ReJoin-request frame.
+// type=0: announce presence; network may re-derive session keys (1.1 only).
+// type=1: periodic rejoin, carries DevEUI+JoinEUI; a Join-Accept may follow.
+// type=2: request session key refresh (1.1 only).
+//
+// ReJoin only makes sense after a successful OTAA join. Unlike link_check()
+// and request_device_time() (which piggy-back on the next uplink), a rejoin
+// is itself an uplink frame — no follow-up send() is required. The call
+// returns as soon as the MAC has accepted the request; the optional
+// Join-Accept arrives later and is processed by the MAC internally.
+static mp_obj_t lorawan_rejoin(size_t n_args, const mp_obj_t *args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    if (!self->joined) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not joined"));
+    }
+    int type = (n_args > 1) ? mp_obj_get_int(args[1]) : 0;
+    if (type < 0 || type > 2) {
+        mp_raise_ValueError(MP_ERROR_TEXT("rejoin type must be 0, 1 or 2"));
+    }
+    lorawan_cmd_data_t cmd;
+    cmd.cmd = CMD_REQUEST_REJOIN;
+    cmd.rejoin_type = (uint8_t)type;
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_rejoin_obj, 1, 2, lorawan_rejoin);
+
 // on_time_sync(callback) — register callback(gps_epoch_seconds) for every
 // successful DeviceTimeAns. Pass None to deregister.
 static mp_obj_t lorawan_on_time_sync(mp_obj_t self_in, mp_obj_t cb) {
@@ -1838,6 +1915,7 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_request_device_time), MP_ROM_PTR(&lorawan_request_device_time_obj) },
     { MP_ROM_QSTR(MP_QSTR_network_time),   MP_ROM_PTR(&lorawan_network_time_obj) },
     { MP_ROM_QSTR(MP_QSTR_link_check),     MP_ROM_PTR(&lorawan_link_check_obj) },
+    { MP_ROM_QSTR(MP_QSTR_rejoin),         MP_ROM_PTR(&lorawan_rejoin_obj) },
     { MP_ROM_QSTR(MP_QSTR_on_time_sync),   MP_ROM_PTR(&lorawan_on_time_sync_obj) },
 };
 static MP_DEFINE_CONST_DICT(lorawan_locals, lorawan_locals_table);
@@ -1853,7 +1931,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.9.1", 5);
+    return mp_obj_new_str("0.9.2", 5);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 
