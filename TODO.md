@@ -401,6 +401,14 @@ Follow-up to Session 16's hazard note ("An IRQ ISR firing mid-teardown will corr
 - [x] Rejected `eTaskGetState` polling as a "safer" alternative to the `vTaskDelay(10 ms)` that lets the idle task reclaim the task's TCB — the FreeRTOS implementation of `eTaskGetState` dereferences the handle directly and would UAF as soon as the idle task on CPU1 frees the TCB between polling iterations. The 10 ms delay stays, with a comment explaining why.
 - [x] Version bumped 0.15.0 → 0.16.0; compile clean, zero warnings; firmware 1645888 bytes (+192 B).
 
+### Session 19: Battery level reporting (DevStatusAns)
+
+- [x] HAL: `hal/esp32_board.c` now holds a `static volatile uint8_t s_battery_level = 255` (matches LoRaWAN DevStatusAns "unable to measure" default). `BoardGetBatteryLevel()` reads it; new `BoardSetBatteryLevel(uint8_t)` stores it. Volatile is enough — a single-byte store is atomic on xtensa, the MAC task only reads, the Python thread only writes, no mutex needed.
+- [x] Python API: `lw.battery_level([level])` getter/setter. Validates `0..255` and raises `ValueError` out of range. Does not require `initialized` or a command round-trip — writes the static directly, so it's safe to call before join or from any thread.
+- [x] `examples/sensor_node.py` — refactored: new `read_battery_mv(hw)` + `battery_level_lorawan(mv)` helpers split out of `read_sensor`. `main()` now calls `lw.battery_level(battery_level_lorawan(mv))` before `send()`, so the next `DevStatusReq` from the network gets a real answer. Prints the mapped level alongside the mV reading for visibility.
+- [x] README — new `battery_level()` entry under *Configuration*, documenting the `0 / 1..254 / 255` semantics and pointing to `sensor_node.py`. Examples README annotates `sensor_node.py` with the new capability.
+- [x] Version bumped 0.17.0 → 0.18.0; compile clean, firmware 0x191f40 bytes.
+
 ## Notes
 
 - TCXO register: T-Beam uses crystal (0x09), NOT TCXO (0x19). Wrong value = radio doesn't work.

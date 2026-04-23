@@ -30,26 +30,46 @@ SLEEP_SECONDS = 15 * 60   # 900 s — respects TTN fair-use policy at DR_0..DR_5
 UPLINK_PORT   = 2
 
 
-def read_sensor(hw):
-    """Gather a sample. Replace with your real sensor code.
-
-    Returns 6 bytes:
-      uint32 uptime_seconds + uint16 supply_millivolts
+def read_battery_mv(hw):
+    """Read battery voltage in mV. Returns 0 if the reading failed or the
+    board has no supported PMU. We do the raw I2C read to avoid dragging in
+    a full PMU driver. AXP192 battery-voltage ADC is at 0x78/0x79 (12 bits,
+    1.1 mV/LSB). Add an AXP2101 branch here for T-Beam v1.2.
     """
-    uptime = int(time.time())
-    mv = 0
-
-    # If an AXP192/AXP2101 is fitted, read VBus/battery voltage. We do the
-    # raw I2C read here to avoid dragging in a full PMU driver. The AXP192
-    # battery-voltage ADC is at 0x78/0x79 (12 bits, 1.1 mV/LSB).
     if hw.pmu == "axp192":
         try:
             i2c = tbeam.i2c_bus()
             raw = i2c.readfrom_mem(0x34, 0x78, 2)
-            mv = ((raw[0] << 4) | (raw[1] & 0x0F)) * 11 // 10
+            return ((raw[0] << 4) | (raw[1] & 0x0F)) * 11 // 10
         except Exception as e:
             print("pmu read failed:", e)
+    return 0
 
+
+def battery_level_lorawan(mv):
+    """Map battery voltage (mV) to the LoRaWAN DevStatusAns range:
+      0       = on external power (not inferable from voltage alone)
+      1..254  = battery level (1 = 3.2 V empty, 254 = 4.2 V full — linear)
+      255     = unable to measure
+    The network asks for this via the DevStatusReq MAC command; the stack
+    answers automatically from whatever we last pushed via battery_level().
+    """
+    if mv == 0:
+        return 255
+    level = 1 + (mv - 3200) * 253 // 1000
+    if level < 1:
+        return 1
+    if level > 254:
+        return 254
+    return level
+
+
+def read_sensor(mv):
+    """Pack the telemetry frame. Replace with your real sensor code.
+
+    Returns 6 bytes: uint32 uptime_seconds + uint16 supply_millivolts.
+    """
+    uptime = int(time.time())
     return struct.pack(">IH", uptime & 0xFFFFFFFF, mv & 0xFFFF)
 
 
@@ -93,7 +113,11 @@ def main():
         print(f"back to sleep for {SLEEP_SECONDS} s, will retry on wake")
         machine.deepsleep(SLEEP_SECONDS * 1000)
 
-    payload = read_sensor(hw)
+    mv = read_battery_mv(hw)
+    lw.battery_level(battery_level_lorawan(mv))
+    print(f"battery: {mv} mV → DevStatusAns level {lw.battery_level()}")
+
+    payload = read_sensor(mv)
     print(f"payload: {payload.hex()}")
 
     try:

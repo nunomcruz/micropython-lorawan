@@ -39,6 +39,7 @@
 #include "board.h"
 #include "lorawan_config.h"
 #include "LoRaMac.h"
+#include "LoRaMacClassB.h"
 #include "LoRaMacTest.h"
 #include "region/RegionEU868.h"
 #include "systime.h"
@@ -48,6 +49,7 @@
 // GetTemperatureLevel callback is plugged in via s_mac_callbacks directly.
 float BoardGetTemperatureLevel(void);
 void BoardDeInitMcu(void);
+void BoardSetBatteryLevel(uint8_t level);
 
 // Radio HAL teardown. Declared in loramac-node/src/boards/sx*-board.h, but
 // those headers collide with each other so we redeclare the two entry
@@ -1611,9 +1613,26 @@ static void lorawan_task(void *arg) {
                 // Leaving Class B cleanly: stop the state machine first so no
                 // pending flag re-triggers PingSlotInfoReq after the switch.
                 if (cur_class == CLASS_B) {
-                    s_classb_active              = false;
-                    s_classb_need_ping_slot_req  = false;
-                    s_classb_need_switch_class   = false;
+                    s_classb_active                = false;
+                    s_classb_need_ping_slot_req    = false;
+                    s_classb_need_switch_class     = false;
+                    s_classb_need_device_time_req  = false;
+                }
+
+                // Aborting an in-flight Class B acquisition: MIB.Class is still
+                // CLASS_A (the BEACON_ACQUISITION → PINGSLOT_INFO chain never
+                // completed) so the SwitchClass(CLASS_A) below would be a no-op
+                // in LoRaMac.c and would leave LoRaMacClassB's beacon state
+                // machine reserving windows — next McpsRequest would then return
+                // LORAMAC_STATUS_BUSY_BEACON_RESERVED_TIME (14). Halt explicitly.
+                if (new_class == CLASS_A && s_classb_active) {
+                    LoRaMacClassBHaltBeaconing();
+                    LoRaMacClassBStopRxSlots();
+                    s_classb_active                = false;
+                    s_classb_need_ping_slot_req    = false;
+                    s_classb_need_switch_class     = false;
+                    s_classb_need_device_time_req  = false;
+                    esp_rom_printf("lorawan: Class B acquisition aborted\n");
                 }
 
                 if (cur_class == new_class) {
@@ -2657,6 +2676,25 @@ static mp_obj_t lorawan_tx_power(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_tx_power_obj, 1, 2, lorawan_tx_power);
 
+// battery_level(level=None) — value reported in DevStatusAns MAC command.
+//   0       = powered by external source (USB/DC)
+//   1..254  = battery level (1 min, 254 max)
+//   255     = unable to measure (default)
+// The MAC task reads this on demand when the network sends DevStatusReq;
+// no queueing needed since a single-byte store is atomic.
+static mp_obj_t lorawan_battery_level(size_t n_args, const mp_obj_t *args) {
+    if (n_args == 1) {
+        return mp_obj_new_int(BoardGetBatteryLevel());
+    }
+    mp_int_t level = mp_obj_get_int(args[1]);
+    if (level < 0 || level > 255) {
+        mp_raise_ValueError(MP_ERROR_TEXT("battery_level must be 0..255"));
+    }
+    BoardSetBatteryLevel((uint8_t)level);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_battery_level_obj, 1, 2, lorawan_battery_level);
+
 // antenna_gain(gain=None) — getter/setter for MIB_ANTENNA_GAIN.
 // Getter returns the current antenna gain in dBi as a float.
 // Setter updates both MIB_ANTENNA_GAIN and MIB_DEFAULT_ANTENNA_GAIN so a
@@ -3483,6 +3521,7 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_datarate),       MP_ROM_PTR(&lorawan_datarate_obj) },
     { MP_ROM_QSTR(MP_QSTR_adr),            MP_ROM_PTR(&lorawan_adr_obj) },
     { MP_ROM_QSTR(MP_QSTR_tx_power),       MP_ROM_PTR(&lorawan_tx_power_obj) },
+    { MP_ROM_QSTR(MP_QSTR_battery_level),  MP_ROM_PTR(&lorawan_battery_level_obj) },
     { MP_ROM_QSTR(MP_QSTR_antenna_gain),   MP_ROM_PTR(&lorawan_antenna_gain_obj) },
     { MP_ROM_QSTR(MP_QSTR_duty_cycle),     MP_ROM_PTR(&lorawan_duty_cycle_obj) },
     { MP_ROM_QSTR(MP_QSTR_time_until_tx),  MP_ROM_PTR(&lorawan_time_until_tx_obj) },
@@ -3533,7 +3572,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.17.0", 6);
+    return mp_obj_new_str("0.18.0", 6);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 

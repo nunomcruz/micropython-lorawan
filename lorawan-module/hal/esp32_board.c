@@ -49,12 +49,23 @@ uint32_t BoardGetBatteryVoltage(void)
     return 3300;
 }
 
+// LoRaWAN DevStatusAns battery field:
+//   0       = powered by external source
+//   1..254  = battery level (1 min, 254 max)
+//   255     = unable to measure
+// Default 255 until Python sets a value via LoRaWAN.battery_level(...).
+// volatile so the MAC FreeRTOS task sees stores from the Python thread
+// without explicit synchronisation (a single-byte load is atomic on xtensa).
+static volatile uint8_t s_battery_level = 255;
+
 uint8_t BoardGetBatteryLevel(void)
 {
-    // 255 = unknown / not implemented
-    // AXP PMU reads require I2C and knowledge of which PMU is present;
-    // this is deferred until the Python bindings layer initialises the PMU.
-    return 255;
+    return s_battery_level;
+}
+
+void BoardSetBatteryLevel(uint8_t level)
+{
+    s_battery_level = level;
 }
 
 int16_t BoardGetTemperature(void)

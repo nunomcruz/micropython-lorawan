@@ -11,7 +11,7 @@ the top of the script with the values from your LNS console.
 |---|---|
 | [basic_otaa.py](basic_otaa.py) | OTAA join + one unconfirmed uplink. |
 | [basic_abp.py](basic_abp.py) | ABP session + one confirmed uplink. |
-| [sensor_node.py](sensor_node.py) | Periodic sensor uplink with deep sleep between readings. |
+| [sensor_node.py](sensor_node.py) | Periodic sensor uplink with deep sleep, AXP192 battery read, and `battery_level()` reporting for `DevStatusAns`. |
 | [time_sync.py](time_sync.py) | Sync to network time via MAC DeviceTimeReq and the Clock Sync package. |
 | [class_b_beacon.py](class_b_beacon.py) | Switch to Class B, monitor beacons, receive on ping slots. |
 | [multicast_receiver.py](multicast_receiver.py) | Provision a local multicast group and listen in Class C. |

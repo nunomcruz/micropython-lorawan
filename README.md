@@ -326,6 +326,25 @@ lw.antenna_gain(2.15)  # stated gain of the stock T-Beam whip
 lw.antenna_gain()      # → 2.15
 ```
 
+#### `lw.battery_level([level])` → `int | None`
+
+Getter/setter for the battery value reported to the network in `DevStatusAns`. Whenever the network sends a `DevStatusReq` MAC command, the stack answers with this byte plus the SNR of the last uplink. No Python callback fires — the value is read atomically on demand by the MAC task.
+
+| Value | Meaning |
+|-------|---------|
+| `0` | Device is powered by an external source (USB/DC) |
+| `1..254` | Battery level (`1` = empty, `254` = full) |
+| `255` | Unable to measure (default) |
+
+```python
+lw.battery_level(0)          # on USB
+lw.battery_level(1 + int(pct * 253 / 100))  # 0–100 % → 1..254
+lw.battery_level(255)        # unknown
+lw.battery_level()           # → current value
+```
+
+See [`examples/sensor_node.py`](lorawan-module/examples/sensor_node.py) for a worked example that reads the AXP192 battery voltage and maps it to the LoRaWAN range.
+
 #### `lw.stats()` → `dict`
 
 Returns a snapshot of runtime statistics:
@@ -929,7 +948,7 @@ pins = tbeam.lora_pins(hw)         # (cs, irq, rst) or (cs, irq, rst, busy)
 
 ## Project status
 
-**v0.16.0.** Phase 1–5 of the roadmap are complete end-to-end on hardware:
+**v0.18.0.** Phase 1–5 of the roadmap are complete end-to-end on hardware:
 
 - Phase 1: T-Beam board definition (all variants, runtime auto-detect).
 - Phase 2: USER_C_MODULE skeleton.
