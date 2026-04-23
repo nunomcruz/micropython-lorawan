@@ -206,15 +206,32 @@ Returns `True` if the device has an active session (ABP always returns `True` af
 
 #### `lw.send(data, *, port=1, confirmed=False, datarate=lorawan.DR_0, timeout=120)`
 
-Transmits an uplink frame. Blocks until TX is complete (includes waiting for RX1/RX2 windows) or until `timeout` seconds elapse. Raises `RuntimeError("send timeout")` on timeout.
+Transmits an uplink frame. Blocks until TX is complete (includes waiting for RX1/RX2 windows) or until `timeout` seconds elapse.
 
-`timeout` defaults to 120 s so that a duty-cycle-deferred uplink on DR_0 completes in one call — see [Duty cycle](#duty-cycle) below. Pass `timeout=None` to block until TX completes (non-positive ints map to the same "wait forever" behaviour). The frame may still be queued inside the MAC after a timeout and transmitted later on its own — `tx_counter` advancing with no Python call in between is the tell-tale sign.
+**Exceptions:**
+- `OSError(EBUSY)` — the regional duty cycle is currently restricting TX. The frame was **not** queued; call `lw.time_until_tx()` to get the wait in milliseconds, sleep, then retry.
+- `RuntimeError("send failed")` — the MAC rejected the frame for another reason (not joined, length error, etc.).
+- `RuntimeError("send timeout")` — `timeout` elapsed before TX completed.
+
+`timeout` defaults to 120 s. Pass `timeout=None` to block until TX completes (non-positive ints are treated the same way).
 
 ```python
-lw.send(b"hello")                              # unconfirmed, port 1, DR_0 (SF12)
-lw.send(b"ping", confirmed=True)               # confirmed uplink — waits for ACK
+import errno, time
+
+lw.send(b"hello")                               # unconfirmed, port 1, DR_0 (SF12)
+lw.send(b"ping", confirmed=True)                # confirmed uplink — waits for ACK
 lw.send(b"data", port=2, datarate=lorawan.DR_5) # SF7 — faster, shorter range
-lw.send(b"slow", timeout=None)                 # block until TX completes
+lw.send(b"slow", timeout=None)                  # block until TX completes
+
+# Handle duty-cycle restriction
+try:
+    lw.send(b"payload")
+except OSError as e:
+    if e.args[0] == errno.EBUSY:
+        time.sleep_ms(lw.time_until_tx())
+        lw.send(b"payload")   # retry after the band clears
+    else:
+        raise
 ```
 
 #### `lw.on_tx_done(callback)` / `lw.on_tx_done(None)`
@@ -367,15 +384,19 @@ lw.stats()
 
 EU868 and EU433 enforce a regional duty cycle (typically 1 % air-time per band). The MAC honours this by default — `EU868_DUTY_CYCLE_ENABLED = 1` in the region file — and every uplink past the first is gated by the regional band timers.
 
-**Deferred uplinks.** When the MAC is duty-cycle restricted, `LoRaMacMcpsRequest()` still returns `LORAMAC_STATUS_OK` and schedules an internal `TxDelayedTimer` that fires when the band clears — typically tens of seconds on EU868 at low DR. The `send()` call blocks on `timeout` (default 120 s) while the frame waits inside the MAC. If the timeout elapses first, `send()` raises `RuntimeError("send timeout")` but the frame may still transmit later on its own — watch `stats()["tx_counter"]` advance without a corresponding Python call.
-
-To check how long until the next uplink is allowed:
+**Immediate rejection.** When the band is restricted, `send()` raises `OSError(EBUSY)` immediately — the frame is **not** queued inside the MAC. Use `time_until_tx()` to get the remaining wait in milliseconds:
 
 ```python
-ms = lw.time_until_tx()       # 0 once the band is clear
-if ms:
-    time.sleep_ms(ms)
-lw.send(b"data")
+import errno, time
+
+try:
+    lw.send(b"data")
+except OSError as e:
+    if e.args[0] == errno.EBUSY:
+        time.sleep_ms(lw.time_until_tx())
+        lw.send(b"data")   # retry once the band is clear
+    else:
+        raise
 ```
 
 #### `lw.duty_cycle([enabled])` → `bool | None`

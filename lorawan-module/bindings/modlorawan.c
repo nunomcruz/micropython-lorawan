@@ -102,15 +102,16 @@ void sx126x_spi_mutex_deinit(void);
 #define LORAWAN_V1_1    1
 
 // Event group bits
-#define EVT_COMPLETED    (1u << 0)
-#define EVT_INIT_ERROR   (1u << 1)
-#define EVT_TX_DONE      (1u << 2)
-#define EVT_TX_ERROR     (1u << 3)
-#define EVT_JOIN_DONE    (1u << 4)
-#define EVT_NVRAM_OK     (1u << 5)
-#define EVT_NVRAM_ERROR  (1u << 6)
-#define EVT_CLASS_OK     (1u << 7)
-#define EVT_CLASS_ERROR  (1u << 8)
+#define EVT_COMPLETED       (1u << 0)
+#define EVT_INIT_ERROR      (1u << 1)
+#define EVT_TX_DONE         (1u << 2)
+#define EVT_TX_ERROR        (1u << 3)
+#define EVT_JOIN_DONE       (1u << 4)
+#define EVT_NVRAM_OK        (1u << 5)
+#define EVT_NVRAM_ERROR     (1u << 6)
+#define EVT_CLASS_OK        (1u << 7)
+#define EVT_CLASS_ERROR     (1u << 8)
+#define EVT_TX_DUTY_CYCLE   (1u << 9)
 
 // Beacon state codes surfaced to Python via on_beacon(state, info).
 // Mapped from MLME_BEACON / MLME_BEACON_LOST indications and the
@@ -1293,7 +1294,9 @@ static void lorawan_task(void *arg) {
                     s_lora_obj->last_dc_wait_ms  = (uint32_t)mcps.ReqReturn.DutyCycleWaitTime;
                     s_lora_obj->last_dc_query_us = esp_timer_get_time();
                 }
-                if (st != LORAMAC_STATUS_OK) {
+                if (st == LORAMAC_STATUS_DUTYCYCLE_RESTRICTED) {
+                    xEventGroupSetBits(s_events, EVT_TX_DUTY_CYCLE);
+                } else if (st != LORAMAC_STATUS_OK) {
                     esp_rom_printf("lorawan: McpsRequest failed: %d\n", (int)st);
                     xEventGroupSetBits(s_events, EVT_TX_ERROR);
                 }
@@ -2430,21 +2433,22 @@ static mp_obj_t lorawan_send(size_t n_args, const mp_obj_t *pos_args,
     cmd.tx.datarate   = (uint8_t)args[ARG_datarate].u_int;
     memcpy(cmd.tx.data, buf.buf, buf.len);
 
-    xEventGroupClearBits(s_events, EVT_TX_DONE | EVT_TX_ERROR);
+    xEventGroupClearBits(s_events, EVT_TX_DONE | EVT_TX_ERROR | EVT_TX_DUTY_CYCLE);
     xQueueSend(s_cmd_queue, &cmd, portMAX_DELAY);
     xTaskNotifyGive(s_task_handle);
 
     EventBits_t bits = xEventGroupWaitBits(s_events,
-                                           EVT_TX_DONE | EVT_TX_ERROR,
+                                           EVT_TX_DONE | EVT_TX_ERROR | EVT_TX_DUTY_CYCLE,
                                            pdTRUE, pdFALSE,
                                            wait_ticks);
 
+    if (bits & EVT_TX_DUTY_CYCLE) {
+        mp_raise_OSError(MP_EBUSY);
+    }
     if (bits & EVT_TX_ERROR) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("send failed"));
     }
     if (!(bits & EVT_TX_DONE)) {
-        // The MAC may still have the frame queued (TxDelayedTimer pending);
-        // it will transmit later on its own. tx_counter advances when it does.
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("send timeout"));
     }
 
