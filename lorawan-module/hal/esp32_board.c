@@ -11,6 +11,7 @@
 #include "esp_system.h"
 #include "esp_random.h"
 #include "esp_mac.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -131,14 +132,28 @@ void RtcStopAlarm(void) {}
 void RtcStartAlarm(uint32_t timeout) { (void)timeout; }
 uint32_t RtcSetTimerContext(void) { return 0; }
 uint32_t RtcGetTimerContext(void) { return 0; }
-uint32_t RtcGetCalendarTime(uint16_t *ms) { if (ms) *ms = 0; return 0; }
+uint32_t RtcGetCalendarTime(uint16_t *ms)
+{
+    int64_t us = esp_timer_get_time();
+    uint32_t seconds = (uint32_t)(us / 1000000);
+    if (ms) *ms = (uint16_t)((us / 1000) % 1000);
+    return seconds;
+}
 uint32_t RtcGetTimerValue(void) { return 0; }
 uint32_t RtcGetTimerElapsedTime(void) { return 0; }
-void RtcBkupWrite(uint32_t data0, uint32_t data1) { (void)data0; (void)data1; }
+
+static uint32_t rtc_bkup_data0 = 0;
+static uint32_t rtc_bkup_data1 = 0;
+
+void RtcBkupWrite(uint32_t data0, uint32_t data1)
+{
+    rtc_bkup_data0 = data0;
+    rtc_bkup_data1 = data1;
+}
 void RtcBkupRead(uint32_t *data0, uint32_t *data1)
 {
-    if (data0) *data0 = 0;
-    if (data1) *data1 = 0;
+    if (data0) *data0 = rtc_bkup_data0;
+    if (data1) *data1 = rtc_bkup_data1;
 }
 void RtcProcess(void) {}
 TimerTime_t RtcTempCompensation(TimerTime_t period, float temperature)
