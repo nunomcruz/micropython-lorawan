@@ -39,6 +39,7 @@
 #include "board.h"
 #include "lorawan_config.h"
 #include "LoRaMac.h"
+#include "LoRaMacTest.h"
 #include "region/RegionEU868.h"
 #include "systime.h"
 #include "lmhandler_shim.h"
@@ -176,7 +177,7 @@ typedef struct {
     bool     confirmed;
 } cmd_tx_t;
 
-// set_params.type: 0=ADR, 1=DR, 2=TX_POWER, 3=ANTENNA_GAIN
+// set_params.type: 0=ADR, 1=DR, 2=TX_POWER, 3=ANTENNA_GAIN, 4=DUTY_CYCLE
 typedef struct {
     uint8_t type;
     union {
@@ -184,6 +185,7 @@ typedef struct {
         int8_t dr;
         int8_t tx_power;
         float  antenna_gain;
+        bool   duty_cycle;
     };
 } cmd_set_params_t;
 
@@ -261,6 +263,14 @@ typedef struct {
     int8_t          channels_datarate;
     bool            adr_enabled;
     int8_t          channels_tx_power; // TX_POWER index (0=max); convert to/from dBm at API boundary
+    // Duty-cycle state. duty_cycle_enabled mirrors Nvm.MacGroup2.DutyCycleOn so
+    // the getter is O(1) (no MIB round-trip). last_dc_wait_ms is the wait time
+    // returned by the most recent McpsRequest.ReqReturn.DutyCycleWaitTime, with
+    // last_dc_query_us the esp_timer_get_time() at the moment we read it; their
+    // difference is what time_until_tx() returns (clamped to >= 0).
+    bool            duty_cycle_enabled;
+    uint32_t        last_dc_wait_ms;
+    int64_t         last_dc_query_us;
     // Antenna gain in dBi. MAC subtracts this from EIRP when computing radio TX power:
     //   radioTxPower = floor(maxEirp - txPowerIndex*2 - antennaGain)
     // EU868 region default is 2.15 dBi; we default to 0.0 so the radio emits full EIRP
@@ -1077,6 +1087,13 @@ static void lorawan_task(void *arg) {
                     mib.Type = MIB_CHANNELS_TX_POWER;
                     if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK)
                         s_lora_obj->channels_tx_power = mib.Param.ChannelsTxPower;
+
+                    // Duty cycle: no dedicated MIB in v4.7.0 — read it via the
+                    // NVM blob (MacGroup2.DutyCycleOn is set from the region
+                    // PHY default during LoRaMacInitialization).
+                    mib.Type = MIB_NVM_CTXS;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK)
+                        s_lora_obj->duty_cycle_enabled = mib.Param.Contexts->MacGroup2.DutyCycleOn;
                 }
 
                 s_mac_initialized = true;
@@ -1217,6 +1234,17 @@ static void lorawan_task(void *arg) {
                 }
 
                 LoRaMacStatus_t st = LoRaMacMcpsRequest(&mcps);
+                // Capture the duty-cycle wait time the MAC computed for this
+                // request. On LORAMAC_STATUS_OK this is also the delay until
+                // the internal TxDelayedTimer fires when the MAC has queued
+                // the frame instead of sending it immediately, so it is the
+                // value time_until_tx() needs for callers waiting on the
+                // current TX path. Always populated (the MAC initialises it
+                // to 0 at the top of LoRaMacMcpsRequest).
+                if (s_lora_obj) {
+                    s_lora_obj->last_dc_wait_ms  = (uint32_t)mcps.ReqReturn.DutyCycleWaitTime;
+                    s_lora_obj->last_dc_query_us = esp_timer_get_time();
+                }
                 if (st != LORAMAC_STATUS_OK) {
                     esp_rom_printf("lorawan: McpsRequest failed: %d\n", (int)st);
                     xEventGroupSetBits(s_events, EVT_TX_ERROR);
@@ -1301,6 +1329,10 @@ static void lorawan_task(void *arg) {
                     mib.Type = MIB_ANTENNA_GAIN;
                     if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK)
                         s_lora_obj->antenna_gain = mib.Param.AntennaGain;
+
+                    // Duty cycle is part of MacGroup2 → restored above.
+                    s_lora_obj->duty_cycle_enabled =
+                        s_restored_ctx.MacGroup2.DutyCycleOn;
                 }
                 // Read FCntUp back from the MAC to confirm the Crypto group was
                 // restored (CRC matched).  If FCntUp==0 here, the CRC was wrong.
@@ -1347,6 +1379,14 @@ static void lorawan_task(void *arg) {
                     mib.Param.DefaultAntennaGain = cmd.set_params.antenna_gain;
                     LoRaMacMibSetRequestConfirm(&mib);
                     if (s_lora_obj) s_lora_obj->antenna_gain = cmd.set_params.antenna_gain;
+                    break;
+                case 4: // Duty cycle on/off. LoRaMAC-node v4.7.0 has no MIB for
+                        // this; the only public entry point is the test API,
+                        // named "Test" because disabling duty cycle is non-
+                        // conformant on public ISM bands. Exposed here for
+                        // bench testing on private gateways.
+                    LoRaMacTestSetDutyCycleOn(cmd.set_params.duty_cycle);
+                    if (s_lora_obj) s_lora_obj->duty_cycle_enabled = cmd.set_params.duty_cycle;
                     break;
                 default:
                     break;
@@ -1956,6 +1996,12 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     self->snr              = 0;
     self->channels_datarate = DR_0;
     self->adr_enabled       = false;
+    // Duty cycle: cached value gets overwritten in CMD_INIT from the region
+    // PHY default (true on EU868 / EU433). last_dc_* stay zero until the
+    // first send() actually goes through the MAC.
+    self->duty_cycle_enabled = true;
+    self->last_dc_wait_ms    = 0;
+    self->last_dc_query_us   = 0;
     // tx_power kwarg: None = use region max (index 0 = 16 dBm EU868); int = dBm.
     // If dBm exceeds the region table max, activate hardware override (user's responsibility).
     if (args[ARG_tx_power].u_obj != mp_const_none) {
@@ -2212,17 +2258,37 @@ static mp_obj_t lorawan_send(size_t n_args, const mp_obj_t *pos_args,
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not joined"));
     }
 
-    enum { ARG_data, ARG_port, ARG_confirmed, ARG_datarate };
+    enum { ARG_data, ARG_port, ARG_confirmed, ARG_datarate, ARG_timeout };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_data,      MP_ARG_REQUIRED | MP_ARG_OBJ },
         { MP_QSTR_port,      MP_ARG_KW_ONLY  | MP_ARG_INT,  {.u_int  = 1} },
         { MP_QSTR_confirmed, MP_ARG_KW_ONLY  | MP_ARG_BOOL, {.u_bool = false} },
         // DR_0=SF12 .. DR_5=SF7; default DR_0 for maximum range on first uplinks
         { MP_QSTR_datarate,  MP_ARG_KW_ONLY  | MP_ARG_INT,  {.u_int  = DR_0} },
+        // timeout in seconds. Default 120 s covers a duty-cycled DR_0 uplink
+        // (the MAC may queue the frame internally via TxDelayedTimer when the
+        // band is restricted). Pass None to block until TX completes.
+        { MP_QSTR_timeout,   MP_ARG_KW_ONLY  | MP_ARG_OBJ,  {.u_obj  = MP_OBJ_NULL} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
                      MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+
+    // Resolve timeout: None → portMAX_DELAY (wait forever); int seconds → ticks.
+    // Default (kwarg omitted) → 120 s. A non-positive int is treated as None
+    // for forward compatibility with code that does `timeout=0` to mean "wait".
+    TickType_t wait_ticks;
+    mp_obj_t timeout_obj = args[ARG_timeout].u_obj;
+    if (timeout_obj == MP_OBJ_NULL) {
+        wait_ticks = pdMS_TO_TICKS(120000);
+    } else if (timeout_obj == mp_const_none) {
+        wait_ticks = portMAX_DELAY;
+    } else {
+        int timeout_s = mp_obj_get_int(timeout_obj);
+        wait_ticks = (timeout_s > 0)
+                     ? pdMS_TO_TICKS((uint32_t)timeout_s * 1000)
+                     : portMAX_DELAY;
+    }
 
     mp_buffer_info_t buf;
     mp_get_buffer_raise(args[ARG_data].u_obj, &buf, MP_BUFFER_READ);
@@ -2243,16 +2309,17 @@ static mp_obj_t lorawan_send(size_t n_args, const mp_obj_t *pos_args,
     xQueueSend(s_cmd_queue, &cmd, portMAX_DELAY);
     xTaskNotifyGive(s_task_handle);
 
-    // Block up to 10 s for TX confirmation (covers RX1 + RX2 windows)
     EventBits_t bits = xEventGroupWaitBits(s_events,
                                            EVT_TX_DONE | EVT_TX_ERROR,
                                            pdTRUE, pdFALSE,
-                                           pdMS_TO_TICKS(10000));
+                                           wait_ticks);
 
     if (bits & EVT_TX_ERROR) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("send failed"));
     }
     if (!(bits & EVT_TX_DONE)) {
+        // The MAC may still have the frame queued (TxDelayedTimer pending);
+        // it will transmit later on its own. tx_counter advances when it does.
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("send timeout"));
     }
 
@@ -2494,6 +2561,52 @@ static mp_obj_t lorawan_antenna_gain(size_t n_args, const mp_obj_t *args) {
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_antenna_gain_obj, 1, 2, lorawan_antenna_gain);
+
+// duty_cycle(enabled=None) — getter/setter for the regional duty-cycle gate.
+// On by default for compliance (EU868 / EU433 enforce a 1 % air-time per band).
+// Disabling is non-conformant on public ISM bands and intended for bench
+// testing on a private gateway only.
+static mp_obj_t lorawan_duty_cycle(size_t n_args, const mp_obj_t *args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    if (n_args == 1) {
+        return mp_obj_new_bool(self->duty_cycle_enabled);
+    }
+    bool enable = mp_obj_is_true(args[1]);
+    if (!enable) {
+        mp_printf(&mp_plat_print,
+                  "lorawan: duty cycle disabled — non-conformant on public ISM bands\n");
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_SET_PARAMS };
+    cmd.set_params.type       = 4;
+    cmd.set_params.duty_cycle = enable;
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_duty_cycle_obj, 1, 2, lorawan_duty_cycle);
+
+// time_until_tx() — milliseconds until the next uplink is allowed.
+// Reflects the DutyCycleWaitTime captured from the most recent McpsRequest:
+// when the MAC accepts a frame but defers it via TxDelayedTimer, this is the
+// remaining time until that timer fires. Returns 0 when no send has run yet,
+// when duty cycle is off, or once the wait window has elapsed.
+static mp_obj_t lorawan_time_until_tx(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    if (self->last_dc_wait_ms == 0 || self->last_dc_query_us == 0) {
+        return mp_obj_new_int(0);
+    }
+    int64_t elapsed_ms = (esp_timer_get_time() - self->last_dc_query_us) / 1000;
+    if (elapsed_ms < 0) elapsed_ms = 0;
+    int64_t remaining = (int64_t)self->last_dc_wait_ms - elapsed_ms;
+    if (remaining < 0) remaining = 0;
+    return mp_obj_new_int((mp_int_t)remaining);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_time_until_tx_obj, lorawan_time_until_tx);
 
 // request_class(cls) — request a switch to CLASS_A, CLASS_B or CLASS_C.
 // CLASS_A / CLASS_C: LoRaMAC-node performs the transition synchronously via
@@ -3113,6 +3226,8 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_adr),            MP_ROM_PTR(&lorawan_adr_obj) },
     { MP_ROM_QSTR(MP_QSTR_tx_power),       MP_ROM_PTR(&lorawan_tx_power_obj) },
     { MP_ROM_QSTR(MP_QSTR_antenna_gain),   MP_ROM_PTR(&lorawan_antenna_gain_obj) },
+    { MP_ROM_QSTR(MP_QSTR_duty_cycle),     MP_ROM_PTR(&lorawan_duty_cycle_obj) },
+    { MP_ROM_QSTR(MP_QSTR_time_until_tx),  MP_ROM_PTR(&lorawan_time_until_tx_obj) },
     { MP_ROM_QSTR(MP_QSTR_request_class),  MP_ROM_PTR(&lorawan_request_class_obj) },
     { MP_ROM_QSTR(MP_QSTR_device_class),   MP_ROM_PTR(&lorawan_device_class_obj) },
     { MP_ROM_QSTR(MP_QSTR_on_class_change), MP_ROM_PTR(&lorawan_on_class_change_obj) },
@@ -3157,7 +3272,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.12.0", 6);
+    return mp_obj_new_str("0.13.0", 6);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 

@@ -337,10 +337,10 @@ Confirmed: duty cycle IS enforced. `EU868_DUTY_CYCLE_ENABLED = 1` in `RegionEU86
 
 The reason back-to-back `send()` calls *appear* to ignore the duty cycle is a hard-coded 10 s wait in `send()`: `xEventGroupWaitBits(..., pdMS_TO_TICKS(10000))` at `modlorawan.c:2171`. In LoRaMAC-node v4.7.0, when the MAC is restricted it returns `LORAMAC_STATUS_OK` (not an error) and schedules an internal `TxDelayedTimer` to fire when the band clears — typically tens of seconds on EU868 at low DR. Our `send()` gives up at 10 s with `RuntimeError("send timeout")` while the frame is still queued inside the MAC, and it transmits later *on its own* (user sees `tx_counter` advance with no Python call in between).
 
-- [ ] `send(..., timeout=None)` — make the wait configurable. `None` (or `timeout=0`, whichever is more MicroPython-idiomatic) = block as long as needed; any positive value = per-call cap. Default should probably go up to ~120 s so a duty-cycled DR_0 uplink still completes in one call.
-- [ ] `lw.duty_cycle([enabled])` — getter/setter via `MIB_CHANNELS_DUTY_CYCLE`. On by default for compliance; explicit `duty_cycle(False)` for bench testing on a private gateway (illegal on the public band but essential for iterating without the 1 % throttle).
-- [ ] `lw.time_until_tx()` — returns ms until the next uplink is allowed on the current channel (`LoRaMacQueryTxPossible` exposes `DutyCycleWaitTime`; on the McpsRequest path it's also on `ReqReturn.DutyCycleWaitTime`). Lets the caller choose between waiting, lowering DR, or giving up — instead of a blind block.
-- [ ] README — document the current duty-cycle behaviour (enforced, async via `TxDelayedTimer`, why `send()` timeouts appear suspicious) alongside the new `timeout` kwarg.
+- [x] `send(..., timeout=...)` — `timeout` kwarg added. Default 120 s (covers a duty-cycled DR_0 uplink in one call); `timeout=None` blocks until TX completes via `portMAX_DELAY`; non-positive ints also map to "wait forever" so user code that does `timeout=0` does not silently get the old 10 s behaviour. Same `RuntimeError("send timeout")` on cap; the MAC may still have the frame queued internally and emit it later (`tx_counter` advances).
+- [x] `lw.duty_cycle([enabled])` — getter returns the cached `Nvm.MacGroup2.DutyCycleOn` (read at init via `MIB_NVM_CTXS` and after `nvram_restore()`). Setter dispatches `CMD_SET_PARAMS` type 4 → `LoRaMacTestSetDutyCycleOn(bool)` (no `MIB_CHANNELS_DUTY_CYCLE` exists in v4.7.0; the test API is the only public flip). On by default for EU868/EU433 region defaults; disabling logs a non-conformance warning.
+- [x] `lw.time_until_tx()` — returns ms until the next TX is allowed. Reads `last_dc_wait_ms` captured from `mcps.ReqReturn.DutyCycleWaitTime` after every `LoRaMacMcpsRequest` and subtracts `esp_timer_get_time()` elapsed since. Returns 0 before the first send, when duty cycle is off, or once the wait window has elapsed.
+- [ ] README — document the current duty-cycle behaviour (enforced, async via `TxDelayedTimer`, why pre-Session-16 `send()` 10 s timeouts appeared suspicious) alongside the new `timeout` kwarg, `duty_cycle()` and `time_until_tx()`.
 
 #### Channel management (optional — needed if anyone deploys outside TTN defaults)
 
@@ -357,6 +357,7 @@ The reason back-to-back `send()` calls *appear* to ignore the duty cycle is a ha
 - [ ] README — new "Lifecycle" section covering `deinit()` and the soft-reset caveat.
 - [ ] README — note the duty-cycle default and how to disable for bench testing.
 - [x] Version bump 0.11.0 → 0.12.0 on lifecycle completion (lorawan.version() returns '0.12.0'). Compile clean, zero warnings; firmware 1644624 bytes.
+- [x] Version bump 0.12.0 → 0.13.0 on duty-cycle additions (`send(timeout=...)`, `duty_cycle()`, `time_until_tx()`). Compile clean, zero warnings; firmware 1645216 bytes (+592 B).
 
 ## Notes
 
