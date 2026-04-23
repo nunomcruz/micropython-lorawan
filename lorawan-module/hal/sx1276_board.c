@@ -50,6 +50,17 @@ void SX1276IoIrqInit(DioIrqHandler **irqHandlers)
     }
 }
 
+// Deregister DIO ISRs only. Called from the module deinit path BEFORE
+// LoRaMacDeInitialization() so that no in-flight DIO IRQ can dispatch into
+// half-torn-down MAC state. Idempotent (GpioRemoveInterrupt is safe to call
+// on an already-disabled pin), so the call inside SX1276IoDeInit below
+// remains as a defensive no-op.
+void SX1276IoIrqDeInit(void)
+{
+    GpioRemoveInterrupt(&SX1276.DIO0);
+    GpioRemoveInterrupt(&SX1276.DIO1);
+}
+
 void SX1276IoDeInit(void)
 {
     GpioRemoveInterrupt(&SX1276.DIO0);

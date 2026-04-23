@@ -55,6 +55,15 @@ void BoardDeInitMcu(void);
 void SX1276IoDeInit(void);
 void SX126xIoDeInit(void);
 
+// ISR-only teardown: removes the DIO interrupt handlers without touching
+// the SPI bus. Called BEFORE LoRaMacDeInitialization() so that any DIO IRQ
+// already pending in the GPIO ISR service queue cannot dispatch into
+// half-torn-down MAC state. Declared in hal/sx1276_board.c and
+// hal/sx126x_board.c respectively (not in the loramac-node board headers —
+// these are our HAL extensions).
+void SX1276IoIrqDeInit(void);
+void SX126xIoIrqDeInit(void);
+
 // HAL teardown helpers: stop/delete the shared esp_timer backing LoRaMAC's
 // timer list, and release the SX126x recursive SPI mutex. Declared in
 // hal/esp32_timer.c and hal/sx126x_board.c respectively.
@@ -1743,21 +1752,37 @@ static void lorawan_task(void *arg) {
                 // we still force the radio to sleep and proceed with the
                 // HAL-level teardown below — the task is about to exit so
                 // any lingering MAC state becomes irrelevant.
+                //
+                // Step 1: deregister DIO ISRs FIRST. A DIO IRQ already
+                // latched in the GPIO ISR service queue could otherwise
+                // fire after LoRaMacDeInitialization() begins dismantling
+                // MAC state, dispatching RadioIrqProcess() against a
+                // half-torn-down state machine. SPI is untouched here so
+                // LoRaMacDeInitialization() (and the lorawan_radio_sleep()
+                // fallback) can still issue commands to the radio below.
+                bool is_sx1276_local = s_lora_obj ? s_lora_obj->is_sx1276 : true;
+                if (is_sx1276_local) {
+                    SX1276IoIrqDeInit();
+                } else {
+                    SX126xIoIrqDeInit();
+                }
+
+                // Step 2: MAC deinit (radio to sleep). BUSY means mid-TX/RX;
+                // force-quiesce the radio before the SPI bus goes away.
                 if (s_mac_initialized) {
                     LoRaMacStatus_t ds = LoRaMacDeInitialization();
                     if (ds != LORAMAC_STATUS_OK) {
-                        // MAC was mid-TX/RX; force-quiesce the radio before
-                        // the SPI bus goes away.
                         lorawan_radio_sleep();
                     }
                 }
 
-                // Drop LmHandler package registrations and release the
-                // shim-owned fragmentation buffer.
+                // Step 3: drop LmHandler package registrations and release
+                // the shim-owned fragmentation buffer.
                 lorawan_packages_deinit();
 
-                // Deregister radio DIO ISRs and free the SPI bus.
-                bool is_sx1276_local = s_lora_obj ? s_lora_obj->is_sx1276 : true;
+                // Step 4: free the SPI bus and reconfigure NSS as input.
+                // (The ISR removal inside these functions is a defensive
+                // no-op now that step 1 has already done it.)
                 if (is_sx1276_local) {
                     SX1276IoDeInit();
                 } else {
@@ -3294,11 +3319,30 @@ static mp_obj_t lorawan_deinit(mp_obj_t self_in) {
     xEventGroupClearBits(s_events, EVT_COMPLETED);
     xQueueSend(s_cmd_queue, &cmd, portMAX_DELAY);
     xTaskNotifyGive(s_task_handle);
-    xEventGroupWaitBits(s_events, EVT_COMPLETED,
-                        pdTRUE, pdFALSE, pdMS_TO_TICKS(2000));
+    EventBits_t bits = xEventGroupWaitBits(s_events, EVT_COMPLETED,
+                                           pdTRUE, pdFALSE,
+                                           pdMS_TO_TICKS(2000));
 
-    // Give FreeRTOS' idle task one tick to actually reclaim the TCB
-    // before we delete the primitives the (now-dead) task was using.
+    if (!(bits & EVT_COMPLETED)) {
+        // Task didn't reach vTaskDelete in time. Deleting the command
+        // queue / rx queue / event group while it may still be alive
+        // would corrupt state worse than a small leak. Bail out, mark
+        // the object as torn down (Python won't dispatch more commands),
+        // and leave the primitives in place so the task can finish on
+        // its own schedule.
+        mp_printf(&mp_plat_print,
+                  "lorawan: deinit timed out waiting for task; "
+                  "leaking queues/events to avoid UAF\n");
+        if (self) self->initialized = false;
+        return mp_const_none;
+    }
+
+    // Give FreeRTOS' idle task time to actually reclaim the TCB before
+    // we delete the primitives the (now-dead) task was using. We cannot
+    // poll eTaskGetState here: once the idle task frees the TCB, the
+    // handle is UAF and eTaskGetState would deref freed memory. 10 ms
+    // is ample in practice — after vTaskDelete(NULL) on CPU1, the only
+    // remaining ready task on that core is almost always idle itself.
     vTaskDelay(pdMS_TO_TICKS(10));
 
     if (s_cmd_queue) { vQueueDelete(s_cmd_queue); s_cmd_queue = NULL; }
