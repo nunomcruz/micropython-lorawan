@@ -29,17 +29,17 @@ static SemaphoreHandle_t s_spi_mutex = NULL;
 
 void sx126x_spi_mutex_init(void)
 {
-    s_spi_mutex = xSemaphoreCreateMutex();
+    s_spi_mutex = xSemaphoreCreateRecursiveMutex();
 }
 
 static inline void spi_lock(void)
 {
-    if (s_spi_mutex) xSemaphoreTake(s_spi_mutex, portMAX_DELAY);
+    if (s_spi_mutex) xSemaphoreTakeRecursive(s_spi_mutex, portMAX_DELAY);
 }
 
 static inline void spi_unlock(void)
 {
-    if (s_spi_mutex) xSemaphoreGive(s_spi_mutex);
+    if (s_spi_mutex) xSemaphoreGiveRecursive(s_spi_mutex);
 }
 
 // TCXO startup time in SX126x timer units (15.625 µs each).
@@ -131,10 +131,24 @@ void SX126xWakeup(void)
 {
     // Assert NSS to wake the radio from sleep, then deassert.
     // BUSY will pulse high briefly; SX126xWaitOnBusy() blocks until ready.
+    // Caller must hold spi_lock (recursive mutex allows nested takes).
     nss_low();
     SpiInOut(&SX126x.Spi, RADIO_GET_STATUS);
     nss_high();
     SX126xWaitOnBusy();
+    // Radio wakes into STDBY_RC — update our tracking so we don't
+    // re-trigger wakeup on every subsequent SPI command.
+    SX126xSetOperatingMode(MODE_STDBY_RC);
+}
+
+// Check if the radio is sleeping and wake it up before SPI access.
+// Must be called while holding spi_lock.
+static inline void ensure_awake(void)
+{
+    if (operating_mode == MODE_SLEEP) {
+        SX126xWakeup();
+        SX126xAntSwOn();
+    }
 }
 
 static uint32_t s_last_freq_hz = 0;
@@ -149,6 +163,7 @@ void SX126xWriteCommand(RadioCommands_t opcode, uint8_t *buffer, uint16_t size)
     }
 
     spi_lock();
+    ensure_awake();
     SX126xWaitOnBusy();
     nss_low();
     SpiInOut(&SX126x.Spi, (uint16_t)opcode);
@@ -164,6 +179,7 @@ void SX126xWriteCommand(RadioCommands_t opcode, uint8_t *buffer, uint16_t size)
 uint8_t SX126xReadCommand(RadioCommands_t opcode, uint8_t *buffer, uint16_t size)
 {
     spi_lock();
+    ensure_awake();
     SX126xWaitOnBusy();
     nss_low();
     SpiInOut(&SX126x.Spi, (uint16_t)opcode);
@@ -179,6 +195,7 @@ uint8_t SX126xReadCommand(RadioCommands_t opcode, uint8_t *buffer, uint16_t size
 void SX126xWriteRegisters(uint16_t address, uint8_t *buffer, uint16_t size)
 {
     spi_lock();
+    ensure_awake();
     SX126xWaitOnBusy();
     nss_low();
     SpiInOut(&SX126x.Spi, RADIO_WRITE_REGISTER);
@@ -194,6 +211,7 @@ void SX126xWriteRegisters(uint16_t address, uint8_t *buffer, uint16_t size)
 void SX126xReadRegisters(uint16_t address, uint8_t *buffer, uint16_t size)
 {
     spi_lock();
+    ensure_awake();
     SX126xWaitOnBusy();
     nss_low();
     SpiInOut(&SX126x.Spi, RADIO_READ_REGISTER);
@@ -222,6 +240,7 @@ uint8_t SX126xReadRegister(uint16_t address)
 void SX126xWriteBuffer(uint8_t offset, uint8_t *buffer, uint8_t size)
 {
     spi_lock();
+    ensure_awake();
     SX126xWaitOnBusy();
     nss_low();
     SpiInOut(&SX126x.Spi, RADIO_WRITE_BUFFER);
@@ -236,6 +255,7 @@ void SX126xWriteBuffer(uint8_t offset, uint8_t *buffer, uint8_t size)
 void SX126xReadBuffer(uint8_t offset, uint8_t *buffer, uint8_t size)
 {
     spi_lock();
+    ensure_awake();
     SX126xWaitOnBusy();
     nss_low();
     SpiInOut(&SX126x.Spi, RADIO_READ_BUFFER);
