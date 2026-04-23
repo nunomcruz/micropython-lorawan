@@ -37,6 +37,11 @@
 #include "LoRaMac.h"
 #include "region/RegionEU868.h"
 #include "systime.h"
+#include "lmhandler_shim.h"
+
+// Declared in hal/esp32_board.c. Not in loramac-node's board.h — the MAC's
+// GetTemperatureLevel callback is plugged in via s_mac_callbacks directly.
+float BoardGetTemperatureLevel(void);
 
 // Note: we deliberately do NOT include sx1276-board.h / sx126x-board.h /
 // the chip-level sx1276.h / sx126x.h here.  Those headers define several
@@ -78,6 +83,15 @@
 #define EVT_CLASS_OK     (1u << 7)
 #define EVT_CLASS_ERROR  (1u << 8)
 
+// Beacon state codes surfaced to Python via on_beacon(state, info).
+// Mapped from MLME_BEACON / MLME_BEACON_LOST indications and the
+// MLME_BEACON_ACQUISITION confirm outcome.
+#define LW_BEACON_ACQUISITION_OK    1  // acquisition confirmed, first lock
+#define LW_BEACON_ACQUISITION_FAIL  2  // acquisition search timed out
+#define LW_BEACON_LOCKED            3  // beacon received during normal operation
+#define LW_BEACON_NOT_FOUND         4  // expected beacon not received this period
+#define LW_BEACON_LOST              5  // beacon loss exceeded; MAC reverts to Class A
+
 // ---- Command types ----
 
 typedef enum {
@@ -92,6 +106,9 @@ typedef enum {
     CMD_REQUEST_DEVICE_TIME,
     CMD_REQUEST_LINK_CHECK,
     CMD_REQUEST_REJOIN,
+    CMD_CLOCK_SYNC_ENABLE,
+    CMD_CLOCK_SYNC_REQUEST,
+    CMD_PING_SLOT_PERIODICITY,
 } lorawan_cmd_t;
 
 typedef struct {
@@ -133,8 +150,9 @@ typedef struct {
         cmd_join_otaa_t join_otaa;
         cmd_tx_t        tx;
         cmd_set_params_t set_params;
-        uint8_t         device_class; // CMD_SET_CLASS: DeviceClass_t value
-        uint8_t         rejoin_type;  // CMD_REQUEST_REJOIN: 0, 1 or 2
+        uint8_t         device_class;       // CMD_SET_CLASS: DeviceClass_t value
+        uint8_t         rejoin_type;        // CMD_REQUEST_REJOIN: 0, 1 or 2
+        uint8_t         ping_periodicity;   // CMD_PING_SLOT_PERIODICITY: 0..7
     };
 } lorawan_cmd_data_t;
 
@@ -194,6 +212,27 @@ typedef struct {
     bool            link_check_received;
     uint8_t         link_check_margin;
     uint8_t         link_check_gw_count;
+    // Clock Sync (LmhpClockSync, port 202). clock_sync_enabled flips true once
+    // the package is registered via clock_sync_enable(). The time fields above
+    // (time_synced / network_time_gps) are shared between the MAC DeviceTimeReq
+    // path and the application-layer AppTimeReq path, so both update the same
+    // snapshot.
+    bool            clock_sync_enabled;
+    // Class B — beacon + ping slot state, populated by the MLME handlers.
+    mp_obj_t        beacon_callback;           // fires on every MLME_BEACON indication
+    uint8_t         ping_slot_periodicity;     // 0..7, period = 2^N seconds
+    // Snapshot of the most recent BeaconInfo_t delivered by the MAC.
+    // beacon_info_valid flips true on first BEACON_LOCKED and stays true; the
+    // rest of the fields may be overwritten by later indications (LOST clears them).
+    bool            beacon_info_valid;
+    uint8_t         beacon_last_state;         // one of LW_BEACON_* codes; 0 = none yet
+    uint32_t        beacon_time_seconds;       // GPS-epoch seconds of last locked beacon
+    uint32_t        beacon_freq;
+    uint8_t         beacon_datarate;
+    int16_t         beacon_rssi;
+    int8_t          beacon_snr;
+    uint8_t         beacon_gw_info_desc;
+    uint8_t         beacon_gw_info[6];
 } lorawan_obj_t;
 
 // ---- Static FreeRTOS state (one LoRaWAN instance per firmware) ----
@@ -213,6 +252,15 @@ static volatile bool  s_mac_initialized; // set true after LoRaMacInitialization
 static volatile bool s_otaa_active;          // join in progress; cleared on success or Python timeout
 static volatile bool s_otaa_retry_needed;    // mlme_confirm(JOIN_FAIL) sets this; task re-sends
 static volatile bool s_nvram_autosave_needed; // mlme_confirm(JOIN_OK) sets this; task saves after LoRaMacProcess()
+
+// Class B orchestration flags — set from MLME callback context, acted on from the
+// lorawan_task main loop so LoRaMacMlmeRequest / LoRaMacMibSetRequestConfirm are
+// only called outside of a MAC callback (same pattern as the OTAA retry flag).
+static volatile bool    s_classb_active;                // request_class(CLASS_B) has been issued
+static volatile bool    s_classb_need_ping_slot_req;    // BEACON_ACQUISITION OK → send PingSlotInfoReq
+static volatile bool    s_classb_need_switch_class;     // PING_SLOT_INFO OK → set MIB_DEVICE_CLASS
+static volatile bool    s_classb_need_device_time_req;  // BEACON_ACQUISITION FAIL → re-sync time
+static volatile uint8_t s_classb_periodicity;           // 0..7, passed to MLME_PING_SLOT_INFO
 static uint8_t       s_otaa_dev_eui[8];
 static uint8_t       s_otaa_join_eui[8];
 static uint8_t       s_otaa_app_key[16];
@@ -304,10 +352,59 @@ static mp_obj_t lorawan_time_sync_trampoline(mp_obj_t arg) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_time_sync_trampoline_obj, lorawan_time_sync_trampoline);
 
+// Forward declaration — the builder is defined below (it allocates dict/bytes
+// objects so it can only run in VM context).
+static mp_obj_t lorawan_beacon_info_dict(lorawan_obj_t *self);
+
+// Called on every MLME_BEACON / MLME_BEACON_LOST / MLME_BEACON_ACQUISITION
+// event. The scheduler arg carries the LW_BEACON_* state code (small int);
+// info is read from the object snapshot updated in the MLME handler.
+static mp_obj_t lorawan_beacon_trampoline(mp_obj_t arg) {
+    if (!s_lora_obj || s_lora_obj->beacon_callback == mp_const_none) {
+        return mp_const_none;
+    }
+    mp_obj_t info = s_lora_obj->beacon_info_valid
+                    ? lorawan_beacon_info_dict(s_lora_obj)
+                    : mp_const_none;
+    mp_obj_t items[2] = { arg, info };
+    mp_call_function_1(s_lora_obj->beacon_callback, mp_obj_new_tuple(2, items));
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_beacon_trampoline_obj, lorawan_beacon_trampoline);
+
+// Called by lmhandler_shim.c whenever LmhpClockSync has applied a correction
+// from an AppTimeAns (port 202). SysTime has already been updated, so we just
+// snapshot the GPS epoch onto the active object and fire the user callback
+// via the existing time-sync trampoline.
+void lorawan_on_sys_time_update(bool is_synchronized, int32_t correction) {
+    (void)is_synchronized;
+    (void)correction;
+    if (!s_lora_obj) return;
+
+    SysTime_t now = SysTimeGet();
+    uint32_t gps_epoch = (now.Seconds >= UNIX_GPS_EPOCH_OFFSET)
+                         ? (now.Seconds - UNIX_GPS_EPOCH_OFFSET) : 0;
+    s_lora_obj->time_synced      = true;
+    s_lora_obj->network_time_gps = gps_epoch;
+
+    esp_rom_printf("lorawan: ClockSync AppTimeAns OK, GPS epoch=%lu (corr=%ld)\n",
+                   (unsigned long)gps_epoch, (long)correction);
+
+    if (s_lora_obj->time_sync_callback != mp_const_none) {
+        mp_sched_schedule(MP_OBJ_FROM_PTR(&lorawan_time_sync_trampoline_obj),
+                          mp_const_none);
+    }
+}
+
 // ---- LoRaMAC MAC-layer callbacks (run in the LoRaWAN task context) ----
 
 static void mcps_confirm(McpsConfirm_t *c) {
     if (!c) return;
+
+    // Fan out to any registered LmHandler package (Clock Sync etc.) before
+    // touching object state — the package needs confirmation of its own
+    // port-202 uplinks to revert ADR / NbTrans / DR.
+    lorawan_packages_on_mcps_confirm(c);
 
     esp_rom_printf("lorawan: mcps_confirm status=%d uplink=%lu toa=%lu\n",
                    (int)c->Status, (unsigned long)c->UpLinkCounter,
@@ -351,6 +448,11 @@ static void mcps_confirm(McpsConfirm_t *c) {
 
 static void mcps_indication(McpsIndication_t *ind) {
     if (!ind || ind->Status != LORAMAC_EVENT_INFO_STATUS_OK) return;
+
+    // Fan out to any registered LmHandler package first. LmhpClockSync only
+    // consumes frames on port 202 and answers them on the same port, so this
+    // consumes packages' traffic before the port-224-filter below.
+    lorawan_packages_on_mcps_indication(ind);
 
     if (s_lora_obj) {
         s_lora_obj->rssi       = ind->Rssi;
@@ -443,6 +545,53 @@ static void mlme_confirm(MlmeConfirm_t *c) {
         }
         break;
 
+    case MLME_BEACON_ACQUISITION:
+        // Beacon acquisition outcome. On success the MAC has locked onto a
+        // beacon and `Ctx.BeaconCtx.Ctrl.BeaconMode` is now 1 — the next step
+        // (PingSlotInfoReq) can proceed. On failure we trigger a fresh
+        // DeviceTimeReq so beacon timing gets re-synced; the class-B state
+        // machine then re-issues MLME_BEACON_ACQUISITION on the next cycle.
+        if (c->Status == LORAMAC_EVENT_INFO_STATUS_OK) {
+            esp_rom_printf("lorawan: beacon acquired\n");
+            if (s_classb_active) {
+                s_classb_need_ping_slot_req = true;
+            }
+            if (s_lora_obj && s_lora_obj->beacon_callback != mp_const_none) {
+                mp_sched_schedule(MP_OBJ_FROM_PTR(&lorawan_beacon_trampoline_obj),
+                                  MP_OBJ_NEW_SMALL_INT(LW_BEACON_ACQUISITION_OK));
+            }
+        } else {
+            esp_rom_printf("lorawan: beacon acquisition failed (status=%d)\n",
+                           (int)c->Status);
+            if (s_classb_active) {
+                s_classb_need_device_time_req = true;
+            }
+            if (s_lora_obj && s_lora_obj->beacon_callback != mp_const_none) {
+                mp_sched_schedule(MP_OBJ_FROM_PTR(&lorawan_beacon_trampoline_obj),
+                                  MP_OBJ_NEW_SMALL_INT(LW_BEACON_ACQUISITION_FAIL));
+            }
+        }
+        break;
+
+    case MLME_PING_SLOT_INFO:
+        // PingSlotInfoAns arrived. On success the MAC has set
+        // `PingSlotCtx.Ctrl.Assigned = 1` and the CLASS_A -> CLASS_B MIB switch
+        // will now be accepted. On failure we re-issue the PingSlotInfoReq
+        // from the task loop (piggy-back + empty uplink, same as LmHandler).
+        if (c->Status == LORAMAC_EVENT_INFO_STATUS_OK) {
+            esp_rom_printf("lorawan: PingSlotInfoAns OK\n");
+            if (s_classb_active) {
+                s_classb_need_switch_class = true;
+            }
+        } else {
+            esp_rom_printf("lorawan: PingSlotInfoAns failed (status=%d), retrying\n",
+                           (int)c->Status);
+            if (s_classb_active) {
+                s_classb_need_ping_slot_req = true;
+            }
+        }
+        break;
+
     case MLME_REJOIN_0:
     case MLME_REJOIN_1:
     case MLME_REJOIN_2:
@@ -467,7 +616,84 @@ static void mlme_confirm(MlmeConfirm_t *c) {
 }
 
 static void mlme_indication(MlmeIndication_t *ind) {
-    (void)ind;
+    if (!ind || !s_lora_obj) return;
+
+    switch (ind->MlmeIndication) {
+    case MLME_BEACON: {
+        uint8_t state;
+        if (ind->Status == LORAMAC_EVENT_INFO_STATUS_BEACON_LOCKED) {
+            // Real beacon received — snapshot the BeaconInfo_t fields that
+            // Python may want to inspect (time in GPS seconds, gateway-specific
+            // bytes) so the trampoline can build the info dict in VM context.
+            SysTime_t bt = ind->BeaconInfo.Time;
+            s_lora_obj->beacon_info_valid   = true;
+            s_lora_obj->beacon_time_seconds = bt.Seconds;
+            s_lora_obj->beacon_freq         = ind->BeaconInfo.Frequency;
+            s_lora_obj->beacon_datarate     = ind->BeaconInfo.Datarate;
+            s_lora_obj->beacon_rssi         = ind->BeaconInfo.Rssi;
+            s_lora_obj->beacon_snr          = ind->BeaconInfo.Snr;
+            s_lora_obj->beacon_gw_info_desc = ind->BeaconInfo.GwSpecific.InfoDesc;
+            memcpy(s_lora_obj->beacon_gw_info,
+                   ind->BeaconInfo.GwSpecific.Info, 6);
+            state = LW_BEACON_LOCKED;
+            esp_rom_printf("lorawan: beacon locked rssi=%d snr=%d freq=%lu\n",
+                           (int)ind->BeaconInfo.Rssi, (int)ind->BeaconInfo.Snr,
+                           (unsigned long)ind->BeaconInfo.Frequency);
+        } else {
+            state = LW_BEACON_NOT_FOUND;
+            esp_rom_printf("lorawan: beacon not found this period\n");
+        }
+        s_lora_obj->beacon_last_state = state;
+        if (s_lora_obj->beacon_callback != mp_const_none) {
+            mp_sched_schedule(MP_OBJ_FROM_PTR(&lorawan_beacon_trampoline_obj),
+                              MP_OBJ_NEW_SMALL_INT(state));
+        }
+        break;
+    }
+
+    case MLME_BEACON_LOST: {
+        // Beacon loss has exceeded MAX_BEACON_LESS_PERIOD (2h). The MAC's
+        // class-B machinery already aborted its timers; we force MIB_DEVICE_CLASS
+        // back to CLASS_A (this also halts beaconing inside LoRaMacClassB) so
+        // the node returns to the normal Class A RX windows.
+        esp_rom_printf("lorawan: beacon lost, reverting to Class A\n");
+        MibRequestConfirm_t mib;
+        mib.Type = MIB_DEVICE_CLASS;
+        mib.Param.Class = CLASS_A;
+        LoRaMacMibSetRequestConfirm(&mib);
+
+        s_classb_active             = false;
+        s_classb_need_ping_slot_req = false;
+        s_classb_need_switch_class  = false;
+
+        s_lora_obj->beacon_last_state = LW_BEACON_LOST;
+        s_lora_obj->beacon_info_valid = false;
+        s_lora_obj->device_class      = CLASS_A;
+
+        if (s_lora_obj->beacon_callback != mp_const_none) {
+            mp_sched_schedule(MP_OBJ_FROM_PTR(&lorawan_beacon_trampoline_obj),
+                              MP_OBJ_NEW_SMALL_INT(LW_BEACON_LOST));
+        }
+        if (s_lora_obj->class_callback != mp_const_none) {
+            mp_sched_schedule(MP_OBJ_FROM_PTR(&lorawan_class_trampoline_obj),
+                              MP_OBJ_NEW_SMALL_INT((mp_int_t)CLASS_A));
+        }
+        break;
+    }
+
+    case MLME_REVERT_JOIN:
+        // LoRaWAN 1.1: the MAC did not receive a RekeyConf after a Join
+        // Accept, so it has invalidated the session and requires the upper
+        // layer to restart the join procedure. We mark the device as no
+        // longer joined so send()/request_class() raise cleanly; the user
+        // is expected to call join_otaa() again.
+        esp_rom_printf("lorawan: MLME_REVERT_JOIN — session invalidated, rejoin required\n");
+        s_lora_obj->joined = false;
+        break;
+
+    default:
+        break;
+    }
 }
 
 // Called by LoRaMAC to signal that LoRaMacProcess() must be called.
@@ -581,8 +807,8 @@ static void lorawan_task(void *arg) {
                 s_mac_primitives.MacMlmeConfirm    = mlme_confirm;
                 s_mac_primitives.MacMlmeIndication = mlme_indication;
 
-                s_mac_callbacks.GetBatteryLevel    = BoardGetBatteryLevel;
-                s_mac_callbacks.GetTemperatureLevel = NULL;
+                s_mac_callbacks.GetBatteryLevel     = BoardGetBatteryLevel;
+                s_mac_callbacks.GetTemperatureLevel = BoardGetTemperatureLevel;
                 s_mac_callbacks.NvmDataChange       = NULL;
                 s_mac_callbacks.MacProcessNotify    = on_mac_process_notify;
 
@@ -1008,6 +1234,30 @@ static void lorawan_task(void *arg) {
                 break;
             }
 
+            case CMD_CLOCK_SYNC_ENABLE: {
+                // Register LmhpClockSync (port 202) with the shim. Idempotent:
+                // re-registering simply re-runs Init with a fresh buffer.
+                if (lorawan_clock_sync_register()) {
+                    if (s_lora_obj) s_lora_obj->clock_sync_enabled = true;
+                    esp_rom_printf("lorawan: clock sync package enabled\n");
+                } else {
+                    esp_rom_printf("lorawan: clock sync register failed\n");
+                }
+                xEventGroupSetBits(s_events, EVT_COMPLETED);
+                break;
+            }
+
+            case CMD_CLOCK_SYNC_REQUEST: {
+                // Fires LmhpClockSyncAppTimeReq: queues an internal DeviceTimeReq
+                // (via OnDeviceTimeRequest → MLME_DEVICE_TIME) and emits a port-202
+                // AppTimeReq uplink immediately through the shim's LmHandlerSend.
+                // Unlike request_device_time(), this already causes an uplink —
+                // no follow-up send() is required.
+                lorawan_clock_sync_app_time_req();
+                xEventGroupSetBits(s_events, EVT_COMPLETED);
+                break;
+            }
+
             case CMD_REQUEST_REJOIN: {
                 // MLME_REJOIN_{0,1,2} sends a ReJoin-request frame over the
                 // air (SendReJoinReq → ScheduleTx), unlike DeviceTimeReq /
@@ -1035,24 +1285,81 @@ static void lorawan_task(void *arg) {
                 break;
             }
 
+            case CMD_PING_SLOT_PERIODICITY: {
+                // Only stored on the object; applied when CMD_SET_CLASS(CLASS_B)
+                // fires MLME_PING_SLOT_INFO. Changing it after Class B is
+                // already active requires re-requesting the class.
+                if (s_lora_obj) {
+                    s_lora_obj->ping_slot_periodicity = cmd.ping_periodicity;
+                }
+                xEventGroupSetBits(s_events, EVT_COMPLETED);
+                break;
+            }
+
             case CMD_SET_CLASS: {
                 // LoRaMAC-node v4.7.0 does not expose LoRaMacRequestClass / MLME_CLASS_C_SWITCH.
-                // Class A <-> Class C switches are done via MIB_DEVICE_CLASS and are
-                // instantaneous (see LmHandler.c: LmHandlerRequestClass).
-                // Class B requires DeviceTime + beacon acquisition (Session 13).
+                // Class A <-> Class C is done via MIB_DEVICE_CLASS (instantaneous).
+                // Class A -> Class B is multi-step: BEACON_ACQUISITION → PINGSLOT_INFO
+                // → MIB_DEVICE_CLASS=CLASS_B; orchestrated via s_classb_* flags
+                // and the retry block below.
                 DeviceClass_t new_class = (DeviceClass_t)cmd.device_class;
 
                 if (new_class == CLASS_B) {
-                    esp_rom_printf("lorawan: CLASS_B switch not implemented yet\n");
-                    xEventGroupSetBits(s_events, EVT_CLASS_ERROR);
+                    // Prerequisite: time sync must already be established so the
+                    // beacon-timing window is bounded. Require a prior
+                    // request_device_time() + send() (or clock_sync_request).
+                    if (!s_lora_obj || !s_lora_obj->time_synced) {
+                        esp_rom_printf("lorawan: CLASS_B requires time sync "
+                                       "(call request_device_time() + send() first)\n");
+                        xEventGroupSetBits(s_events, EVT_CLASS_ERROR);
+                        break;
+                    }
+
+                    // Current class must be CLASS_A to start acquisition.
+                    mib.Type = MIB_DEVICE_CLASS;
+                    LoRaMacMibGetRequestConfirm(&mib);
+                    if (mib.Param.Class != CLASS_A) {
+                        esp_rom_printf("lorawan: CLASS_B switch requires current class CLASS_A\n");
+                        xEventGroupSetBits(s_events, EVT_CLASS_ERROR);
+                        break;
+                    }
+
+                    MlmeReq_t mlme;
+                    mlme.Type = MLME_BEACON_ACQUISITION;
+                    LoRaMacStatus_t st = LoRaMacMlmeRequest(&mlme);
+                    if (st != LORAMAC_STATUS_OK) {
+                        esp_rom_printf("lorawan: MLME_BEACON_ACQUISITION error %d\n",
+                                       (int)st);
+                        xEventGroupSetBits(s_events, EVT_CLASS_ERROR);
+                        break;
+                    }
+                    s_classb_active              = true;
+                    s_classb_need_ping_slot_req  = false;
+                    s_classb_need_switch_class   = false;
+                    s_classb_periodicity         = s_lora_obj->ping_slot_periodicity;
+
+                    esp_rom_printf("lorawan: Class B acquisition started (periodicity=%u)\n",
+                                   (unsigned)s_classb_periodicity);
+                    // Async: EVT_CLASS_OK only signals that the request was accepted.
+                    // The actual MIB_DEVICE_CLASS=CLASS_B happens later and is
+                    // reported via the on_class_change callback.
+                    xEventGroupSetBits(s_events, EVT_CLASS_OK);
                     break;
                 }
 
-                // MIB_DEVICE_CLASS set fails if current class is B and the target
-                // is anything other than A. We allow only A <-> C here.
+                // Class A <-> Class C path. MIB_DEVICE_CLASS set fails if
+                // current class is B and the target is anything other than A.
                 mib.Type = MIB_DEVICE_CLASS;
                 LoRaMacMibGetRequestConfirm(&mib);
                 DeviceClass_t cur_class = mib.Param.Class;
+
+                // Leaving Class B cleanly: stop the state machine first so no
+                // pending flag re-triggers PingSlotInfoReq after the switch.
+                if (cur_class == CLASS_B) {
+                    s_classb_active              = false;
+                    s_classb_need_ping_slot_req  = false;
+                    s_classb_need_switch_class   = false;
+                }
 
                 if (cur_class == new_class) {
                     // No-op: already in the requested class.
@@ -1096,6 +1403,77 @@ static void lorawan_task(void *arg) {
             default:
                 break;
             }
+        }
+
+        // Class B orchestration — MLME callbacks only flipped flags; we re-issue
+        // the follow-up MLME/MCPS/MIB requests from task context here.
+        if (s_classb_need_ping_slot_req && s_classb_active) {
+            s_classb_need_ping_slot_req = false;
+
+            MlmeReq_t mlme;
+            mlme.Type = MLME_PING_SLOT_INFO;
+            mlme.Req.PingSlotInfo.PingSlot.Fields.Periodicity = s_classb_periodicity;
+            mlme.Req.PingSlotInfo.PingSlot.Fields.RFU = 0;
+            LoRaMacStatus_t st = LoRaMacMlmeRequest(&mlme);
+            if (st == LORAMAC_STATUS_OK) {
+                // Flush the MAC command with an empty unconfirmed uplink so the
+                // piggy-backed PingSlotInfoReq actually reaches the server
+                // (mirrors LmHandlerPingSlotReq in LmHandler.c).
+                McpsReq_t req;
+                req.Type = MCPS_UNCONFIRMED;
+                req.Req.Unconfirmed.fPort       = 0;
+                req.Req.Unconfirmed.fBuffer     = NULL;
+                req.Req.Unconfirmed.fBufferSize = 0;
+                req.Req.Unconfirmed.Datarate    =
+                    s_lora_obj ? s_lora_obj->channels_datarate : DR_0;
+                LoRaMacMcpsRequest(&req);
+            } else {
+                esp_rom_printf("lorawan: MLME_PING_SLOT_INFO error %d\n", (int)st);
+                if (st != LORAMAC_STATUS_BUSY &&
+                    st != LORAMAC_STATUS_DUTYCYCLE_RESTRICTED) {
+                    // Transient vs permanent: retry only on BUSY/duty-cycle.
+                    s_classb_active = false;
+                }
+            }
+        }
+
+        if (s_classb_need_switch_class && s_classb_active) {
+            s_classb_need_switch_class = false;
+
+            MibRequestConfirm_t mib2;
+            mib2.Type = MIB_DEVICE_CLASS;
+            mib2.Param.Class = CLASS_B;
+            LoRaMacStatus_t st = LoRaMacMibSetRequestConfirm(&mib2);
+            if (st == LORAMAC_STATUS_OK) {
+                if (s_lora_obj) {
+                    s_lora_obj->device_class = CLASS_B;
+                    if (s_lora_obj->class_callback != mp_const_none) {
+                        mp_sched_schedule(MP_OBJ_FROM_PTR(&lorawan_class_trampoline_obj),
+                                          MP_OBJ_NEW_SMALL_INT((mp_int_t)CLASS_B));
+                    }
+                }
+                esp_rom_printf("lorawan: device class -> B\n");
+            } else {
+                // BeaconMode==1 && Assigned==1 should hold here; if the MIB set
+                // rejects it, log and drop out of the Class B state machine.
+                esp_rom_printf("lorawan: MIB_DEVICE_CLASS=B failed: %d\n", (int)st);
+                s_classb_active = false;
+            }
+        }
+
+        if (s_classb_need_device_time_req && s_classb_active) {
+            // Beacon acquisition failed — request a fresh DeviceTimeAns so the
+            // next MLME_BEACON_ACQUISITION has a bounded search window, then
+            // re-issue the beacon acquisition itself.
+            s_classb_need_device_time_req = false;
+
+            MlmeReq_t dt;
+            dt.Type = MLME_DEVICE_TIME;
+            LoRaMacMlmeRequest(&dt);
+
+            MlmeReq_t ba;
+            ba.Type = MLME_BEACON_ACQUISITION;
+            LoRaMacMlmeRequest(&ba);
         }
 
         // OTAA retry: mlme_confirm set s_otaa_retry_needed after a failed join
@@ -1244,6 +1622,19 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     self->link_check_received = false;
     self->link_check_margin   = 0;
     self->link_check_gw_count = 0;
+    self->clock_sync_enabled  = false;
+
+    self->beacon_callback       = mp_const_none;
+    self->ping_slot_periodicity = 0;
+    self->beacon_info_valid     = false;
+    self->beacon_last_state     = 0;
+    self->beacon_time_seconds   = 0;
+    self->beacon_freq           = 0;
+    self->beacon_datarate       = 0;
+    self->beacon_rssi           = 0;
+    self->beacon_snr            = 0;
+    self->beacon_gw_info_desc   = 0;
+    memset(self->beacon_gw_info, 0, sizeof(self->beacon_gw_info));
 
     // Apply pin overrides to g_lorawan_pins before any IoInit.
     // -1 means "keep T-Beam default" (set in pin_config.c initialiser).
@@ -1735,10 +2126,13 @@ static mp_obj_t lorawan_antenna_gain(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_antenna_gain_obj, 1, 2, lorawan_antenna_gain);
 
-// request_class(cls) — request a switch to CLASS_A or CLASS_C.
-// CLASS_B is not yet supported (requires beacon acquisition, Session 13).
-// LoRaMAC-node v4.7.0 performs A <-> C transitions synchronously via
-// MIB_DEVICE_CLASS; the on_class_change callback fires after success.
+// request_class(cls) — request a switch to CLASS_A, CLASS_B or CLASS_C.
+// CLASS_A / CLASS_C: LoRaMAC-node performs the transition synchronously via
+// MIB_DEVICE_CLASS; on_class_change fires before the call returns.
+// CLASS_B: requires time sync (call request_device_time() + send() first) and
+// is multi-step — the call returns once beacon acquisition starts; the actual
+// class change is signalled later via on_class_change(CLASS_B). Beacon events
+// (lock, loss, acquisition fail) are surfaced via on_beacon(cb).
 static mp_obj_t lorawan_request_class(mp_obj_t self_in, mp_obj_t cls_in) {
     lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
     if (!self->initialized) {
@@ -1748,8 +2142,8 @@ static mp_obj_t lorawan_request_class(mp_obj_t self_in, mp_obj_t cls_in) {
     if (cls != CLASS_A && cls != CLASS_B && cls != CLASS_C) {
         mp_raise_ValueError(MP_ERROR_TEXT("class must be CLASS_A, CLASS_B or CLASS_C"));
     }
-    if (cls == CLASS_B) {
-        mp_raise_NotImplementedError(MP_ERROR_TEXT("CLASS_B not implemented"));
+    if (cls == CLASS_B && !self->joined) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("CLASS_B requires a joined session"));
     }
 
     lorawan_cmd_data_t cmd;
@@ -1870,6 +2264,64 @@ static mp_obj_t lorawan_rejoin(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_rejoin_obj, 1, 2, lorawan_rejoin);
 
+// clock_sync_enable() — register the LmhpClockSync application-layer package
+// (port 202, LoRa-Alliance Clock Sync v1.0.0). The package can only be
+// registered after the MAC stack is initialised; registering before join() is
+// fine, but clock_sync_request() itself requires a joined session to transmit.
+static mp_obj_t lorawan_clock_sync_enable(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_CLOCK_SYNC_ENABLE };
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_obj_new_bool(self->clock_sync_enabled);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_clock_sync_enable_obj, lorawan_clock_sync_enable);
+
+// clock_sync_request() — trigger LmhpClockSyncAppTimeReq: emits an AppTimeReq
+// uplink on port 202 AND piggy-backs a MAC-layer DeviceTimeReq. Unlike
+// request_device_time() (which only queues a piggy-back MAC command), this
+// already causes an uplink to go out — no follow-up send() is required.
+//
+// The server's AppTimeAns or MAC-layer DeviceTimeAns arrives in the RX window
+// of that uplink; LmhpClockSync updates SysTime and invokes the shim's
+// OnSysTimeUpdate hook, which refreshes self.network_time_gps and fires the
+// registered on_time_sync callback.
+static mp_obj_t lorawan_clock_sync_request(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    if (!self->joined) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not joined"));
+    }
+    if (!self->clock_sync_enabled) {
+        mp_raise_msg(&mp_type_RuntimeError,
+                     MP_ERROR_TEXT("clock sync not enabled; call clock_sync_enable() first"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_CLOCK_SYNC_REQUEST };
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_clock_sync_request_obj, lorawan_clock_sync_request);
+
+// synced_time() — return the corrected time as GPS epoch seconds (live, based
+// on SysTimeGet), or None if no sync has happened yet. Unlike network_time()
+// which returns the snapshot captured at the moment of the last sync, this
+// advances with the local clock between syncs.
+static mp_obj_t lorawan_synced_time(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->time_synced) {
+        return mp_const_none;
+    }
+    SysTime_t now = SysTimeGet();
+    uint32_t gps_epoch = (now.Seconds >= UNIX_GPS_EPOCH_OFFSET)
+                         ? (now.Seconds - UNIX_GPS_EPOCH_OFFSET) : 0;
+    return mp_obj_new_int_from_uint(gps_epoch);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_synced_time_obj, lorawan_synced_time);
+
 // on_time_sync(callback) — register callback(gps_epoch_seconds) for every
 // successful DeviceTimeAns. Pass None to deregister.
 static mp_obj_t lorawan_on_time_sync(mp_obj_t self_in, mp_obj_t cb) {
@@ -1881,6 +2333,82 @@ static mp_obj_t lorawan_on_time_sync(mp_obj_t self_in, mp_obj_t cb) {
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_on_time_sync_obj, lorawan_on_time_sync);
+
+// Build a Python dict from the cached BeaconInfo snapshot on the object.
+// Must run in VM context (allocates dict/bytes); called from the trampoline
+// and from beacon_state().  beacon_time is GPS-epoch seconds per the
+// LoRaWAN spec (BeaconInfo_t.Time is already GPS epoch).
+static mp_obj_t lorawan_beacon_info_dict(lorawan_obj_t *self) {
+    mp_obj_t d = mp_obj_new_dict(0);
+    mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_state),
+                      mp_obj_new_int(self->beacon_last_state));
+    mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_time),
+                      mp_obj_new_int_from_uint(self->beacon_time_seconds));
+    mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_freq),
+                      mp_obj_new_int_from_uint(self->beacon_freq));
+    mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_datarate),
+                      mp_obj_new_int(self->beacon_datarate));
+    mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_rssi),
+                      mp_obj_new_int(self->beacon_rssi));
+    mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_snr),
+                      mp_obj_new_int(self->beacon_snr));
+    mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_gw_info_desc),
+                      mp_obj_new_int(self->beacon_gw_info_desc));
+    mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_gw_info),
+                      mp_obj_new_bytes(self->beacon_gw_info, 6));
+    return d;
+}
+
+// on_beacon(callback) — register callback(state, info) for beacon events.
+// state is one of lorawan.BEACON_* constants. info is a dict (see beacon_state)
+// or None if no beacon has been received yet (e.g. BEACON_ACQUISITION_FAIL).
+// Pass None to deregister.
+static mp_obj_t lorawan_on_beacon(mp_obj_t self_in, mp_obj_t cb) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (cb != mp_const_none && !mp_obj_is_callable(cb)) {
+        mp_raise_TypeError(MP_ERROR_TEXT("on_beacon: callback must be callable or None"));
+    }
+    self->beacon_callback = cb;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_on_beacon_obj, lorawan_on_beacon);
+
+// beacon_state() — return the last known beacon info dict or None if no
+// beacon has been received yet. Keys: state, time (GPS epoch s), freq (Hz),
+// datarate, rssi, snr, gw_info_desc, gw_info (6 bytes).
+static mp_obj_t lorawan_beacon_state(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->beacon_info_valid) {
+        return mp_const_none;
+    }
+    return lorawan_beacon_info_dict(self);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_beacon_state_obj, lorawan_beacon_state);
+
+// ping_slot_periodicity(N=None) — getter/setter for the Class B ping-slot
+// periodicity (0..7). Period between ping slots is 2^N seconds. Only takes
+// effect on the next request_class(CLASS_B) — changing it while already in
+// Class B requires a class-B renegotiation.
+static mp_obj_t lorawan_ping_slot_periodicity(size_t n_args, const mp_obj_t *args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    if (n_args == 1) {
+        return mp_obj_new_int(self->ping_slot_periodicity);
+    }
+    int n = mp_obj_get_int(args[1]);
+    if (n < 0 || n > 7) {
+        mp_raise_ValueError(MP_ERROR_TEXT("periodicity must be 0..7"));
+    }
+    lorawan_cmd_data_t cmd;
+    cmd.cmd = CMD_PING_SLOT_PERIODICITY;
+    cmd.ping_periodicity = (uint8_t)n;
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_ping_slot_periodicity_obj, 1, 2,
+                                            lorawan_ping_slot_periodicity);
 
 // on_class_change(callback) — register callback(new_class) for class transitions.
 // Pass None to deregister.
@@ -1912,11 +2440,18 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_request_class),  MP_ROM_PTR(&lorawan_request_class_obj) },
     { MP_ROM_QSTR(MP_QSTR_device_class),   MP_ROM_PTR(&lorawan_device_class_obj) },
     { MP_ROM_QSTR(MP_QSTR_on_class_change), MP_ROM_PTR(&lorawan_on_class_change_obj) },
+    { MP_ROM_QSTR(MP_QSTR_on_beacon),      MP_ROM_PTR(&lorawan_on_beacon_obj) },
+    { MP_ROM_QSTR(MP_QSTR_beacon_state),   MP_ROM_PTR(&lorawan_beacon_state_obj) },
+    { MP_ROM_QSTR(MP_QSTR_ping_slot_periodicity),
+                                            MP_ROM_PTR(&lorawan_ping_slot_periodicity_obj) },
     { MP_ROM_QSTR(MP_QSTR_request_device_time), MP_ROM_PTR(&lorawan_request_device_time_obj) },
     { MP_ROM_QSTR(MP_QSTR_network_time),   MP_ROM_PTR(&lorawan_network_time_obj) },
     { MP_ROM_QSTR(MP_QSTR_link_check),     MP_ROM_PTR(&lorawan_link_check_obj) },
     { MP_ROM_QSTR(MP_QSTR_rejoin),         MP_ROM_PTR(&lorawan_rejoin_obj) },
     { MP_ROM_QSTR(MP_QSTR_on_time_sync),   MP_ROM_PTR(&lorawan_on_time_sync_obj) },
+    { MP_ROM_QSTR(MP_QSTR_clock_sync_enable),  MP_ROM_PTR(&lorawan_clock_sync_enable_obj) },
+    { MP_ROM_QSTR(MP_QSTR_clock_sync_request), MP_ROM_PTR(&lorawan_clock_sync_request_obj) },
+    { MP_ROM_QSTR(MP_QSTR_synced_time),        MP_ROM_PTR(&lorawan_synced_time_obj) },
 };
 static MP_DEFINE_CONST_DICT(lorawan_locals, lorawan_locals_table);
 
@@ -1931,7 +2466,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.9.2", 5);
+    return mp_obj_new_str("0.10.0", 6);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 
@@ -2001,6 +2536,12 @@ static const mp_rom_map_elem_t lorawan_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_DR_3),      MP_ROM_INT(DR_3) },
     { MP_ROM_QSTR(MP_QSTR_DR_4),      MP_ROM_INT(DR_4) },
     { MP_ROM_QSTR(MP_QSTR_DR_5),      MP_ROM_INT(DR_5) },
+    // Class B beacon state codes (passed to on_beacon callback first arg)
+    { MP_ROM_QSTR(MP_QSTR_BEACON_ACQUISITION_OK),   MP_ROM_INT(LW_BEACON_ACQUISITION_OK) },
+    { MP_ROM_QSTR(MP_QSTR_BEACON_ACQUISITION_FAIL), MP_ROM_INT(LW_BEACON_ACQUISITION_FAIL) },
+    { MP_ROM_QSTR(MP_QSTR_BEACON_LOCKED),           MP_ROM_INT(LW_BEACON_LOCKED) },
+    { MP_ROM_QSTR(MP_QSTR_BEACON_NOT_FOUND),        MP_ROM_INT(LW_BEACON_NOT_FOUND) },
+    { MP_ROM_QSTR(MP_QSTR_BEACON_LOST),             MP_ROM_INT(LW_BEACON_LOST) },
 };
 static MP_DEFINE_CONST_DICT(lorawan_module_globals, lorawan_module_globals_table);
 

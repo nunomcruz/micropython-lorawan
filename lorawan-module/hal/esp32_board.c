@@ -61,6 +61,16 @@ int16_t BoardGetTemperature(void)
     return 25;
 }
 
+// Class B beacon timing compensates for crystal drift using the MCU die
+// temperature (see LoRaMacClassB.c: ApplyTemperatureDrift). The exact value is
+// not critical — a fixed 25 C estimate keeps the compensation term bounded and
+// matches what the NucleoL073/L152/L476 ports do for boards without a sensor.
+// If future hardware exposes the AXP PMU temperature register we can plug it in here.
+float BoardGetTemperatureLevel(void)
+{
+    return 25.0f;
+}
+
 uint32_t BoardGetRandomSeed(void)
 {
     return esp_random();

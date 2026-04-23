@@ -260,14 +260,20 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 
 Prerequisites: DeviceTimeReq must work (Session 12), timer HAL accuracy verified (Session 6).
 
-- [ ] Implement HAL `GetTemperatureLevel()` — read from AXP PMU or fixed estimate (for beacon drift compensation)
-- [ ] Implement `request_class(CLASS_B)` — async transition: beacon acquisition → PingSlotInfoReq → confirmation
-- [ ] Implement `ping_slot_periodicity(N)` — 2^N seconds between ping slots (N=0..7)
-- [ ] Implement `on_beacon(callback)` — states: LOCKED, LOST, ACQUISITION, TIMEOUT, REACQUISITION
-- [ ] Implement `beacon_state()` — returns dict with beacon time, gateway info, etc.
-- [ ] Implement `device_class()` — returns current class (A, B, or C)
-- [ ] Handle `MLME_REVERT_JOIN` — automatic revert to Class A after MAX_BEACON_LESS_PERIOD (2h)
-- [ ] Test: DeviceTimeReq → request Class B → beacon locked → receive on ping slot
+- [x] Enable `LORAMAC_CLASSB_ENABLED` in `micropython.cmake` so `LoRaMacClassB.c` compiles in; otherwise every Class B entry point in `LoRaMac.c` returns `LORAMAC_STATUS_SERVICE_UNKNOWN` silently.
+- [x] Implement HAL `BoardGetTemperatureLevel()` → returns fixed 25.0 °C. Wired via `s_mac_callbacks.GetTemperatureLevel`. Used by `LoRaMacClassB.c: ApplyTemperatureDrift` for crystal-drift compensation on beacon timing; the Nucleo reference ports use the same fixed estimate when a sensor is absent.
+- [x] Implement `request_class(CLASS_B)` — async, multi-step. `CMD_SET_CLASS` gates on `time_synced` + current class == CLASS_A, then fires `MLME_BEACON_ACQUISITION` and returns immediately (EVT_CLASS_OK). The follow-up is driven by `s_classb_*` flags flipped in MLME callback context and drained from the task loop (same pattern as the OTAA retry):
+    - `MLME_BEACON_ACQUISITION` confirm OK → `s_classb_need_ping_slot_req` → task issues `MLME_PING_SLOT_INFO` + empty-port-0 MCPS_UNCONFIRMED uplink (piggy-back flush, mirrors `LmHandlerPingSlotReq`).
+    - `MLME_PING_SLOT_INFO` confirm OK → `s_classb_need_switch_class` → task sets `MIB_DEVICE_CLASS = CLASS_B` (now accepted because `BeaconMode==1 && PingSlotCtx.Assigned==1`) and schedules `on_class_change(CLASS_B)`.
+    - `MLME_BEACON_ACQUISITION` FAIL → `s_classb_need_device_time_req` → task re-issues `MLME_DEVICE_TIME` + `MLME_BEACON_ACQUISITION` to re-sync the search window.
+- [x] Implement `ping_slot_periodicity(N)` — `N=0..7`, period `2^N` s. Getter/setter; value stored on the object and applied on the next `request_class(CLASS_B)` (changing it while already in Class B requires a renegotiation).
+- [x] Implement `on_beacon(callback)` — `callback(state, info)` where state ∈ {`BEACON_ACQUISITION_OK`, `BEACON_ACQUISITION_FAIL`, `BEACON_LOCKED`, `BEACON_NOT_FOUND`, `BEACON_LOST`} and info is either the beacon dict (when a beacon has been received) or `None`. Fires on every `MLME_BEACON` / `MLME_BEACON_LOST` indication and on `MLME_BEACON_ACQUISITION` confirm outcomes.
+- [x] Implement `beacon_state()` — returns `{state, time (GPS epoch s), freq (Hz), datarate, rssi, snr, gw_info_desc, gw_info (6-byte bytes)}` or `None` if no beacon received yet. Snapshot captured in `mlme_indication(MLME_BEACON, BEACON_LOCKED)`; `BEACON_LOST` clears `beacon_info_valid`.
+- [x] `device_class()` already existed (Session 11) — no change needed.
+- [x] Handle `MLME_BEACON_LOST` — sets `MIB_DEVICE_CLASS = CLASS_A`, clears all `s_classb_*` flags, clears `beacon_info_valid`, schedules `on_beacon(LOST)` + `on_class_change(CLASS_A)`. This is the real "2h without beacon" revert path; `MLME_REVERT_JOIN` (LoRaWAN 1.1 rekey revert, unrelated to beacons) is also handled — the session is invalidated (`joined=false`) so the user must rejoin.
+- [x] New module constants exported: `BEACON_ACQUISITION_OK`, `BEACON_ACQUISITION_FAIL`, `BEACON_LOCKED`, `BEACON_NOT_FOUND`, `BEACON_LOST`.
+- [x] Version bumped 0.9.3 → 0.10.0; compile clean, zero warnings; firmware 1632 KB (+8 KB for `LoRaMacClassB.c`).
+- [ ] Test: DeviceTimeReq → request Class B → beacon locked → receive on ping slot (TTN gateway needs Class B beacon support — many community gateways don't).
 - [ ] Test: beacon loss → reacquisition → automatic revert after timeout
 
 ### Session 14: Multicast (local + remote, Class B + C)
