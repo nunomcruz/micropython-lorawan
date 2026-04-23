@@ -327,9 +327,10 @@ Gaps found while reviewing the Python surface against the MAC capabilities. The 
 
 #### Missing getters (MIB already has the answer)
 
-- [ ] `lw.dev_addr()` — returns the current 32-bit DevAddr. After OTAA this is the server-assigned value; useful for debugging and for matching against traffic captures. `MIB_DEV_ADDR`.
-- [ ] `lw.region()` — returns the `LORAMAC_REGION_*` the object was constructed with. Stored on `lorawan_obj_t.region` already; just needs the binding.
-- [ ] `lw.max_payload_len()` — returns the max app payload size for the current DR, accounting for MAC commands already queued. `LoRaMacQueryTxPossible()` returns `LORAMAC_STATUS_OK` with `Size`. Today `send()` fails late with `LENGTH_ERROR`; exposing this lets callers slice before submitting.
+- [x] `lw.dev_addr()` — returns the current 32-bit DevAddr from `MIB_DEV_ADDR`. Dispatched via new `CMD_QUERY` (sub-type `LW_QUERY_DEV_ADDR`) so the MIB read happens on the LoRaWAN task, keeping single-threaded MAC ownership. Result staged in `s_query_dev_addr` while the Python caller is blocked on `EVT_COMPLETED`. Returns 0 before any activation.
+- [x] `lw.region()` — returns `self->region` directly (`LORAMAC_REGION_*` value cached at `__init__`). No CMD round-trip.
+- [x] `lw.max_payload_len()` — wraps `LoRaMacQueryTxPossible(0, &tx_info)` via `CMD_QUERY` (sub-type `LW_QUERY_MAX_PAYLOAD_LEN`); returns `tx_info.MaxPossibleApplicationDataSize`. Treats both `LORAMAC_STATUS_OK` and `LORAMAC_STATUS_LENGTH_ERROR` as success since both populate the field. Lets callers slice payloads before `send()` instead of catching a late `LENGTH_ERROR`.
+- [x] Version bumped 0.13.0 → 0.14.0; compile clean, zero warnings; firmware 1645504 bytes (+288 B).
 
 #### Duty cycle
 

@@ -133,7 +133,13 @@ typedef enum {
     CMD_REMOTE_MCAST_ENABLE,
     CMD_FRAGMENTATION_ENABLE,
     CMD_DEINIT,
+    CMD_QUERY,
 } lorawan_cmd_t;
+
+// Query sub-types for CMD_QUERY. Result is written to s_query_* statics
+// before EVT_COMPLETED fires; the Python caller reads them after send_cmd_wait.
+#define LW_QUERY_DEV_ADDR        0
+#define LW_QUERY_MAX_PAYLOAD_LEN 1
 
 typedef struct {
     uint32_t dev_addr;
@@ -203,6 +209,7 @@ typedef struct {
         cmd_mc_rx_params_t mc_rx_params;
         uint8_t         mc_group;           // CMD_MC_REMOVE: 0..3
         cmd_frag_enable_t frag_enable;
+        uint8_t         query_type;         // CMD_QUERY: LW_QUERY_*
     };
 } lorawan_cmd_data_t;
 
@@ -354,6 +361,12 @@ static uint8_t       s_otaa_dev_eui[8];
 static uint8_t       s_otaa_join_eui[8];
 static uint8_t       s_otaa_app_key[16];
 static uint8_t       s_otaa_nwk_key[16]; // 1.0.x: same as app_key; 1.1: separate root key
+
+// CMD_QUERY result statics. Written by the LoRaWAN task before EVT_COMPLETED;
+// read by the Python thread after send_cmd_wait returns. Safe because the
+// caller is blocked on the event group while the task fills these.
+static uint32_t      s_query_dev_addr;
+static uint8_t       s_query_max_payload_len;
 
 // ---- TX power dBm ↔ MAC index conversion ----
 //
@@ -1790,6 +1803,40 @@ static void lorawan_task(void *arg) {
                 break;
             }
 
+            case CMD_QUERY: {
+                // Read-only MIB / TX-info queries dispatched from Python.
+                // The Python caller is blocked on EVT_COMPLETED while we run,
+                // so the s_query_* statics are safe to write here and read
+                // there without further synchronisation.
+                switch (cmd.query_type) {
+                case LW_QUERY_DEV_ADDR: {
+                    s_query_dev_addr = 0;
+                    mib.Type = MIB_DEV_ADDR;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK) {
+                        s_query_dev_addr = mib.Param.DevAddr;
+                    }
+                    break;
+                }
+                case LW_QUERY_MAX_PAYLOAD_LEN: {
+                    s_query_max_payload_len = 0;
+                    LoRaMacTxInfo_t tx_info;
+                    // size=0 query: txInfo.MaxPossibleApplicationDataSize is
+                    // populated whenever LORAMAC_STATUS_OK or LENGTH_ERROR is
+                    // returned (only PARAMETER_INVALID / MAC_COMMAD_ERROR skip
+                    // it). Treat the populated path as success.
+                    LoRaMacStatus_t st = LoRaMacQueryTxPossible(0, &tx_info);
+                    if (st == LORAMAC_STATUS_OK || st == LORAMAC_STATUS_LENGTH_ERROR) {
+                        s_query_max_payload_len = tx_info.MaxPossibleApplicationDataSize;
+                    }
+                    break;
+                }
+                default:
+                    break;
+                }
+                xEventGroupSetBits(s_events, EVT_COMPLETED);
+                break;
+            }
+
             default:
                 break;
             }
@@ -2646,6 +2693,46 @@ static mp_obj_t lorawan_device_class(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_device_class_obj, lorawan_device_class);
 
+// region() — returns the LORAMAC_REGION_* the object was constructed with.
+// Cached on lorawan_obj_t.region at __init__ — no MAC round-trip.
+static mp_obj_t lorawan_region(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    return mp_obj_new_int((int)self->region);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_region_obj, lorawan_region);
+
+// dev_addr() — returns the current 32-bit DevAddr from MIB_DEV_ADDR.
+// After OTAA this is the server-assigned value; after ABP it is whatever the
+// caller passed to join_abp(). Returns 0 before any activation.
+static mp_obj_t lorawan_dev_addr(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_QUERY };
+    cmd.query_type = LW_QUERY_DEV_ADDR;
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_obj_new_int_from_uint(s_query_dev_addr);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_dev_addr_obj, lorawan_dev_addr);
+
+// max_payload_len() — returns the maximum app payload size (bytes) for the
+// next uplink at the current DR, accounting for any MAC commands the stack
+// has queued (e.g. LinkCheckReq, DeviceTimeReq). Wraps LoRaMacQueryTxPossible
+// with size=0 so the call does not actually submit a frame. Lets callers
+// slice payloads before send() instead of catching a late LENGTH_ERROR.
+static mp_obj_t lorawan_max_payload_len(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_QUERY };
+    cmd.query_type = LW_QUERY_MAX_PAYLOAD_LEN;
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_obj_new_int(s_query_max_payload_len);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_max_payload_len_obj, lorawan_max_payload_len);
+
 // request_device_time() — queue an MLME_DEVICE_TIME request.
 // Sends a DeviceTimeReq MAC command piggy-backed on the next uplink; the
 // network responds with DeviceTimeAns in the same RX window.  The LoRaMAC
@@ -3230,6 +3317,9 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_time_until_tx),  MP_ROM_PTR(&lorawan_time_until_tx_obj) },
     { MP_ROM_QSTR(MP_QSTR_request_class),  MP_ROM_PTR(&lorawan_request_class_obj) },
     { MP_ROM_QSTR(MP_QSTR_device_class),   MP_ROM_PTR(&lorawan_device_class_obj) },
+    { MP_ROM_QSTR(MP_QSTR_region),         MP_ROM_PTR(&lorawan_region_obj) },
+    { MP_ROM_QSTR(MP_QSTR_dev_addr),       MP_ROM_PTR(&lorawan_dev_addr_obj) },
+    { MP_ROM_QSTR(MP_QSTR_max_payload_len), MP_ROM_PTR(&lorawan_max_payload_len_obj) },
     { MP_ROM_QSTR(MP_QSTR_on_class_change), MP_ROM_PTR(&lorawan_on_class_change_obj) },
     { MP_ROM_QSTR(MP_QSTR_on_beacon),      MP_ROM_PTR(&lorawan_on_beacon_obj) },
     { MP_ROM_QSTR(MP_QSTR_beacon_state),   MP_ROM_PTR(&lorawan_beacon_state_obj) },
@@ -3272,7 +3362,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.13.0", 6);
+    return mp_obj_new_str("0.14.0", 6);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 
