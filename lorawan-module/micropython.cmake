@@ -5,13 +5,20 @@ target_compile_definitions(usermod_lorawan INTERFACE
     REGION_EU868        # passes -DREGION_EU868 so Region.c includes RegionEU868.h
     REGION_EU433        # 433 MHz band (amateur, ISM)
     SOFT_SE             # enables KeyList and NUM_OF_KEYS in secure-element-nvm.h
+    LORAMAC_CLASSB_ENABLED  # compile the beacon + ping-slot state machine
     # REGION_US915
     # REGION_AU915
 )
 
-# MicroPython binding
+# MicroPython binding + LmHandler package hosting shim
 target_sources(usermod_lorawan INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/bindings/modlorawan.c
+    ${CMAKE_CURRENT_LIST_DIR}/bindings/lmhandler_shim.c
+)
+
+# LmHandler application-layer packages (hosted by the shim, not the full LmHandler)
+target_sources(usermod_lorawan INTERFACE
+    ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/apps/LoRaMac/common/LmHandler/packages/LmhpClockSync.c
 )
 
 # ESP32 HAL (implemented in Phase 3, Sessions 4–6)
@@ -81,6 +88,8 @@ target_include_directories(usermod_lorawan INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/peripherals/soft-se
     ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/boards
     ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/system
+    ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/apps/LoRaMac/common/LmHandler
+    ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/apps/LoRaMac/common/LmHandler/packages
 )
 
 target_link_libraries(usermod INTERFACE usermod_lorawan)

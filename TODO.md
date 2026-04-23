@@ -216,8 +216,42 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
         `lw.rejoin(2)`. Raises `RuntimeError` if not joined, `ValueError`
         if type is outside 0–2. Meaningful only for LoRaWAN 1.1.
       - Version bumped 0.9.1 → 0.9.2; compile clean, firmware 1624 KB.
-- [ ] Register Clock Sync package (LmhpClockSync, port 202)
-- [ ] Implement `clock_sync_enable()`, `clock_sync_request()`, `synced_time()`
+- [x] Register Clock Sync package (LmhpClockSync, port 202)
+      - Added `bindings/lmhandler_shim.c/.h` — minimal LmHandler adapter that
+        provides the three functions LmhpClockSync.c calls: `LmHandlerIsBusy()`
+        (queries `LoRaMacQueryTxPossible`), `LmHandlerSend()` (wraps
+        `LoRaMacMcpsRequest` using the current `MIB_CHANNELS_DATARATE`), and
+        `LmHandlerPackageRegister()` (stores the package and wires
+        `OnDeviceTimeRequest` → `MLME_DEVICE_TIME` + `OnSysTimeUpdate` → our
+        `lorawan_on_sys_time_update` hook). The full `LmHandler.c` is NOT
+        linked: it carries its own `LoRaMacInitialization` path and would
+        collide with our existing primitives/task design.
+      - `LmhpClockSync.c` compiled in from the vendored loramac-node tree; new
+        include paths `.../LmHandler` and `.../LmHandler/packages` added to
+        `micropython.cmake`.
+      - `mcps_confirm` / `mcps_indication` in modlorawan.c now call
+        `lorawan_packages_on_mcps_confirm/indication()` first so registered
+        packages see MCPS events before the standard user-port filter.
+- [x] Implement `clock_sync_enable()`, `clock_sync_request()`, `synced_time()`
+      - `clock_sync_enable()`: dispatched via `CMD_CLOCK_SYNC_ENABLE` so the
+        package registration runs on the LoRaWAN task (single-thread MAC
+        ownership). Sets `lorawan_obj_t.clock_sync_enabled` on success.
+      - `clock_sync_request()`: dispatched via `CMD_CLOCK_SYNC_REQUEST`,
+        wraps `LmhpClockSyncAppTimeReq()`. Unlike `request_device_time()`
+        (which only piggy-backs), this already emits an uplink on port 202 —
+        no follow-up `send()` needed. Raises `RuntimeError` if not joined or
+        if the package has not been enabled yet.
+      - `synced_time()`: returns live `SysTimeGet().Seconds - UNIX_GPS_EPOCH_OFFSET`
+        (GPS epoch) when time has been synced via either the AppTimeAns or
+        the MAC-level DeviceTimeAns path. Returns `None` before the first
+        sync. Complements `network_time()` which returns the snapshot taken
+        at the moment of last sync.
+      - Shim's `OnSysTimeUpdate` hook updates `self.time_synced` and
+        `self.network_time_gps` and schedules the existing
+        `lorawan_time_sync_trampoline`, so `on_time_sync(cb)` fires for both
+        the DeviceTimeReq and the AppTimeReq paths with identical semantics.
+      - Version bumped 0.9.2 → 0.9.3; compile clean, firmware 1626 KB
+        (+2 KB for the shim + LmhpClockSync.c).
 - [ ] Test: DeviceTimeReq on TTN, verify epoch matches real time
 - [ ] Test: LinkCheckReq, verify gateway count and margin
 - [ ] Test: Clock sync time correction
