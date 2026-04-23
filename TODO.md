@@ -307,12 +307,13 @@ Prerequisites: DeviceTimeReq must work (Session 12), timer HAL accuracy verified
 - [ ] Test: remote multicast setup via LmhpRemoteMcastSetup (if server supports it)
 - [ ] Test: fragmentation session end-to-end (server pushes fragments, `on_done` fires with reassembled payload)
 
-### Session 15: Documentation and examples
+### Session 15: Documentation and examples ✓
 
-- [ ] API reference documentation
-- [ ] Hardware setup guide
-- [ ] Example scripts: basic_otaa.py, basic_abp.py, sensor_node.py
-- [ ] Example scripts: time_sync.py, class_b_beacon.py, multicast_receiver.py
+- [x] API reference documentation — `README.md` rewritten with full Phase 5 coverage: Class A/B/C, time sync (DeviceTimeReq + Clock Sync package), LinkCheckReq, ReJoin, multicast (local + remote), fragmentation/FUOTA, beacon state, ping-slot periodicity. Fixed two pre-existing errors from Phase 4 docs: `joined()` is a method not an attribute, and the `on_rx` callback now receives a 5-tuple `(data, port, rssi, snr, multicast)` (multicast flag added in Session 14).
+- [x] Hardware setup guide — new section covering LoRa antenna (damage risk without), GPS antenna, power, and TTN registration walkthrough (frequency plan "Europe 863–870 MHz (SF9 for RX2)" maps to the default `rx2_dr=DR_3`).
+- [x] Example scripts: `lorawan-module/examples/basic_otaa.py`, `basic_abp.py`, `sensor_node.py` — all gated by `tbeam.detect()`, print diagnostic info (RSSI/SNR/counters), handle OSError on join timeout and RuntimeError on send failure. `sensor_node.py` uses `machine.deepsleep()` with pre-sleep `nvram_save()` and reads AXP192 battery voltage inline when available.
+- [x] Example scripts: `time_sync.py`, `class_b_beacon.py`, `multicast_receiver.py` — all demonstrate the relevant callback (`on_time_sync`, `on_beacon`, `on_rx`-with-multicast-flag). `class_b_beacon.py` walks the full flow: join → DeviceTimeReq → set ping-slot periodicity → request CLASS_B → wait for `BEACON_LOCKED` state. `multicast_receiver.py` uses local group provisioning (keys in-script) and Class C continuous listen.
+- [x] `lorawan-module/examples/README.md` index with a pointer to each script and notes on LNS prerequisites (Class B beacon support, multicast API availability).
 
 ## Notes
 

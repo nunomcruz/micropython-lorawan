@@ -5,7 +5,17 @@ Fork of [MicroPython](https://micropython.org/) v1.29.0-preview with a full LoRa
 
 ## What this fork adds
 
-A `USER_C_MODULE` that wraps [Semtech LoRaMAC-node v4.7.0](https://github.com/Lora-net/LoRaMac-node/tree/v4.7.0), providing OTAA/ABP join, uplink/downlink, confirmed messages, ADR, and NVS session persistence. Import as `lorawan`.
+A `USER_C_MODULE` that wraps [Semtech LoRaMAC-node v4.7.0](https://github.com/Lora-net/LoRaMac-node/tree/v4.7.0), providing:
+
+- OTAA and ABP join (LoRaWAN 1.0.4 and 1.1)
+- Uplink and downlink, confirmed and unconfirmed
+- Adaptive Data Rate, TX-power control, NVS session persistence
+- Class A, Class B (beacons + ping slots) and Class C
+- MAC extensions: DeviceTimeReq, LinkCheckReq, ReJoin
+- Application-layer packages: Clock Sync (port 202), Remote Multicast Setup (port 200), Fragmentation / FUOTA (port 201)
+- Local and remotely-provisioned multicast (up to 4 groups)
+
+All exposed via a single `import lorawan` module.
 
 Single firmware image for all T-Beam variants (v0.7–v1.2, SX1276 and SX1262 radios). Hardware is auto-detected at boot; no separate builds required.
 
@@ -20,19 +30,78 @@ Primary region: EU868 (TTN). EU433 supported.
 | v1.1 | SX1276 or SX1262 | AXP192 | 34/12 |
 | v1.2 | SX1276 or SX1262 | AXP2101 | 34/12 |
 
+## Hardware setup
+
+### LoRa antenna
+
+**Attach a matched 868 MHz (or 433 MHz) antenna to the SMA/IPEX connector before powering the board.** Transmitting without an antenna can damage the SX1276 / SX1262 PA within a few frames. The T-Beam ships with the MCU and radio soldered together — the only wiring step you need to do is screw on the antenna.
+
+Do not reuse a 2.4 GHz (WiFi/BLE) antenna — the mismatch wastes 10+ dB of output power.
+
+### GPS antenna
+
+Most T-Beams come with a passive patch antenna connected via U.FL. If you are using the GPS at all, leave it attached — GPS RF is not shared with LoRa and there is no risk from running the radio without it, but your first fix will be slow without an antenna.
+
+### Power
+
+USB-C (or micro-USB on v0.7) powers the MCU and charges the 18650 cell. For deep-sleep sensor nodes, insert a charged 18650 and rely on the PMU to maintain the radio between wakeups.
+
+### Registering the device on The Things Network
+
+1. Create a TTN application at [console.cloud.thethings.network](https://console.cloud.thethings.network/).
+2. Add an **end device** → "Enter end device specifics manually".
+   - Frequency plan: `Europe 863–870 MHz (SF9 for RX2 — recommended)` — this is what the default `rx2_dr=DR_3` corresponds to.
+   - LoRaWAN version: `MAC V1.0.4` (or `MAC V1.1` if you passed `lorawan_version=lorawan.V1_1`).
+   - Regional Parameters version: `RP002 Regional Parameters 1.0.3 revision A` (or whichever the console recommends for your MAC version).
+3. Activation mode: **OTAA** (recommended). TTN will generate the JoinEUI, DevEUI and AppKey — copy these into your script.
+4. After your first successful uplink the device status on TTN switches from *Never seen* to *Connected*. Send a downlink from the **Messaging → Downlink** tab to verify the RX path.
+
+ABP is supported but discouraged on TTN: you lose replay protection across reboots unless you call `nvram_save()` after every uplink and `nvram_restore()` on every boot.
+
 ## Build
 
 ```bash
 source micropython-esp-idf/export.sh    # set up ESP-IDF toolchain
 
 cd micropython-lorawan
-make -C mpy-cross
+make -C mpy-cross                        # first time only (or after upstream changes)
 
 cd ports/esp32
-make submodules
+make submodules                          # first time only (or after IDF bump)
 make BOARD=LILYGO_TTGO_TBEAM \
      USER_C_MODULES=$(pwd)/../../lorawan-module/micropython.cmake
 ```
+
+Flash with `make deploy PORT=/dev/ttyUSB0` or `esptool.py` directly.
+
+---
+
+## Quick start
+
+```python
+import lorawan
+
+lw = lorawan.LoRaWAN(region=lorawan.EU868)
+
+# Restore previous session if any; must be called before join on every boot.
+try:
+    lw.nvram_restore()
+except OSError:
+    pass
+
+if not lw.joined():
+    lw.join_otaa(
+        dev_eui=bytes.fromhex("70B3D57ED0000000"),
+        join_eui=bytes.fromhex("0000000000000000"),
+        app_key=bytes.fromhex("00000000000000000000000000000000"),
+        timeout=60,
+    )
+
+lw.send(b"hello", port=1)
+lw.nvram_save()
+```
+
+Ready-made scripts live in [`lorawan-module/examples/`](lorawan-module/examples/) — `basic_otaa.py`, `basic_abp.py`, `sensor_node.py`, `time_sync.py`, `class_b_beacon.py`, `multicast_receiver.py`.
 
 ---
 
@@ -44,16 +113,17 @@ Creates and initialises the LoRaWAN stack. Only one instance may exist at a time
 
 ```python
 lw = lorawan.LoRaWAN(
-    region=lorawan.EU868,           # required — region constant (see below)
+    region=lorawan.EU868,           # required — EU868 or EU433
 
     # --- LoRaWAN protocol ---
     lorawan_version=lorawan.V1_0_4, # V1_0_4 (default) or V1_1
     device_class=lorawan.CLASS_A,   # CLASS_A (default), CLASS_B, CLASS_C
 
     # --- RX2 window ---
-    # TTN EU868 uses DR_3 (SF9/125kHz). Standard LoRaWAN uses DR_0 (SF12).
-    rx2_dr=lorawan.DR_3,            # default: DR_3 (TTN EU868)
-    rx2_freq=869525000,             # default: 869.525 MHz (Hz)
+    # Unset fields fall through to the region's PHY_DEF_RX2 (DR_0 / region default freq).
+    # For TTN EU868, set rx2_dr=DR_3 (the 869.525 MHz freq is already the region default).
+    rx2_dr=None,                    # e.g. lorawan.DR_3 for TTN EU868
+    rx2_freq=None,                  # e.g. 869525000 (Hz)
 
     # --- TX power ---
     # In dBm EIRP. None = region maximum (16 dBm for EU868).
@@ -62,6 +132,12 @@ lw = lorawan.LoRaWAN(
     #   SX1276 hardware cap: 20 dBm
     #   SX1262 hardware cap: 22 dBm
     tx_power=None,
+
+    # --- Antenna gain ---
+    # In dBi. Default 0.0 so the radio emits the full EIRP.
+    # Set to the measured gain of your antenna if you care about staying
+    # under the regulatory EIRP cap.
+    antenna_gain=0.0,
 
     # --- Radio selection ---
     # None = auto-detect by reading SX1276 version register (default).
@@ -130,7 +206,7 @@ Returns `True` if the device has an active session (ABP always returns `True` af
 
 #### `lw.send(data, *, port=1, confirmed=False, datarate=lorawan.DR_0)`
 
-Transmits an uplink frame. Blocks until TX is complete (includes waiting for RX1/RX2 windows — up to 10 s). Raises `RuntimeError` on failure.
+Transmits an uplink frame. Blocks until TX is complete (includes waiting for RX1/RX2 windows — up to ~10 s). Raises `RuntimeError` on failure.
 
 ```python
 lw.send(b"hello")                              # unconfirmed, port 1, DR_0 (SF12)
@@ -164,10 +240,15 @@ if pkt:
 
 #### `lw.on_rx(callback)` / `lw.on_rx(None)`
 
-Registers a callback fired on each downlink. Do not combine with `recv()` on the same object.
+Registers a callback fired on each downlink. Callback receives a single 5-tuple `(data, port, rssi, snr, multicast)`. `multicast` is `True` when the frame was received on a multicast address. Do not combine with `recv()` on the same object.
 
 ```python
-lw.on_rx(lambda pkt: print("rx:", pkt))  # pkt = (data, port, rssi, snr)
+def on_downlink(pkt):
+    data, port, rssi, snr, mc = pkt
+    kind = "mcast" if mc else "ucast"
+    print(f"{kind} port={port} rssi={rssi} snr={snr}: {data}")
+
+lw.on_rx(on_downlink)
 lw.on_rx(None)  # deregister
 ```
 
@@ -218,18 +299,29 @@ lw.tx_power(20)  # hardware maximum for SX1276
 
 EU868 table (for reference):
 
-| dBm EIRP | MAC index | SF equivalent |
-|----------|-----------|---------------|
-| 16 | 0 (max) | any |
-| 14 | 1 | |
-| 12 | 2 | |
-| 10 | 3 | |
-| 8 | 4 | |
-| 6 | 5 | |
-| 4 | 6 | |
-| 2 | 7 (min) | |
+| dBm EIRP | MAC index |
+|----------|-----------|
+| 16 | 0 (max) |
+| 14 | 1 |
+| 12 | 2 |
+| 10 | 3 |
+|  8 | 4 |
+|  6 | 5 |
+|  4 | 6 |
+|  2 | 7 (min) |
 
 The setter rounds down to the nearest available step (never exceeds the requested value).
+
+> Note: the dBm↔index table is hardcoded to EU868 (max 16 dBm, step 2). On EU433, `tx_power()` still accepts and returns EU868 dBm values; the MAC indices are correct but the dBm annotations will be off by a few dB. Region-accurate mapping is a future refactor.
+
+#### `lw.antenna_gain([gain])` → `float | None`
+
+Getter/setter for the antenna gain in dBi. The MAC subtracts this from the requested EIRP to compute the radio output power. Default is `0.0` so the radio emits the full EIRP — with a 2.15 dBi antenna the radiated power is then 2.15 dB over target.
+
+```python
+lw.antenna_gain(2.15)  # stated gain of the stock T-Beam whip
+lw.antenna_gain()      # → 2.15
+```
 
 #### `lw.stats()` → `dict`
 
@@ -238,12 +330,12 @@ Returns a snapshot of runtime statistics:
 ```python
 lw.stats()
 # {
-#   'rssi': -109,        # last downlink RSSI (dBm)
-#   'snr': 6,            # last downlink SNR (dB)
-#   'tx_counter': 4,     # uplink frame counter
-#   'rx_counter': 1,     # downlink frame counter
-#   'tx_time_on_air': 991, # last uplink time on air (ms)
-#   'last_tx_ack': True,   # confirmed uplink: True if ACKed
+#   'rssi': -109,           # last downlink RSSI (dBm)
+#   'snr': 6,               # last downlink SNR (dB)
+#   'tx_counter': 4,        # uplink frame counter
+#   'rx_counter': 1,        # downlink frame counter
+#   'tx_time_on_air': 991,  # last uplink time on air (ms)
+#   'last_tx_ack': True,    # confirmed uplink: True if ACKed
 # }
 ```
 
@@ -251,7 +343,7 @@ lw.stats()
 
 ### Persistence
 
-The MAC session (DevAddr, session keys, frame counters, ADR state) can be stored in ESP32 NVS so the device resumes after a reboot without re-joining.
+The MAC session (DevAddr, session keys, frame counters, ADR state, DevNonce) is stored in ESP32 NVS so the device resumes after a reboot without re-joining.
 
 **Critical boot sequence:**
 
@@ -263,7 +355,7 @@ try:
 except OSError:
     pass  # first boot — no saved session yet
 
-if not lw.joined:
+if not lw.joined():
     lw.join_otaa(...)   # DevNonce auto-saved to NVS after successful join
 
 lw.send(b"data")
@@ -282,11 +374,265 @@ Restores a previously saved session from NVS. Raises `OSError(ENOENT)` if no ses
 
 ---
 
+### Device class (A / B / C)
+
+#### `lw.request_class(cls)`
+
+Requests a switch to `CLASS_A`, `CLASS_B` or `CLASS_C`.
+
+- Class A ↔ Class C: synchronous — `MIB_DEVICE_CLASS` is set immediately and `on_class_change(new_class)` fires before the call returns.
+- Class B: asynchronous and multi-step. Requires a prior time sync (see `request_device_time()` below). The call returns once beacon acquisition starts; the actual class change is signalled later via `on_class_change(CLASS_B)`. Beacon lock, loss and acquisition-failure events are surfaced via `on_beacon(cb)`.
+
+Raises `RuntimeError` if the transition fails.
+
+```python
+# Class C — instantaneous
+lw.request_class(lorawan.CLASS_C)
+
+# Class B — prerequisite: time sync
+lw.request_device_time()
+lw.send(b"")              # DeviceTimeReq piggy-backs on this uplink
+lw.request_class(lorawan.CLASS_B)
+```
+
+#### `lw.device_class()` → `int`
+
+Returns the current class (`CLASS_A`, `CLASS_B` or `CLASS_C`).
+
+#### `lw.on_class_change(callback)` / `lw.on_class_change(None)`
+
+Registers a callback fired on every completed class transition. Callback receives the new class as a single int.
+
+```python
+lw.on_class_change(lambda c: print("now in class", c))
+```
+
+---
+
+### Class B (beacon tracking)
+
+#### `lw.ping_slot_periodicity([n])` → `int | None`
+
+Getter/setter for the Class B ping-slot periodicity `N` (0..7). Period between ping slots is `2^N` seconds. Takes effect on the next `request_class(CLASS_B)` — changing it while already in Class B requires renegotiation.
+
+```python
+lw.ping_slot_periodicity(4)  # 16 s between ping slots
+lw.ping_slot_periodicity()   # → 4
+```
+
+#### `lw.on_beacon(callback)` / `lw.on_beacon(None)`
+
+Registers a callback fired on every beacon event. Callback receives a single 2-tuple `(state, info)` where `state` is one of the `BEACON_*` constants and `info` is the beacon dict (see `beacon_state()`) or `None`.
+
+```python
+def on_beacon(evt):
+    state, info = evt
+    if state == lorawan.BEACON_LOCKED:
+        print("beacon locked:", info)
+    elif state == lorawan.BEACON_LOST:
+        print("beacon lost — reverting to Class A")
+
+lw.on_beacon(on_beacon)
+```
+
+States: `BEACON_ACQUISITION_OK`, `BEACON_ACQUISITION_FAIL`, `BEACON_LOCKED`, `BEACON_NOT_FOUND`, `BEACON_LOST`.
+
+#### `lw.beacon_state()` → `dict | None`
+
+Returns the most recent beacon info, or `None` if no beacon has been received yet.
+
+```python
+lw.beacon_state()
+# {
+#   'state': 2,                # last BEACON_* code (BEACON_LOCKED = 2)
+#   'time': 1398067200,        # GPS epoch seconds
+#   'freq': 869525000,         # beacon frequency (Hz)
+#   'datarate': 3,             # DR the beacon was received on
+#   'rssi': -95,
+#   'snr': 7,
+#   'gw_info_desc': 0,         # gateway info descriptor
+#   'gw_info': b'\x00\x00\x00\x00\x00\x00',  # 6-byte gateway info field
+# }
+```
+
+---
+
+### Time synchronisation
+
+Two independent paths are available:
+
+- **MAC DeviceTimeReq** (LoRaWAN 1.0.3+). Piggy-backed on the next uplink. Simpler; needed as a prerequisite for Class B.
+- **Clock Sync application package** (LoRa-Alliance v1.0.0, port 202). Sends its own uplink; also handles periodic re-sync and provides drift estimation.
+
+Both update the same internal `network_time_gps` snapshot, so `on_time_sync(cb)` and `network_time()` / `synced_time()` work identically regardless of which path caused the sync.
+
+#### `lw.request_device_time()`
+
+Queues an MLME DeviceTimeReq. Does **not** transmit — the request piggy-backs on the next uplink.
+
+```python
+lw.request_device_time()
+lw.send(b"")                # carries the DeviceTimeReq over the air
+# after RX window closes:
+print(lw.network_time())    # → GPS epoch seconds, or None if no answer yet
+```
+
+#### `lw.network_time()` → `int | None`
+
+Returns the GPS epoch seconds captured at the moment of the last sync, or `None` if time has never been synced.
+
+#### `lw.synced_time()` → `int | None`
+
+Returns the *live* corrected GPS epoch seconds (advances with the local clock between syncs). Returns `None` if no sync has happened yet.
+
+GPS epoch = Unix epoch − 315964800 s (Jan 6 1980). Add this offset back to convert to Unix time.
+
+#### `lw.on_time_sync(callback)` / `lw.on_time_sync(None)`
+
+Registers a callback fired on every successful sync. Callback receives the GPS epoch seconds as a single int.
+
+#### `lw.clock_sync_enable()` → `bool`
+
+Registers the `LmhpClockSync` application package (port 202). Returns `True` on success. Must be called once; safe to call before `join_otaa()`.
+
+#### `lw.clock_sync_request()`
+
+Sends an `AppTimeReq` on port 202 (which also piggy-backs a MAC DeviceTimeReq). Unlike `request_device_time()`, this **does transmit an uplink** — no follow-up `send()` is required. Raises `RuntimeError` if the device is not joined or the package has not been enabled.
+
+---
+
+### Link quality
+
+#### `lw.link_check()` → `dict | None`
+
+Queues an MLME LinkCheckReq (piggy-backs on the next uplink). Returns the most recent `LinkCheckAns` as `{"margin": N, "gw_count": N}`, or `None` if no answer has been received yet.
+
+Typical two-cycle pattern:
+
+```python
+lw.link_check()               # queue the request
+lw.send(b"")                  # carries LinkCheckReq
+result = lw.link_check()      # read the answer after RX window closes
+if result:
+    print(f"margin={result['margin']} dB, seen by {result['gw_count']} gateways")
+```
+
+---
+
+### LoRaWAN 1.1 rejoin
+
+#### `lw.rejoin(type=0)`
+
+Sends a ReJoin-request frame. Only meaningful on LoRaWAN 1.1. Raises `RuntimeError` if not joined, `ValueError` if `type` is outside 0–2.
+
+- `type=0`: announce presence; network may refresh session keys.
+- `type=1`: periodic rejoin, carries DevEUI+JoinEUI; a Join-Accept may follow.
+- `type=2`: request session-key refresh.
+
+Unlike `link_check()` / `request_device_time()` (piggy-back), a rejoin is itself an uplink — no follow-up `send()` is required.
+
+---
+
+### Multicast
+
+Up to 4 multicast groups (indices 0–3) can be active simultaneously. Multicast frames are received on either the Class C continuous RX window or the Class B ping slots, depending on the group's RX params.
+
+#### `lw.multicast_add(group, addr, mc_nwk_s_key, mc_app_s_key, *, f_count_min=0, f_count_max=0xFFFFFFFF)`
+
+Provisions a local multicast group. Keys must be supplied out-of-band (shared with the network server). Use `remote_multicast_enable()` below for server-driven provisioning.
+
+```python
+lw.multicast_add(
+    group=0,
+    addr=0x11223344,
+    mc_nwk_s_key=bytes.fromhex("01" * 16),
+    mc_app_s_key=bytes.fromhex("02" * 16),
+    f_count_min=0,
+    f_count_max=0xFFFFFFFF,
+)
+```
+
+#### `lw.multicast_rx_params(group, device_class, frequency, datarate, *, periodicity=0)`
+
+Configures the multicast RX window. `device_class` must be `CLASS_B` or `CLASS_C`. `periodicity` is only used for Class B (0–7 → 2^N seconds).
+
+```python
+# Class C multicast — continuous listen on 869.525 MHz / SF9
+lw.multicast_rx_params(
+    group=0,
+    device_class=lorawan.CLASS_C,
+    frequency=869525000,
+    datarate=lorawan.DR_3,
+)
+
+# Class B multicast — ping slot every 32 s
+lw.multicast_rx_params(
+    group=0,
+    device_class=lorawan.CLASS_B,
+    frequency=869525000,
+    datarate=lorawan.DR_3,
+    periodicity=5,
+)
+```
+
+#### `lw.multicast_remove(group)`
+
+Removes a group and clears its crypto state.
+
+#### `lw.multicast_list()` → `list[dict]`
+
+Returns the active groups with their metadata. RX-param keys (`device_class`, `frequency`, `datarate`, `periodicity`) are only present after `multicast_rx_params()` has been called.
+
+#### `lw.remote_multicast_enable()` → `bool`
+
+Registers the `LmhpRemoteMcastSetup` package (port 200). After this, the network server can provision groups remotely via `McGroupSetupReq` / `McGroupClassCSessionReq` / `McGroupClassBSessionReq` — no further Python glue required. The package drives the class switch automatically when a session starts.
+
+---
+
+### Fragmentation (FUOTA)
+
+Reassembles a firmware image delivered via multicast, with recovery of up to `redundancy` fragments via Reed–Solomon.
+
+#### `lw.fragmentation_enable(buffer_size, *, on_progress=None, on_done=None)`
+
+Registers `LmhpFragmentation` (port 201) and allocates a flat RAM reassembly buffer.
+
+- `on_progress(counter, nb, size, lost)` — fragment counter, total fragments, fragment size (bytes), fragments lost so far. Called with a single 4-tuple.
+- `on_done(status, size)` — `status=0` means success; `status>0` is the number of unrecoverable missing fragments. Called with a single 2-tuple.
+
+```python
+def on_progress(info):
+    n, total, sz, lost = info
+    print(f"frag {n}/{total} size={sz} lost={lost}")
+
+def on_done(info):
+    status, size = info
+    if status == 0:
+        data = lw.fragmentation_data()[:size]
+        print(f"FUOTA complete: {size} bytes")
+    else:
+        print(f"FUOTA incomplete: {status} fragments missing")
+
+lw.fragmentation_enable(buffer_size=32 * 1024,
+                        on_progress=on_progress,
+                        on_done=on_done)
+```
+
+#### `lw.fragmentation_data()` → `bytes | None`
+
+Returns the reassembled buffer (full size — slice down to the `size` reported by `on_done`). Returns `None` if fragmentation was never enabled.
+
+---
+
 ### Module-level
 
 #### `lorawan.version()` → `str`
 
-Returns the module version string, e.g. `'0.6.0'`.
+Returns the module version string, e.g. `'0.11.0'`.
+
+#### `lorawan.test_hal()` → `dict`
+
+Low-level HAL smoke test (SPI reg 0x42 probe + 200 ms timer). Useful for bring-up on unfamiliar hardware before calling `LoRaWAN()`.
 
 ---
 
@@ -303,8 +649,8 @@ lorawan.V1_1    # LoRaWAN 1.1   — separate NwkKey/AppKey, two-key MIC
 
 # Device classes
 lorawan.CLASS_A  # Class A — uplink-triggered RX windows (default)
-lorawan.CLASS_B  # Class B — scheduled ping slots (Phase 5)
-lorawan.CLASS_C  # Class C — continuous RX2 (Phase 5)
+lorawan.CLASS_B  # Class B — scheduled ping slots
+lorawan.CLASS_C  # Class C — continuous RX2
 
 # Data rates (EU868): higher index = higher SF = longer range, slower
 lorawan.DR_0   # SF12 / 125 kHz — maximum range
@@ -313,99 +659,32 @@ lorawan.DR_2   # SF10 / 125 kHz
 lorawan.DR_3   # SF9  / 125 kHz
 lorawan.DR_4   # SF8  / 125 kHz
 lorawan.DR_5   # SF7  / 125 kHz — maximum throughput
+
+# Beacon states (first arg to on_beacon callback tuple)
+lorawan.BEACON_ACQUISITION_OK
+lorawan.BEACON_ACQUISITION_FAIL
+lorawan.BEACON_LOCKED
+lorawan.BEACON_NOT_FOUND
+lorawan.BEACON_LOST
 ```
 
 ---
 
-## Raw LoRa — `tbeam` module
-
-The frozen `tbeam` module provides hardware auto-detection and access to the raw LoRa physical layer (MicroPython's `lora-sx127x` / `lora-sx126x` drivers). This is **completely separate** from the LoRaWAN MAC stack — no join, no frame counters, just raw RF packets.
-
-> **Important:** `tbeam.lora_modem()` and `lorawan.LoRaWAN()` both own the SPI bus and the radio hardware. They are mutually exclusive — do not use both at the same time. Reset the board to switch between them.
-
-### Hardware detection
-
-```python
-import tbeam
-
-hw = tbeam.detect()
-# HardwareInfo(radio='sx1262', pmu='axp192', irq=33, busy=32,
-#              gps_rx=34, gps_tx=12, oled=False)
-
-hw.radio    # 'sx1276' or 'sx1262'
-hw.pmu      # 'axp192', 'axp2101', or None (v0.7)
-hw.irq_pin  # radio IRQ GPIO
-hw.busy_pin # SX1262 BUSY GPIO, or None for SX1276
-hw.gps_rx   # GPS UART RX pin (ESP32 side)
-hw.gps_tx   # GPS UART TX pin (ESP32 side)
-hw.has_oled # True if SSD1306 found on I2C
-```
-
-`detect()` probes SPI, I2C, and optionally the GPS UART. Cache the result if calling multiple times — it takes 2–4 s on the first call.
-
-### Raw LoRa TX/RX
-
-```python
-import tbeam
-
-hw  = tbeam.detect()
-lm  = tbeam.lora_modem(hw)   # SX1276 or SX1262 SyncModem
-
-# Configure the radio (all fields optional — only set what changes)
-lm.configure({
-    "freq_khz":    868100,  # frequency in kHz
-    "sf":          7,       # spreading factor 7–12
-    "bw":          "125",   # bandwidth in kHz: "125", "250", "500"
-    "coding_rate": 5,       # 5=4/5, 6=4/6, 7=4/7, 8=4/8
-    "output_power": 14,     # TX power in dBm (SX1276 PA_BOOST: 2–20; SX1262: 2–22)
-    "preamble_len": 8,      # preamble symbols
-    "crc_en":      True,    # CRC on packet
-    "implicit_header": False,
-})
-
-# Transmit
-lm.send(b"hello world")
-
-# Receive — blocks up to timeout_ms milliseconds, returns bytes or None
-pkt = lm.recv(timeout_ms=5000)
-if pkt:
-    print("rx:", pkt, "rssi:", lm.last_rssi)
-```
-
-`lora_modem()` handles SX1262-specific initialisation automatically (DIO3 TCXO at 1.8V, DIO2 RF switch).
-
-### Other `tbeam` helpers
-
-```python
-# GPS UART (NEO-6M / NEO-M8N)
-uart = tbeam.gps_uart(hw)          # returns machine.UART, baudrate=9600
-line = uart.readline()
-
-# I2C bus (PMU, OLED, sensors)
-i2c = tbeam.i2c_bus()              # returns machine.I2C at 400 kHz
-
-# Low-level SPI + pin access (for custom driver use)
-spi  = tbeam.lora_spi(baudrate=10_000_000)
-pins = tbeam.lora_pins(hw)         # (cs, irq, rst) or (cs, irq, rst, busy)
-```
-
----
-
-## Examples
+## Usage patterns
 
 ### OTAA sensor node (TTN, standard setup)
 
 ```python
 import lorawan
 
-lw = lorawan.LoRaWAN(region=lorawan.EU868)
+lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_3)
 
 try:
     lw.nvram_restore()
 except OSError:
     pass
 
-if not lw.joined:
+if not lw.joined():
     lw.join_otaa(
         dev_eui=bytes.fromhex("70B3D57ED0000000"),
         join_eui=bytes.fromhex("0000000000000000"),
@@ -422,7 +701,7 @@ lw.nvram_save()
 ```python
 import lorawan
 
-lw = lorawan.LoRaWAN(region=lorawan.EU868)
+lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_3)
 
 try:
     lw.nvram_restore()
@@ -456,27 +735,22 @@ lw.tx_power(22)   # hardware override (SX1262 only; SX1276 caps at 20)
 lw.tx_power()     # → current value in dBm
 ```
 
-### Standard LoRaWAN network (non-TTN, RX2 DR_0)
+### Callbacks (async pattern)
 
 ```python
 import lorawan
 
-# TTN uses RX2 DR_3 (SF9). Standard LoRaWAN EU868 uses DR_0 (SF12).
-lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_0)
-```
+lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_3)
+# ... join ...
 
-### LoRaWAN 1.1 OTAA
+def on_downlink(pkt):
+    data, port, rssi, snr, mc = pkt
+    print(f"rx port={port} rssi={rssi} snr={snr} mcast={mc}: {data}")
 
-```python
-import lorawan
+lw.on_rx(on_downlink)
+lw.on_tx_done(lambda ok: print("tx ack:", ok))
 
-lw = lorawan.LoRaWAN(region=lorawan.EU868, lorawan_version=lorawan.V1_1)
-lw.join_otaa(
-    dev_eui=bytes.fromhex("70B3D57ED0000000"),
-    join_eui=bytes.fromhex("0000000000000000"),
-    app_key=bytes.fromhex("00000000000000000000000000000000"),
-    nwk_key=bytes.fromhex("11111111111111111111111111111111"),
-)
+lw.send(b"ping", confirmed=True)
 ```
 
 ### Non-T-Beam hardware (custom pins)
@@ -496,18 +770,59 @@ lw = lorawan.LoRaWAN(
 )
 ```
 
-### Callbacks (async pattern)
+---
+
+## Raw LoRa — `tbeam` module
+
+The frozen `tbeam` module provides hardware auto-detection and access to the raw LoRa physical layer (MicroPython's `lora-sx127x` / `lora-sx126x` drivers). This is **completely separate** from the LoRaWAN MAC stack — no join, no frame counters, just raw RF packets.
+
+> **Important:** `tbeam.lora_modem()` and `lorawan.LoRaWAN()` both own the SPI bus and the radio hardware. They are mutually exclusive — do not use both at the same time. Reset the board to switch between them.
+
+### Hardware detection
 
 ```python
-import lorawan
+import tbeam
 
-lw = lorawan.LoRaWAN(region=lorawan.EU868)
-# ... join ...
+hw = tbeam.detect()
+# HardwareInfo(radio='sx1262', pmu='axp192', irq=33, busy=32,
+#              gps_rx=34, gps_tx=12, oled=False)
+```
 
-lw.on_rx(lambda pkt: print("downlink:", pkt))
-lw.on_tx_done(lambda ok: print("tx ack:", ok))
+`detect()` probes SPI, I2C, and optionally the GPS UART. Cache the result if calling multiple times — it takes 2–4 s on the first call.
 
-lw.send(b"ping", confirmed=True)
+### Raw LoRa TX/RX
+
+```python
+import tbeam
+
+hw  = tbeam.detect()
+lm  = tbeam.lora_modem(hw)   # SX1276 or SX1262 SyncModem
+
+lm.configure({
+    "freq_khz":    868100,
+    "sf":          7,
+    "bw":          "125",
+    "coding_rate": 5,
+    "output_power": 14,
+    "preamble_len": 8,
+    "crc_en":      True,
+    "implicit_header": False,
+})
+
+lm.send(b"hello world")
+
+pkt = lm.recv(timeout_ms=5000)
+if pkt:
+    print("rx:", pkt, "rssi:", lm.last_rssi)
+```
+
+### Other `tbeam` helpers
+
+```python
+uart = tbeam.gps_uart(hw)          # machine.UART, 9600 baud
+i2c  = tbeam.i2c_bus()             # machine.I2C at 400 kHz
+spi  = tbeam.lora_spi(baudrate=10_000_000)
+pins = tbeam.lora_pins(hw)         # (cs, irq, rst) or (cs, irq, rst, busy)
 ```
 
 ---
@@ -522,17 +837,23 @@ lw.send(b"ping", confirmed=True)
 
 **SPI bus exclusivity.** The HAL owns the SPI bus exclusively. Do not create a `machine.SPI` instance on the same bus while the LoRaWAN stack is running.
 
-**TX power hardware maximums.** The SX1262 outputs up to +22 dBm; the SX1276 (PA_BOOST) up to +20 dBm. Both are below the EU868 regulatory EIRP limit of 16 dBm. Going above 16 dBm requires a hardware TX power override (see `tx_power()` above) and is the user's responsibility. Reaching +30 dBm requires an external PA (e.g. Ebyte E22-900M30S module); the software hook point is `SX126xAntSwOn()`/`SX126xAntSwOff()` in `sx126x_board.c`.
+**TX power hardware maximums.** The SX1262 outputs up to +22 dBm; the SX1276 (PA_BOOST) up to +20 dBm. Both are well above the EU868 regulatory EIRP limit of 16 dBm. Going above 16 dBm requires a hardware TX-power override (see `tx_power()` above) and is the user's responsibility. Reaching +30 dBm requires an external PA (e.g. Ebyte E22-900M30S module); the software hook point is `SX126xAntSwOn()` / `SX126xAntSwOff()` in `sx126x_board.c`.
 
-**RX2 default.** TTN EU868 uses 869.525 MHz / DR_3 (SF9). Standard LoRaWAN specifies DR_0 (SF12) on the same frequency. Pass `rx2_dr=lorawan.DR_0` for non-TTN networks.
+**RX2 default.** The MAC uses the region's `PHY_DEF_RX2` unless overridden via `rx2_dr=` / `rx2_freq=`. TTN EU868 wants `rx2_dr=DR_3` (SF9) — 869.525 MHz is already the region default. Standard LoRaWAN specifies DR_0 (SF12) on the same frequency.
 
 ---
 
 ## Project status
 
-v0.6.0. Phase 4 complete (ABP, OTAA, uplink/downlink, confirmed messages, ADR, NVS persistence). Phase 5 in progress: runtime pin config, LoRaWAN version selection, configurable RX2 and TX power. Class C, Device Time, Class B beacons, and multicast planned for Sessions 12–14.
+**v0.11.0.** Phase 1–5 of the roadmap are complete end-to-end on hardware:
 
-See [TODO.md](TODO.md) for the development roadmap and [CLAUDE.md](../CLAUDE.md) for project context including hardware constants and FreeRTOS pitfalls.
+- Phase 1: T-Beam board definition (all variants, runtime auto-detect).
+- Phase 2: USER_C_MODULE skeleton.
+- Phase 3: ESP32 HAL (GPIO, SPI, timers, board).
+- Phase 4: OTAA/ABP, uplink/downlink, confirmed messages, ADR, NVS persistence.
+- Phase 5: runtime pin config, LoRaWAN 1.1, RX2 / TX-power / antenna-gain control, Class C, EU433, DeviceTimeReq, LinkCheckReq, ReJoin, Clock Sync package, Class B (beacon + ping slots), multicast (local and remote), fragmentation (FUOTA).
+
+See [TODO.md](TODO.md) for the development roadmap and per-session notes. See [CLAUDE.md](../CLAUDE.md) for project context including hardware constants and FreeRTOS pitfalls.
 
 ## Architecture
 
@@ -540,7 +861,8 @@ See [TODO.md](TODO.md) for the development roadmap and [CLAUDE.md](../CLAUDE.md)
 lorawan-module/
 ├── micropython.cmake       build entry point (INTERFACE library)
 ├── bindings/
-│   └── modlorawan.c        Python bindings + FreeRTOS task
+│   ├── modlorawan.c        Python bindings + FreeRTOS task
+│   └── lmhandler_shim.c    minimal LmHandler adapter for app-layer packages
 ├── hal/
 │   ├── esp32_gpio.c        GPIO (ISR, edge interrupt)
 │   ├── esp32_spi.c         SPI master (ESP-IDF spi_master)
@@ -552,16 +874,18 @@ lorawan-module/
 │   ├── sx1276_radio_wrapper.c  symbol isolation (dual-radio build)
 │   ├── sx126x_radio_wrapper.c
 │   ├── radio_select.c      runtime Radio vtable selection
-│   └── pin_config.c        runtime pin config + TX power override
+│   └── pin_config.c        runtime pin config + TX-power override
 ├── config/
 │   └── lorawan_config.h    T-Beam defaults, region flags
+├── examples/               see examples/README.md
 └── loramac-node/           Semtech LoRaMAC-node v4.7.0 (copied sources)
-    ├── src/mac/            LoRaMac.c, regions
+    ├── src/mac/            LoRaMac.c, regions, LoRaMacClassB.c
     ├── src/radio/          SX1276, SX126x drivers
-    └── src/peripherals/    soft-se (AES, CMAC)
+    ├── src/peripherals/    soft-se (AES, CMAC)
+    └── src/apps/.../packages/   LmhpClockSync, LmhpRemoteMcastSetup, LmhpFragmentation
 ```
 
-The LoRaWAN MAC runs in a dedicated FreeRTOS task on CPU1 (priority 6, 8 KB stack). Python communicates via a command queue and event group. All `mp_printf` / MicroPython calls are confined to `mp_sched_schedule` trampolines running on the Python thread.
+The LoRaWAN MAC runs in a dedicated FreeRTOS task on CPU1 (priority 6, 8 KB stack). Python communicates via a command queue and event group. All `mp_printf` / MicroPython object allocation is confined to `mp_sched_schedule` trampolines running on the Python thread.
 
 ## Related repositories
 
