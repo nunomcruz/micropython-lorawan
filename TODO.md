@@ -341,7 +341,7 @@ The reason back-to-back `send()` calls *appear* to ignore the duty cycle is a ha
 - [x] `send(..., timeout=...)` — `timeout` kwarg added. Default 120 s (covers a duty-cycled DR_0 uplink in one call); `timeout=None` blocks until TX completes via `portMAX_DELAY`; non-positive ints also map to "wait forever" so user code that does `timeout=0` does not silently get the old 10 s behaviour. Same `RuntimeError("send timeout")` on cap; the MAC may still have the frame queued internally and emit it later (`tx_counter` advances).
 - [x] `lw.duty_cycle([enabled])` — getter returns the cached `Nvm.MacGroup2.DutyCycleOn` (read at init via `MIB_NVM_CTXS` and after `nvram_restore()`). Setter dispatches `CMD_SET_PARAMS` type 4 → `LoRaMacTestSetDutyCycleOn(bool)` (no `MIB_CHANNELS_DUTY_CYCLE` exists in v4.7.0; the test API is the only public flip). On by default for EU868/EU433 region defaults; disabling logs a non-conformance warning.
 - [x] `lw.time_until_tx()` — returns ms until the next TX is allowed. Reads `last_dc_wait_ms` captured from `mcps.ReqReturn.DutyCycleWaitTime` after every `LoRaMacMcpsRequest` and subtracts `esp_timer_get_time()` elapsed since. Returns 0 before the first send, when duty cycle is off, or once the wait window has elapsed.
-- [ ] README — document the current duty-cycle behaviour (enforced, async via `TxDelayedTimer`, why pre-Session-16 `send()` 10 s timeouts appeared suspicious) alongside the new `timeout` kwarg, `duty_cycle()` and `time_until_tx()`.
+- [x] README — document the current duty-cycle behaviour (enforced, async via `TxDelayedTimer`, why pre-Session-16 `send()` 10 s timeouts appeared suspicious) alongside the new `timeout` kwarg, `duty_cycle()` and `time_until_tx()`. New "Duty cycle" section + `send()` signature updated with `timeout=120` default; `timeout=None` documented as "block forever".
 
 #### Channel management (optional — needed if anyone deploys outside TTN defaults)
 
@@ -356,10 +356,19 @@ The reason back-to-back `send()` calls *appear* to ignore the duty cycle is a ha
 
 #### Documentation
 
-- [ ] README — new "Lifecycle" section covering `deinit()` and the soft-reset caveat.
-- [ ] README — note the duty-cycle default and how to disable for bench testing.
+- [x] README — new "Lifecycle" section covering `deinit()`, the soft-reset caveat (GC sweep + finaliser pattern so `Ctrl-D` is safe) and the `with lorawan.LoRaWAN(...) as lw:` context manager.
+- [x] README — note the duty-cycle default and how to disable for bench testing. Covered in the new "Duty cycle" section: EU868/EU433 enforced by default, `TxDelayedTimer` explanation, `duty_cycle(False)` disable path with non-conformance warning for private-gateway use.
 - [x] Version bump 0.11.0 → 0.12.0 on lifecycle completion (lorawan.version() returns '0.12.0'). Compile clean, zero warnings; firmware 1644624 bytes.
 - [x] Version bump 0.12.0 → 0.13.0 on duty-cycle additions (`send(timeout=...)`, `duty_cycle()`, `time_until_tx()`). Compile clean, zero warnings; firmware 1645216 bytes (+592 B).
+
+### Session 17: Teardown ordering hardening (deinit safety)
+
+Follow-up to Session 16's hazard note ("An IRQ ISR firing mid-teardown will corrupt state"). Review of the `CMD_DEINIT` path found three subtle issues worth tightening before shipping the lifecycle story.
+
+- [x] DIO ISRs now deregistered **before** `LoRaMacDeInitialization()`. New `SX1276IoIrqDeInit()` / `SX126xIoIrqDeInit()` in the HAL board files call `GpioRemoveInterrupt` on DIO0/DIO1 (SX1276) or DIO1 (SX1262) only — SPI stays up so the MAC and the `lorawan_radio_sleep()` fallback can still command the radio. Called from the `CMD_DEINIT` handler as step 1. The `GpioRemoveInterrupt` inside `SX*IoDeInit` stays as an idempotent defensive no-op (see `esp32_gpio.c:84` — calling on an already-disabled pin is a no-op).
+- [x] Bounded-wait blindness: `lorawan_deinit` (Python side) now captures the return of `xEventGroupWaitBits(EVT_COMPLETED, ..., 2000 ms)`. On timeout it logs via `mp_printf` and returns **without** deleting `s_cmd_queue` / `s_rx_queue` / `s_events`. A small leak is strictly better than deleting primitives while the LoRaWAN task may still be dereferencing them.
+- [x] Rejected `eTaskGetState` polling as a "safer" alternative to the `vTaskDelay(10 ms)` that lets the idle task reclaim the task's TCB — the FreeRTOS implementation of `eTaskGetState` dereferences the handle directly and would UAF as soon as the idle task on CPU1 frees the TCB between polling iterations. The 10 ms delay stays, with a comment explaining why.
+- [x] Version bumped 0.15.0 → 0.16.0; compile clean, zero warnings; firmware 1645888 bytes (+192 B).
 
 ## Notes
 

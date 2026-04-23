@@ -204,14 +204,17 @@ Returns `True` if the device has an active session (ABP always returns `True` af
 
 ### Uplink
 
-#### `lw.send(data, *, port=1, confirmed=False, datarate=lorawan.DR_0)`
+#### `lw.send(data, *, port=1, confirmed=False, datarate=lorawan.DR_0, timeout=120)`
 
-Transmits an uplink frame. Blocks until TX is complete (includes waiting for RX1/RX2 windows — up to ~10 s). Raises `RuntimeError` on failure.
+Transmits an uplink frame. Blocks until TX is complete (includes waiting for RX1/RX2 windows) or until `timeout` seconds elapse. Raises `RuntimeError("send timeout")` on timeout.
+
+`timeout` defaults to 120 s so that a duty-cycle-deferred uplink on DR_0 completes in one call — see [Duty cycle](#duty-cycle) below. Pass `timeout=None` to block until TX completes (non-positive ints map to the same "wait forever" behaviour). The frame may still be queued inside the MAC after a timeout and transmitted later on its own — `tx_counter` advancing with no Python call in between is the tell-tale sign.
 
 ```python
 lw.send(b"hello")                              # unconfirmed, port 1, DR_0 (SF12)
 lw.send(b"ping", confirmed=True)               # confirmed uplink — waits for ACK
 lw.send(b"data", port=2, datarate=lorawan.DR_5) # SF7 — faster, shorter range
+lw.send(b"slow", timeout=None)                 # block until TX completes
 ```
 
 #### `lw.on_tx_done(callback)` / `lw.on_tx_done(None)`
@@ -338,6 +341,36 @@ lw.stats()
 #   'last_tx_ack': True,    # confirmed uplink: True if ACKed
 # }
 ```
+
+---
+
+### Duty cycle
+
+EU868 and EU433 enforce a regional duty cycle (typically 1 % air-time per band). The MAC honours this by default — `EU868_DUTY_CYCLE_ENABLED = 1` in the region file — and every uplink past the first is gated by the regional band timers.
+
+**Deferred uplinks.** When the MAC is duty-cycle restricted, `LoRaMacMcpsRequest()` still returns `LORAMAC_STATUS_OK` and schedules an internal `TxDelayedTimer` that fires when the band clears — typically tens of seconds on EU868 at low DR. The `send()` call blocks on `timeout` (default 120 s) while the frame waits inside the MAC. If the timeout elapses first, `send()` raises `RuntimeError("send timeout")` but the frame may still transmit later on its own — watch `stats()["tx_counter"]` advance without a corresponding Python call.
+
+To check how long until the next uplink is allowed:
+
+```python
+ms = lw.time_until_tx()       # 0 once the band is clear
+if ms:
+    time.sleep_ms(ms)
+lw.send(b"data")
+```
+
+#### `lw.duty_cycle([enabled])` → `bool | None`
+
+Getter/setter for the regional duty-cycle gate. **Disabling is non-conformant on public ISM bands** and intended only for bench testing on a private gateway you own. The setter logs a warning when called with `False`.
+
+```python
+lw.duty_cycle()        # → True on EU868 / EU433
+lw.duty_cycle(False)   # private gateway / bench only
+```
+
+#### `lw.time_until_tx()` → `int`
+
+Returns the milliseconds remaining until the next uplink is allowed. Derived from `DutyCycleWaitTime` captured on the most recent `send()`. Returns `0` before the first send, when duty cycle is disabled, or once the wait window has elapsed.
 
 ---
 
@@ -624,11 +657,50 @@ Returns the reassembled buffer (full size — slice down to the `size` reported 
 
 ---
 
+### Lifecycle
+
+The LoRaWAN stack owns a FreeRTOS task, the SPI bus, DIO interrupt handlers and an `esp_timer` — resources that live outside the MicroPython heap. Tearing them down cleanly matters whenever you want to re-create the object without a hard reset, or when the REPL's soft-reset (`Ctrl-D`) runs.
+
+#### `lw.deinit()`
+
+Ordered teardown, strict order: (1) deregister DIO ISRs first so no in-flight interrupt can dispatch into half-torn-down MAC state; (2) stop the MAC (`LoRaMacDeInitialization`, falling back to a radio sleep if a TX/RX is in flight — SPI is still up at this point so the sleep command reaches the radio); (3) drop LmHandler package registrations and any FUOTA buffer; (4) release the SPI bus, delete the `esp_timer` backing the MAC timer list, and let the LoRaWAN task self-delete. Idempotent — safe to call twice. After `deinit()` a fresh `lorawan.LoRaWAN(...)` in the same REPL session works.
+
+If the MAC ever stalls past the 2 s bounded wait on teardown, the Python side logs a warning and leaves the internal command queue / rx queue / event group in place rather than free them while the task may still be using them — a small leak is strictly preferable to a use-after-free.
+
+```python
+lw = lorawan.LoRaWAN(region=lorawan.EU868)
+# ...
+lw.deinit()
+lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_3)   # now safe
+```
+
+#### Soft-reset safety
+
+`Ctrl-D` in the REPL triggers a MicroPython soft-reset: the VM heap is swept, `__main__` is re-imported, but the ESP32 port does **not** restart the MCU. Without a hook, the FreeRTOS task keeps running against a freed `lorawan_obj_t` — the next DIO interrupt or timer callback dereferences garbage and crashes.
+
+`deinit()` is registered as `__del__` on the type, and the `lorawan_obj_t` is allocated with a finaliser, so the GC sweep that runs during soft-reset (`gc_sweep_all()` in the ESP32 port's `main.c`) fires `__del__ → deinit()` automatically. This matches the pattern used by `machine.I2S`, `machine.I2CTarget`, `ssl` etc. No user action required — `Ctrl-D` is safe.
+
+Hard-reset (power cycle, `machine.reset()`) is always safe: the radio comes up from POR.
+
+#### Context manager
+
+`__enter__` returns `self`; `__exit__` calls `deinit()` regardless of exception state. Use `with` when you want teardown guaranteed at scope exit:
+
+```python
+with lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_3) as lw:
+    lw.nvram_restore() if lw.joined() else lw.join_otaa(...)
+    lw.send(b"data")
+    lw.nvram_save()
+# lw.deinit() has run here — task is gone, SPI bus is free
+```
+
+---
+
 ### Module-level
 
 #### `lorawan.version()` → `str`
 
-Returns the module version string, e.g. `'0.11.0'`.
+Returns the module version string, e.g. `'0.16.0'`.
 
 #### `lorawan.test_hal()` → `dict`
 
@@ -845,7 +917,7 @@ pins = tbeam.lora_pins(hw)         # (cs, irq, rst) or (cs, irq, rst, busy)
 
 ## Project status
 
-**v0.11.0.** Phase 1–5 of the roadmap are complete end-to-end on hardware:
+**v0.16.0.** Phase 1–5 of the roadmap are complete end-to-end on hardware:
 
 - Phase 1: T-Beam board definition (all variants, runtime auto-detect).
 - Phase 2: USER_C_MODULE skeleton.
