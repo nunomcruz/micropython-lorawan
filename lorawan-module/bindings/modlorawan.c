@@ -30,14 +30,20 @@
 
 #include "radio_select.h"
 #include "pin_config.h"
-#include "sx1276-board.h"
-#include "sx126x-board.h"
-#include "sx1276/sx1276.h"
 #include "timer.h"
 #include "board.h"
 #include "lorawan_config.h"
 #include "LoRaMac.h"
 #include "region/RegionEU868.h"
+
+// Note: we deliberately do NOT include sx1276-board.h / sx126x-board.h /
+// the chip-level sx1276.h / sx126x.h here.  Those headers define several
+// macros (REG_LR_SYNCWORD, LORA_MAC_PRIVATE_SYNCWORD, LORA_MAC_PUBLIC_SYNCWORD,
+// RADIO_WAKEUP_TIME, REG_OCP, REG_LR_PAYLOADLENGTH) with chip-specific values
+// that collide when both headers land in the same translation unit.
+// The three entry points modlorawan.c actually needs — SX1276 probe,
+// SX126x bring-up, and the chip-agnostic Radio table selection — are all
+// exposed via hal/radio_select.h.
 
 // ---- Constants ----
 
@@ -1043,14 +1049,11 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
 
     // Radio detection: bring up SX1276 HAL (GPIO + SPI), reset, read reg 0x42.
     // SX1276 version register returns 0x12; anything else → SX1262.
-    SX1276IoInit();
-    SX1276Reset();
-    uint8_t reg42 = SX1276Read(0x42);
+    uint8_t reg42 = lorawan_radio_probe_reg42();
     bool is_sx1276 = radio_forced ? is_sx1276_forced : (reg42 == 0x12);
 
     if (!is_sx1276) {
-        sx126x_spi_mutex_init();
-        SX126xIoInit();
+        lorawan_radio_init_sx126x();
     }
 
     self->is_sx1276 = is_sx1276;
@@ -1562,9 +1565,7 @@ static void test_timer_cb(void *ctx) {
 }
 
 static mp_obj_t lorawan_test_hal(void) {
-    SX1276IoInit();
-    SX1276Reset();
-    uint8_t reg42     = SX1276Read(0x42);
+    uint8_t reg42     = lorawan_radio_probe_reg42();
     bool    is_sx1276 = (reg42 == 0x12);
 
     mp_printf(&mp_plat_print,

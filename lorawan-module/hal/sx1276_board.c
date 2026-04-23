@@ -10,6 +10,7 @@
 #include "sx1276/sx1276.h"
 #include "sx1276-board.h"
 #include "radio.h"
+#include "radio_select.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -187,3 +188,14 @@ const struct Radio_s Radio_SX1276 = {
     NULL,  // RxBoosted  — SX126x only
     NULL,  // SetRxDutyCycle — SX126x only
 };
+
+// Auto-detect helper: bring up the SX1276 HAL and read the version register.
+// Lives here so callers can auto-detect without having to include sx1276.h
+// (which clashes with sx126x.h on a handful of macros that differ between
+// the two chips).
+uint8_t lorawan_radio_probe_reg42(void)
+{
+    SX1276IoInit();
+    SX1276Reset();
+    return SX1276Read(0x42);
+}

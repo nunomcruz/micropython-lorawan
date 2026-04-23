@@ -10,6 +10,7 @@
 
 #include "sx126x/sx126x.h"
 #include "sx126x-board.h"
+#include "radio_select.h"
 
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -30,6 +31,15 @@ static SemaphoreHandle_t s_spi_mutex = NULL;
 void sx126x_spi_mutex_init(void)
 {
     s_spi_mutex = xSemaphoreCreateRecursiveMutex();
+}
+
+// Bring up the SX126x HAL.  Wrapper exposed via radio_select.h so callers
+// can bring up the chip without including sx126x-board.h (which clashes
+// with sx1276.h on chip-specific register/syncword macros).
+void lorawan_radio_init_sx126x(void)
+{
+    sx126x_spi_mutex_init();
+    SX126xIoInit();
 }
 
 static inline void spi_lock(void)
