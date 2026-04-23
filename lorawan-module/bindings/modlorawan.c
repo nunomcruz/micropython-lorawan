@@ -432,7 +432,7 @@ static mp_obj_t lorawan_rx_trampoline(mp_obj_t arg) {
     items[2] = mp_obj_new_int(pkt.rssi);
     items[3] = mp_obj_new_int(pkt.snr);
     items[4] = mp_obj_new_bool(pkt.multicast);
-    mp_call_function_1(s_lora_obj->rx_callback, mp_obj_new_tuple(5, items));
+    mp_call_function_n_kw(s_lora_obj->rx_callback, 5, 0, items);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_rx_trampoline_obj, lorawan_rx_trampoline);
@@ -2510,16 +2510,17 @@ static mp_obj_t lorawan_recv(size_t n_args, const mp_obj_t *pos_args,
         return mp_const_none;
     }
 
-    mp_obj_t items[4];
+    mp_obj_t items[5];
     items[0] = mp_obj_new_bytes(pkt.data, pkt.len);
     items[1] = mp_obj_new_int(pkt.port);
     items[2] = mp_obj_new_int(pkt.rssi);
     items[3] = mp_obj_new_int(pkt.snr);
-    return mp_obj_new_tuple(4, items);
+    items[4] = mp_obj_new_bool(pkt.multicast);
+    return mp_obj_new_tuple(5, items);
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_recv_obj, 1, lorawan_recv);
 
-// on_rx(callback) — register callback(data, port, rssi, snr) for incoming downlinks.
+// on_rx(callback) — register callback(data, port, rssi, snr, multicast) for incoming downlinks.
 // Pass None to deregister. Do not use together with recv() on the same object.
 static mp_obj_t lorawan_on_rx(mp_obj_t self_in, mp_obj_t cb) {
     lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
