@@ -351,7 +351,8 @@ The reason back-to-back `send()` calls *appear* to ignore the duty cycle is a ha
 
 #### Stats expansion
 
-- [ ] Extend `stats()` dict with `last_tx_dr`, `last_tx_freq`, `last_tx_power` (snapshot at TX start from `McpsConfirm` / MIB). Currently the user can track DR via `datarate()` but that's the *next* DR, not the last TX DR post-ADR.
+- [x] Extend `stats()` dict with `last_tx_dr`, `last_tx_freq`, `last_tx_power` (snapshot captured in `mcps_confirm` from `McpsConfirm.Datarate / TxPower / Channel`). The `Channel` field is an index into the region channel list — resolved to Hz via `MIB_CHANNELS` inside `mcps_confirm` (task context, safe). `last_tx_power` is converted from MAC index to dBm via `tx_power_to_dbm()` for consistency with the live `tx_power()` getter. Distinct from the live `datarate()` / `tx_power()` getters: those report the *next* TX values after any ADR adjustment in the same confirm, which can mask what was just sent. All three default to 0 before the first TX (mirrors the existing `tx_counter == 0` convention).
+- [x] Version bumped 0.14.0 → 0.15.0; compile clean, zero warnings; firmware 1645696 bytes (+192 B).
 
 #### Documentation
 

@@ -262,6 +262,14 @@ typedef struct {
     uint32_t        tx_counter;
     uint32_t        tx_time_on_air;
     bool            last_tx_ack;    // confirmed uplink: true if network ACKed
+    // Snapshot of the parameters the MAC actually used for the most recent
+    // uplink, captured in mcps_confirm. Distinct from the live datarate() /
+    // tx_power() getters: those report the *next* TX values after any ADR
+    // adjustment in the same confirm, which can mask what was just sent.
+    // Zero before the first TX (mirrors the existing tx_counter convention).
+    int8_t          last_tx_dr;
+    int8_t          last_tx_power;  // MAC index (0=region max); converted to dBm in stats()
+    uint32_t        last_tx_freq;   // Hz; resolved from McpsConfirm.Channel via MIB_CHANNELS
     // Last downlink stats
     uint32_t        rx_counter;
     int16_t         rssi;
@@ -599,6 +607,21 @@ static void mcps_confirm(McpsConfirm_t *c) {
             s_lora_obj->tx_time_on_air = c->TxTimeOnAir;
             // AckReceived is only meaningful for MCPS_CONFIRMED frames.
             s_lora_obj->last_tx_ack    = c->AckReceived;
+
+            // Snapshot the params actually used for this TX. Datarate / TxPower
+            // come straight off the confirm; the Channel field is an index into
+            // the region channel list — resolve it to Hz via MIB_CHANNELS so
+            // Python sees a frequency, not an opaque slot number.
+            s_lora_obj->last_tx_dr    = (int8_t)c->Datarate;
+            s_lora_obj->last_tx_power = c->TxPower;
+            s_lora_obj->last_tx_freq  = 0;
+            MibRequestConfirm_t ch_mib;
+            ch_mib.Type = MIB_CHANNELS;
+            if (LoRaMacMibGetRequestConfirm(&ch_mib) == LORAMAC_STATUS_OK
+                && ch_mib.Param.ChannelList != NULL
+                && c->Channel < 16) {
+                s_lora_obj->last_tx_freq = ch_mib.Param.ChannelList[c->Channel].Frequency;
+            }
 
             // When ADR is on the MAC may have adjusted the DR after this TX.
             // Read it back so the Python datarate() getter stays accurate.
@@ -2396,6 +2419,15 @@ static mp_obj_t lorawan_stats(mp_obj_t self_in) {
                       mp_obj_new_int_from_uint(self->tx_time_on_air));
     mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_last_tx_ack),
                       mp_obj_new_bool(self->last_tx_ack));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_last_tx_dr),
+                      mp_obj_new_int(self->last_tx_dr));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_last_tx_freq),
+                      mp_obj_new_int_from_uint(self->last_tx_freq));
+    // Convert MAC index → dBm so this is consistent with tx_power(); zero
+    // before the first TX maps to region max, which is acceptable since
+    // tx_counter==0 already tells the caller no uplink has happened yet.
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_last_tx_power),
+                      mp_obj_new_int(tx_power_to_dbm(self->last_tx_power)));
     return d;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_stats_obj, lorawan_stats);
@@ -3362,7 +3394,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.14.0", 6);
+    return mp_obj_new_str("0.15.0", 6);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 
