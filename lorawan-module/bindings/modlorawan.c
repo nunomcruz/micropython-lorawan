@@ -3194,7 +3194,7 @@ static mp_obj_t lorawan_multicast_add(size_t n_args, const mp_obj_t *pos_args,
            ARG_fcnt_min, ARG_fcnt_max };
     static const mp_arg_t allowed[] = {
         { MP_QSTR_group,         MP_ARG_REQUIRED | MP_ARG_INT },
-        { MP_QSTR_addr,          MP_ARG_REQUIRED | MP_ARG_INT },
+        { MP_QSTR_addr,          MP_ARG_REQUIRED | MP_ARG_OBJ },
         { MP_QSTR_mc_nwk_s_key,  MP_ARG_REQUIRED | MP_ARG_OBJ },
         { MP_QSTR_mc_app_s_key,  MP_ARG_REQUIRED | MP_ARG_OBJ },
         { MP_QSTR_f_count_min,   MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = 0} },
