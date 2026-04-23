@@ -54,7 +54,7 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] Compile full HAL + both radio drivers — zero errors, zero warnings; firmware 1579 KB (both Radio tables now fully linked)
 - [x] Test SPI: read register 0x42 = 0x12 confirmed on T-Beam SX1276 hardware
 - [x] Test timer accuracy: 200ms timer fires within 500ms confirmed on hardware
-- [ ] Test on SX1262 board if available: BUSY pin reads, command interface  ← needs hardware
+- [x] Test on SX1262 board: BUSY pin reads, command interface, OTAA join, uplink, downlink — confirmed on T-Beam v1.1 SX1262/AXP192
 
 ## Phase 4 — Python Bindings (Sessions 7–10)
 
@@ -146,7 +146,7 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
       - Override and ADR mutually exclusive: setting override auto-disables ADR; enabling ADR clears override
       - Warning logged when override exceeds region regulatory limit
       - Version bumped to 0.6.0; compile clean — 1618 KB (+1 KB)
-- [ ] End-to-end SX1262 test: join, uplink, downlink, confirmed, persistence
+- [x] End-to-end SX1262 test: join, uplink, downlink, confirmed, persistence — fixed sleep/wakeup bug (SX126xWakeup must update operating_mode to STDBY_RC; recursive SPI mutex; ensure_awake() in all SPI functions)
 - [ ] Class C support (`request_class(CLASS_C)`, continuous RX2 window)
 - [ ] Implement `on_class_change(callback)` — confirmed class transitions
 - [ ] EU433 region support (enable REGION_EU433 in config)
