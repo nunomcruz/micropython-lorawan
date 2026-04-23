@@ -163,8 +163,8 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 - [x] EU433 region support (enable REGION_EU433 in config)
       - `REGION_EU433` compile def added to `micropython.cmake`; `RegionEU433.c` added to source list
       - `lorawan.EU433` module constant already exported (pre-existing)
-      - RX2 defaults made region-aware in `lorawan_make_new`: sentinel `-1` on `rx2_dr`/`rx2_freq` kwargs → EU868 uses TTN's 869.525 MHz/DR_3; EU433 uses 434.665 MHz/DR_0 (`EU433_RX_WND_2`); other regions skip the MIB override so the MAC's `PHY_DEF_RX2` applies
-      - `CMD_INIT` skips `MIB_RX2_CHANNEL`/`MIB_RX2_DEFAULT_CHANNEL` writes when `rx2_freq == 0` (sentinel)
+      - RX2 default simplified: `__init__` no longer forces any RX2 override. Without `rx2_dr`/`rx2_freq` kwargs, the MAC uses the region's `PHY_DEF_RX2` (standard LoRaWAN DR_0). TTN EU868 users must now pass `rx2_dr=DR_3, rx2_freq=869525000` explicitly. Partial overrides (only one of the two) raise `ValueError`
+      - `CMD_INIT` skips `MIB_RX2_CHANNEL`/`MIB_RX2_DEFAULT_CHANNEL` writes when `rx2_freq == 0` (no-override sentinel)
       - Known limitation: `tx_power_to_dbm`/`dbm_to_tx_power` helpers assume the EU868 EIRP table (max 16 dBm, step -2 dB). EU433 `DEFAULT_MAX_EIRP` is 12.15 dBm (see `RegionEU433.h:115`), so `lw.tx_power()` returns/accepts EU868 dBm values on EU433 hardware. Acceptable for now — region-accurate dBm↔index mapping is a future refactor
       - Compile clean — firmware 1584 KB (+2 KB for RegionEU433.c)
       - Hardware test: pending — requires EU433 radio and gateway
