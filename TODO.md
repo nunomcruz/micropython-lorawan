@@ -155,10 +155,11 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
       - Version 0.6.0 → 0.7.0; compile clean, zero warnings; firmware 1619 KB.
       - **RxC window fix**: on first test, class C switched OK but `recv(timeout=30)` returned None despite TTN queueing a confirmed downlink. Root cause: LoRaMAC-node v4.7.0 has a **separate** `RxCChannel` (used by the Class C continuous listen) alongside `Rx2Channel`. `MIB_RX2_CHANNEL` only writes `Rx2Channel`. In `SwitchClass(CLASS_C)`, `OpenContinuousRxCWindow()` recomputes the RX config from `RxCChannel.Datarate` — which defaults to `PHY_DEF_RX2_DR` = DR_0 (SF12) in EU868 — so the radio ends up listening at SF12 while TTN transmits on DR_3 (SF9). Fix: `CMD_INIT` now also writes `MIB_RXC_CHANNEL` and `MIB_RXC_DEFAULT_CHANNEL` with the same (freq, DR) as RX2.
       - Test: configure device as Class C on TTN, call `request_class(CLASS_C)`, schedule a downlink from TTN console and verify `recv()` gets it without a preceding uplink. Also test class persistence across reboot.
-- [ ] Configurable antenna gain (`antenna_gain` kwarg on `__init__`, default 0.0)
-      - Currently `EU868_DEFAULT_ANTENNA_GAIN = 2.15` in `RegionEU868.h` causes the MAC to subtract 2.15 from EIRP, so `tx_power()` reports 16 dBm but the radio only emits 13. With default 0.0, the radio emits the full EIRP.
-      - Implementation: add `antenna_gain` float kwarg to `__init__` (default 0.0); store in `lorawan_obj_t`; set `MIB_ANTENNA_GAIN` via `LoRaMacMibSetRequestConfirm` during init (after `LoRaMacInitialization`). Also expose as getter/setter: `lw.antenna_gain()` / `lw.antenna_gain(2.15)`.
-      - The MIB value is a `float`; `RegionCommonComputeTxPower()` in `RegionCommon.c:466` uses it as: `phyTxPower = floor(maxEirp - (index * 2) - antennaGain)`.
+- [x] Configurable antenna gain (`antenna_gain` kwarg on `__init__`, default 0.0)
+      - EU868 region default is 2.15 dBi (`EU868_DEFAULT_ANTENNA_GAIN` in `RegionEU868.h`), which makes the MAC under-drive the radio by 2.15 dB vs. the requested EIRP. With default 0.0 the radio emits the full EIRP (`tx_power()` index 0 → 16 dBm actually transmitted).
+      - `antenna_gain=<float>` kwarg on `__init__`; stored in `lorawan_obj_t.antenna_gain`. In `CMD_INIT` (after `LoRaMacStart`) both `MIB_ANTENNA_GAIN` and `MIB_DEFAULT_ANTENNA_GAIN` are set, so any `ResetMacParameters` keeps our value.
+      - Getter/setter `lw.antenna_gain()` / `lw.antenna_gain(2.15)`: setter dispatches through `CMD_SET_PARAMS` type 3 (extended the union with a `float` field) and updates both MIB slots. `nvram_restore()` syncs the Python cache from `MIB_ANTENNA_GAIN`.
+      - Version bumped 0.7.0 → 0.8.0; compile clean, firmware 1582 KB (no regression).
 - [ ] EU433 region support (enable REGION_EU433 in config)
 
 ### Session 12: Advanced MAC commands + time sync

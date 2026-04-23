@@ -5,7 +5,8 @@
 //                         datarate/adr/tx_power getters+setters.
 // Phase 5, Session 11:   runtime pin config; lorawan_version (1.0.4/1.1), rx2_dr/freq,
 //                         tx_power kwargs on __init__; nwk_key kwarg on join_otaa;
-//                         request_class / device_class / on_class_change (Class A <-> C).
+//                         request_class / device_class / on_class_change (Class A <-> C);
+//                         antenna_gain kwarg + getter/setter (MIB_ANTENNA_GAIN).
 // FreeRTOS task owns all MAC calls; Python thread communicates via queue + event group.
 
 #include <stdint.h>
@@ -110,13 +111,14 @@ typedef struct {
     bool     confirmed;
 } cmd_tx_t;
 
-// set_params.type: 0=ADR, 1=DR, 2=TX_POWER
+// set_params.type: 0=ADR, 1=DR, 2=TX_POWER, 3=ANTENNA_GAIN
 typedef struct {
     uint8_t type;
     union {
         bool   adr;
         int8_t dr;
         int8_t tx_power;
+        float  antenna_gain;
     };
 } cmd_set_params_t;
 
@@ -170,6 +172,11 @@ typedef struct {
     int8_t          channels_datarate;
     bool            adr_enabled;
     int8_t          channels_tx_power; // TX_POWER index (0=max); convert to/from dBm at API boundary
+    // Antenna gain in dBi. MAC subtracts this from EIRP when computing radio TX power:
+    //   radioTxPower = floor(maxEirp - txPowerIndex*2 - antennaGain)
+    // EU868 region default is 2.15 dBi; we default to 0.0 so the radio emits full EIRP
+    // unless the user explicitly declares a gain.
+    float           antenna_gain;
 } lorawan_obj_t;
 
 // ---- Static FreeRTOS state (one LoRaWAN instance per firmware) ----
@@ -546,6 +553,21 @@ static void lorawan_task(void *arg) {
                     LoRaMacMibSetRequestConfirm(&mib);
                 }
 
+                // Apply user-specified antenna gain (default 0.0 dBi).
+                // EU868 region default is 2.15 dBi, which causes the MAC to
+                // under-drive the radio by 2.15 dB relative to the requested EIRP.
+                // Set both the current and the "default" MIB so that any internal
+                // ResetMacParameters (e.g. on deactivation) keeps our value.
+                if (s_lora_obj) {
+                    mib.Type = MIB_ANTENNA_GAIN;
+                    mib.Param.AntennaGain = s_lora_obj->antenna_gain;
+                    LoRaMacMibSetRequestConfirm(&mib);
+
+                    mib.Type = MIB_DEFAULT_ANTENNA_GAIN;
+                    mib.Param.DefaultAntennaGain = s_lora_obj->antenna_gain;
+                    LoRaMacMibSetRequestConfirm(&mib);
+                }
+
                 // Cache initial MAC parameter values into the Python object.
                 if (s_lora_obj) {
                     mib.Type = MIB_ADR;
@@ -777,6 +799,12 @@ static void lorawan_task(void *arg) {
                     mib.Type = MIB_DEVICE_CLASS;
                     if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK)
                         s_lora_obj->device_class = mib.Param.Class;
+
+                    // Antenna gain was saved in MacGroup2.MacParams — sync the
+                    // Python-side cache so antenna_gain() returns the restored value.
+                    mib.Type = MIB_ANTENNA_GAIN;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK)
+                        s_lora_obj->antenna_gain = mib.Param.AntennaGain;
                 }
                 // Read FCntUp back from the MAC to confirm the Crypto group was
                 // restored (CRC matched).  If FCntUp==0 here, the CRC was wrong.
@@ -813,6 +841,16 @@ static void lorawan_task(void *arg) {
                     mib.Param.ChannelsTxPower = cmd.set_params.tx_power;
                     LoRaMacMibSetRequestConfirm(&mib);
                     if (s_lora_obj) s_lora_obj->channels_tx_power = cmd.set_params.tx_power;
+                    break;
+                case 3: // Antenna gain (current + default, so a subsequent
+                        // ResetMacParameters doesn't restore the region default)
+                    mib.Type = MIB_ANTENNA_GAIN;
+                    mib.Param.AntennaGain = cmd.set_params.antenna_gain;
+                    LoRaMacMibSetRequestConfirm(&mib);
+                    mib.Type = MIB_DEFAULT_ANTENNA_GAIN;
+                    mib.Param.DefaultAntennaGain = cmd.set_params.antenna_gain;
+                    LoRaMacMibSetRequestConfirm(&mib);
+                    if (s_lora_obj) s_lora_obj->antenna_gain = cmd.set_params.antenna_gain;
                     break;
                 default:
                     break;
@@ -935,6 +973,7 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
         ARG_spi_id, ARG_mosi, ARG_miso, ARG_sclk,
         ARG_cs, ARG_reset, ARG_irq, ARG_busy,
         ARG_lorawan_version, ARG_rx2_dr, ARG_rx2_freq, ARG_tx_power,
+        ARG_antenna_gain,
     };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_region,           MP_ARG_REQUIRED | MP_ARG_INT },
@@ -958,6 +997,10 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
         // TX power in dBm EIRP. None = use region maximum (16 dBm for EU868).
         // Internally converted to MAC TX_POWER index; getter also returns dBm.
         { MP_QSTR_tx_power,         MP_ARG_KW_ONLY  | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        // Antenna gain in dBi. Default 0.0 so the radio emits the full EIRP.
+        // The EU868 region default (2.15 dBi) would otherwise cause the MAC to
+        // subtract 2.15 from the requested EIRP, silently under-driving the radio.
+        { MP_QSTR_antenna_gain,     MP_ARG_KW_ONLY  | MP_ARG_OBJ, {.u_obj = mp_const_none} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args,
@@ -1003,6 +1046,11 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     } else {
         self->channels_tx_power = 0; // TX_POWER_0 = region max
     }
+
+    // antenna_gain kwarg: None → 0.0 dBi (full EIRP at the radio).
+    self->antenna_gain = (args[ARG_antenna_gain].u_obj != mp_const_none)
+                         ? mp_obj_get_float(args[ARG_antenna_gain].u_obj)
+                         : 0.0f;
 
     // Apply pin overrides to g_lorawan_pins before any IoInit.
     // -1 means "keep T-Beam default" (set in pin_config.c initialiser).
@@ -1474,6 +1522,26 @@ static mp_obj_t lorawan_tx_power(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_tx_power_obj, 1, 2, lorawan_tx_power);
 
+// antenna_gain(gain=None) — getter/setter for MIB_ANTENNA_GAIN.
+// Getter returns the current antenna gain in dBi as a float.
+// Setter updates both MIB_ANTENNA_GAIN and MIB_DEFAULT_ANTENNA_GAIN so a
+// subsequent ResetMacParameters doesn't restore the region default.
+static mp_obj_t lorawan_antenna_gain(size_t n_args, const mp_obj_t *args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    if (n_args == 1) {
+        return mp_obj_new_float(self->antenna_gain);
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_SET_PARAMS };
+    cmd.set_params.type         = 3;
+    cmd.set_params.antenna_gain = mp_obj_get_float(args[1]);
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_antenna_gain_obj, 1, 2, lorawan_antenna_gain);
+
 // request_class(cls) — request a switch to CLASS_A or CLASS_C.
 // CLASS_B is not yet supported (requires beacon acquisition, Session 13).
 // LoRaMAC-node v4.7.0 performs A <-> C transitions synchronously via
@@ -1535,6 +1603,7 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_datarate),       MP_ROM_PTR(&lorawan_datarate_obj) },
     { MP_ROM_QSTR(MP_QSTR_adr),            MP_ROM_PTR(&lorawan_adr_obj) },
     { MP_ROM_QSTR(MP_QSTR_tx_power),       MP_ROM_PTR(&lorawan_tx_power_obj) },
+    { MP_ROM_QSTR(MP_QSTR_antenna_gain),   MP_ROM_PTR(&lorawan_antenna_gain_obj) },
     { MP_ROM_QSTR(MP_QSTR_request_class),  MP_ROM_PTR(&lorawan_request_class_obj) },
     { MP_ROM_QSTR(MP_QSTR_device_class),   MP_ROM_PTR(&lorawan_device_class_obj) },
     { MP_ROM_QSTR(MP_QSTR_on_class_change), MP_ROM_PTR(&lorawan_on_class_change_obj) },
@@ -1552,7 +1621,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.7.0", 5);
+    return mp_obj_new_str("0.8.0", 5);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 
