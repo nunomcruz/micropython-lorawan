@@ -34,3 +34,6 @@ user.props
 /xtensa-lx106-elf/
 CLAUDE.md
 .mpy-workbench/.mpyignore
+
+# Flasher binaries (live on gh-pages branch only)
+flasher/*.bin
