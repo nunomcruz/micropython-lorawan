@@ -302,7 +302,7 @@ Prerequisites: DeviceTimeReq must work (Session 12), timer HAL accuracy verified
       - `CMD_FRAGMENTATION_ENABLE` mallocs the requested buffer (raw C heap, outside MicroPython's GC since the MAC writes to it from the LoRaWAN task) and calls `lorawan_fragmentation_register()`. Rejects a second call while already enabled (second-call would leak the previous buffer).
       - `fragmentation_data()` returns the reassembled buffer as `bytes` after `on_done` has fired; caller slices to the reported size.
 - [x] Version bumped 0.10.0 → 0.11.0; compile clean, zero warnings; firmware 1643 KB (+11 KB for LmhpRemoteMcastSetup.c + LmhpFragmentation.c + FragDecoder.c + Session 14 Python glue).
-- [ ] Test: local multicast Class C — device receives on multicast address
+- [x] Test: local multicast Class C — device receives on multicast address
 - [ ] Test: local multicast Class B — device receives on multicast ping slot
 - [ ] Test: remote multicast setup via LmhpRemoteMcastSetup (if server supports it)
 - [ ] Test: fragmentation session end-to-end (server pushes fragments, `on_done` fires with reassembled payload)
@@ -408,6 +408,40 @@ Follow-up to Session 16's hazard note ("An IRQ ISR firing mid-teardown will corr
 - [x] `examples/sensor_node.py` — refactored: new `read_battery_mv(hw)` + `battery_level_lorawan(mv)` helpers split out of `read_sensor`. `main()` now calls `lw.battery_level(battery_level_lorawan(mv))` before `send()`, so the next `DevStatusReq` from the network gets a real answer. Prints the mapped level alongside the mV reading for visibility.
 - [x] README — new `battery_level()` entry under *Configuration*, documenting the `0 / 1..254 / 255` semantics and pointing to `sensor_node.py`. Examples README annotates `sensor_node.py` with the new capability.
 - [x] Version bumped 0.17.0 → 0.18.0; compile clean, firmware 0x191f40 bytes.
+
+### Session 20: API refinement (naming consistency, error handling, callbacks)
+
+Review of the full Python API surface identified several inconsistencies to fix before v1.0.
+
+#### Naming
+
+- [ ] Rename `request_class(cls)` → overload `device_class(cls)` as setter. All other getter/setters use one name (`datarate()`, `adr()`, `tx_power()`, etc.), but class uses two (`device_class()` getter + `request_class()` setter). Keep `request_class` as a deprecated alias for one release. For Class B (async), `device_class(CLASS_B)` returns immediately and `on_class_change` fires later — document this clearly.
+- [ ] Rename constructor kwarg `rx2_dr` → `rx2_datarate` for consistency with the `datarate()` method name. Keep `rx2_dr` as a deprecated alias. Similarly `rx2_freq` is fine (no `frequency()` method).
+
+#### Callbacks
+
+- [ ] Unify callback argument passing — currently `on_rx` receives 5 separate args, `on_beacon` receives a 2-tuple, fragmentation callbacks receive tuples. Pick one convention. Recommendation: all callbacks receive separate named-position args (not tuples), matching `on_rx(data, port, rssi, snr, multicast)` pattern. Update `on_beacon(state, info)` to two separate args (currently a single 2-tuple). Update fragmentation `on_progress(counter, nb, size, lost)` and `on_done(status, size)` to separate args.
+- [ ] `recv()` returns 5-tuple `(data, port, rssi, snr, multicast)` — verify this matches `on_rx` shape. The Session 14 notes say `recv()` still returns 4-tuple for backwards compat — if so, update to 5-tuple for consistency.
+
+#### Error handling
+
+- [ ] Standardise exception types: `OSError(errno)` for I/O and timeout conditions, `ValueError` for invalid arguments, `RuntimeError` only for state errors. Specific changes:
+      - `send()` timeout: change from `RuntimeError("send timeout")` to `OSError(ETIMEDOUT)` (matches `join_otaa` timeout)
+      - `request_class()` failure: change from `RuntimeError("class switch failed")` to `OSError(EIO)` or similar
+      - Keep `RuntimeError` for state precondition failures (e.g. "not joined", "package not enabled")
+
+#### Time API clarity
+
+- [ ] Remove `network_time()` — it returns the frozen snapshot from last DeviceTimeAns, which is rarely what users want. `synced_time()` returns the live advancing time and covers all use cases. If someone needs the snapshot timestamp, they can capture it in the `on_time_sync` callback. Alternatively, rename `network_time()` → `last_sync_epoch()` if we keep it.
+
+#### Documentation
+
+- [ ] Add `__doc__` strings to all Python-facing methods in modlorawan.c (MP_DEFINE_CONST_FUN_OBJ accepts a doc string via the MP_ROM_xxx macros — check if MicroPython v1.29 supports this, otherwise skip)
+- [ ] Verify README API reference matches the actual implementation after all renames
+
+#### Version bump
+
+- [ ] Bump version to 1.0.0 after API refinement — signals stable API surface
 
 ## Notes
 
