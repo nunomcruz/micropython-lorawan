@@ -29,9 +29,9 @@ def main():
     print("tbeam:", hw)
     print("lorawan module version:", lorawan.version())
 
-    # rx2_dr=DR_3 (SF9) is what TTN EU868 expects. For standard LoRaWAN
+    # rx2_datarate=DR_3 (SF9) is what TTN EU868 expects. For standard LoRaWAN
     # networks, omit this kwarg to use the region default (DR_0 / SF12).
-    lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_3)
+    lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_datarate=lorawan.DR_3)
 
     # Restore any saved session (DevNonce, FCntUp, session keys). Must be
     # called BEFORE join on every boot.
@@ -71,7 +71,7 @@ def main():
     # Check for a scheduled downlink (non-blocking poll).
     pkt = lw.recv(timeout=0)
     if pkt:
-        data, port, rssi, snr = pkt
+        data, port, rssi, snr, multicast = pkt
         print(f"downlink port={port} rssi={rssi} snr={snr}: {data!r}")
 
     # Persist FCntUp so the next reboot doesn't replay a frame counter.

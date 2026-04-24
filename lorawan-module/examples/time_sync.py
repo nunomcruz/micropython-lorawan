@@ -46,7 +46,7 @@ def main():
     hw = tbeam.detect()
     print("tbeam:", hw)
 
-    lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_3)
+    lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_datarate=lorawan.DR_3)
 
     # Install the callback before any request so the first sync is reported.
     lw.on_time_sync(on_time_sync)
@@ -110,7 +110,7 @@ def main():
     print("\n--- link_check (synchronous, DR_0) ---")
     try:
         info = lw.link_check(send_now=True, datarate=lorawan.DR_0)
-    except RuntimeError as e:
+    except (OSError, RuntimeError) as e:
         print("link_check failed:", e)
         info = None
     if info is None:

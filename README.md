@@ -50,7 +50,7 @@ USB-C (or micro-USB on v0.7) powers the MCU and charges the 18650 cell. For deep
 
 1. Create a TTN application at [console.cloud.thethings.network](https://console.cloud.thethings.network/).
 2. Add an **end device** → "Enter end device specifics manually".
-   - Frequency plan: `Europe 863–870 MHz (SF9 for RX2 — recommended)` — this is what the default `rx2_dr=DR_3` corresponds to.
+   - Frequency plan: `Europe 863–870 MHz (SF9 for RX2 — recommended)` — this is what the default `rx2_datarate=DR_3` corresponds to.
    - LoRaWAN version: `MAC V1.0.4` (or `MAC V1.1` if you passed `lorawan_version=lorawan.V1_1`).
    - Regional Parameters version: `RP002 Regional Parameters 1.0.3 revision A` (or whichever the console recommends for your MAC version).
 3. Activation mode: **OTAA** (recommended). TTN will generate the JoinEUI, DevEUI and AppKey — copy these into your script.
@@ -121,8 +121,8 @@ lw = lorawan.LoRaWAN(
 
     # --- RX2 window ---
     # Unset fields fall through to the region's PHY_DEF_RX2 (DR_0 / region default freq).
-    # For TTN EU868, set rx2_dr=DR_3 (the 869.525 MHz freq is already the region default).
-    rx2_dr=None,                    # e.g. lorawan.DR_3 for TTN EU868
+    # For TTN EU868, set rx2_datarate=DR_3 (the 869.525 MHz freq is already the region default).
+    rx2_datarate=None,              # e.g. lorawan.DR_3 for TTN EU868
     rx2_freq=None,                  # e.g. 869525000 (Hz)
 
     # --- TX power ---
@@ -211,7 +211,7 @@ Transmits an uplink frame. Blocks until TX is complete (includes waiting for RX1
 **Exceptions:**
 - `OSError(EBUSY)` — the regional duty cycle is currently restricting TX. The frame was **not** queued; call `lw.time_until_tx()` to get the wait in milliseconds, sleep, then retry.
 - `RuntimeError("send failed")` — the MAC rejected the frame for another reason (not joined, length error, etc.).
-- `RuntimeError("send timeout")` — `timeout` elapsed before TX completed.
+- `OSError(ETIMEDOUT)` — `timeout` elapsed before TX completed.
 
 `timeout` defaults to 120 s. Pass `timeout=None` to block until TX completes (non-positive ints are treated the same way).
 
@@ -247,29 +247,51 @@ lw.on_tx_done(None)  # deregister
 
 ### Downlink
 
-#### `lw.recv(*, timeout=10)` → `(bytes, int, int, int) | None`
+#### `lw.recv(*, timeout=10)` → `(bytes, int, int, int, bool) | None`
 
-Blocks up to `timeout` seconds for a downlink. Returns `(data, port, rssi, snr)` or `None`. Use `timeout=0` to poll without blocking.
+Blocks up to `timeout` seconds for a downlink. Returns `(data, port, rssi, snr, multicast)` or `None`. `multicast` is `True` when the frame was received on a multicast address. Use `timeout=0` to poll without blocking.
 
 ```python
 pkt = lw.recv(timeout=10)
 if pkt:
-    data, port, rssi, snr = pkt
+    data, port, rssi, snr, multicast = pkt
     print(f"rx port={port} rssi={rssi} snr={snr}: {data}")
 ```
 
 #### `lw.on_rx(callback)` / `lw.on_rx(None)`
 
-Registers a callback fired on each downlink. Callback receives a single 5-tuple `(data, port, rssi, snr, multicast)`. `multicast` is `True` when the frame was received on a multicast address. Do not combine with `recv()` on the same object.
+Registers a callback fired on each downlink. Callback receives five separate positional args: `data`, `port`, `rssi`, `snr`, `multicast`. `multicast` is `True` when the frame was received on a multicast address.
 
 ```python
-def on_downlink(pkt):
-    data, port, rssi, snr, mc = pkt
-    kind = "mcast" if mc else "ucast"
+def on_downlink(data, port, rssi, snr, multicast):
+    kind = "mcast" if multicast else "ucast"
     print(f"{kind} port={port} rssi={rssi} snr={snr}: {data}")
 
 lw.on_rx(on_downlink)
 lw.on_rx(None)  # deregister
+```
+
+#### `recv()` vs `on_rx` — pick one
+
+Both read from the same internal queue. **`recv()` has priority**: while it is blocking, the MicroPython VM cannot run scheduled callbacks, so when a packet arrives `recv()` pops it and the `on_rx` trampoline runs later against an empty queue — the callback never fires for that message.
+
+| Pattern | Right for |
+|---------|-----------|
+| `recv(timeout=N)` | Request/response flows: send an uplink, then block waiting for the reply. |
+| `on_rx(callback)` | Event-driven flows: Class C continuous listen, sensor node sleeping between uplinks. |
+
+Do not use both simultaneously. For Class C in particular, downlinks can arrive at any time; `on_rx` is the right choice:
+
+```python
+# Class C — correct pattern: on_rx only
+lw.on_rx(on_downlink)
+lw.device_class(lorawan.CLASS_C)
+# recv() is never called — on_rx fires for every downlink
+
+# Class C — incorrect pattern: mixing both
+lw.on_rx(on_downlink)
+lw.device_class(lorawan.CLASS_C)
+pkt = lw.recv(timeout=30)  # while this blocks, on_rx is silenced
 ```
 
 ---
@@ -375,8 +397,13 @@ lw.stats()
 #   'rx_counter': 1,        # downlink frame counter
 #   'tx_time_on_air': 991,  # last uplink time on air (ms)
 #   'last_tx_ack': True,    # confirmed uplink: True if ACKed
+#   'last_tx_dr': 3,        # DR used for the last uplink (DR_0..DR_5)
+#   'last_tx_freq': 868100000,  # frequency of the last uplink (Hz)
+#   'last_tx_power': 14,    # TX power of the last uplink (dBm EIRP)
 # }
 ```
+
+`last_tx_dr`, `last_tx_freq`, and `last_tx_power` all default to 0 before the first uplink (`tx_counter == 0`). `last_tx_power` is in dBm EIRP, consistent with `tx_power()`.
 
 ---
 
@@ -449,28 +476,30 @@ Restores a previously saved session from NVS. Raises `OSError(ENOENT)` if no ses
 
 ### Device class (A / B / C)
 
-#### `lw.request_class(cls)`
+#### `lw.device_class([cls])` → `int | None`
 
-Requests a switch to `CLASS_A`, `CLASS_B` or `CLASS_C`.
+Getter/setter for the device class.
 
-- Class A ↔ Class C: synchronous — `MIB_DEVICE_CLASS` is set immediately and `on_class_change(new_class)` fires before the call returns.
-- Class B: asynchronous and multi-step. Requires a prior time sync (see `request_device_time()` below). The call returns once beacon acquisition starts; the actual class change is signalled later via `on_class_change(CLASS_B)`. Beacon lock, loss and acquisition-failure events are surfaced via `on_beacon(cb)`.
+- **Getter** (no argument): returns the current class (`CLASS_A`, `CLASS_B` or `CLASS_C`).
+- **Setter** (with `cls`): requests a transition to `CLASS_A`, `CLASS_B` or `CLASS_C`.
+  - Class A ↔ Class C: synchronous — `MIB_DEVICE_CLASS` is set immediately and `on_class_change(new_class)` fires before the call returns.
+  - Class B: asynchronous and multi-step. Requires a prior time sync (see `request_device_time()` below). The call returns immediately once beacon acquisition starts; the actual class change is signalled later via `on_class_change(CLASS_B)`. Beacon lock, loss and acquisition-failure events are surfaced via `on_beacon(cb)`.
 
-Raises `RuntimeError` if the transition fails.
+Raises `OSError(EIO)` if the transition fails (setter only). Raises `RuntimeError` for state preconditions (not initialised, CLASS_B requires a joined session).
+
+`request_class(cls)` is a deprecated alias for `device_class(cls)`.
 
 ```python
+lw.device_class()                  # → CLASS_A
+
 # Class C — instantaneous
-lw.request_class(lorawan.CLASS_C)
+lw.device_class(lorawan.CLASS_C)
 
 # Class B — prerequisite: time sync
 lw.request_device_time()
-lw.send(b"")              # DeviceTimeReq piggy-backs on this uplink
-lw.request_class(lorawan.CLASS_B)
+lw.send(b"")                       # DeviceTimeReq piggy-backs on this uplink
+lw.device_class(lorawan.CLASS_B)
 ```
-
-#### `lw.device_class()` → `int`
-
-Returns the current class (`CLASS_A`, `CLASS_B` or `CLASS_C`).
 
 #### `lw.on_class_change(callback)` / `lw.on_class_change(None)`
 
@@ -486,7 +515,7 @@ lw.on_class_change(lambda c: print("now in class", c))
 
 #### `lw.ping_slot_periodicity([n])` → `int | None`
 
-Getter/setter for the Class B ping-slot periodicity `N` (0..7). Period between ping slots is `2^N` seconds. Takes effect on the next `request_class(CLASS_B)` — changing it while already in Class B requires renegotiation.
+Getter/setter for the Class B ping-slot periodicity `N` (0..7). Period between ping slots is `2^N` seconds. Takes effect on the next `device_class(CLASS_B)` — changing it while already in Class B requires renegotiation.
 
 ```python
 lw.ping_slot_periodicity(4)  # 16 s between ping slots
@@ -495,11 +524,10 @@ lw.ping_slot_periodicity()   # → 4
 
 #### `lw.on_beacon(callback)` / `lw.on_beacon(None)`
 
-Registers a callback fired on every beacon event. Callback receives a single 2-tuple `(state, info)` where `state` is one of the `BEACON_*` constants and `info` is the beacon dict (see `beacon_state()`) or `None`.
+Registers a callback fired on every beacon event. Callback receives two separate positional args: `state` (one of the `BEACON_*` constants) and `info` (the beacon dict from `beacon_state()`, or `None`).
 
 ```python
-def on_beacon(evt):
-    state, info = evt
+def on_beacon(state, info):
     if state == lorawan.BEACON_LOCKED:
         print("beacon locked:", info)
     elif state == lorawan.BEACON_LOST:
@@ -594,7 +622,7 @@ if result:
     print(f"margin={result['margin']} dB, seen by {result['gw_count']} gateways")
 ```
 
-- **`send_now=True`** — also emits an empty unconfirmed uplink on port 1 to carry the piggy-back, waits for the TX+RX cycle to complete, and returns the fresh answer in a single call. Costs one uplink of airtime and bumps `FCntUp` by one.
+- **`send_now=True`** — also emits an empty unconfirmed uplink on port 1 to carry the piggy-back, waits for the TX+RX cycle to complete, and returns the fresh answer in a single call. Costs one uplink of airtime and bumps `FCntUp` by one. Raises `RuntimeError("link_check send failed")` on MAC rejection or `OSError(ETIMEDOUT)` on timeout.
 
 ```python
 result = lw.link_check(send_now=True, datarate=lorawan.DR_0)
@@ -622,12 +650,12 @@ Unlike `link_check()` / `request_device_time()` (piggy-back), a rejoin is itself
 
 Up to 4 multicast groups (indices 0–3) can be active simultaneously. Multicast frames are received on either the Class C continuous RX window or the Class B ping slots, depending on the group's RX params.
 
-#### `lw.multicast_add(group, addr, mc_nwk_s_key, mc_app_s_key, *, f_count_min=0, f_count_max=0xFFFFFFFF)`
+#### `lw.multicast_add(group, addr, mc_nwk_s_key, mc_app_s_key, *, f_count_min=0, f_count_max=0xFFFFFFFF)` → `int`
 
-Provisions a local multicast group. Keys must be supplied out-of-band (shared with the network server). Use `remote_multicast_enable()` below for server-driven provisioning.
+Provisions a local multicast group. Returns the `group` index that was registered. Keys must be supplied out-of-band (shared with the network server). Use `remote_multicast_enable()` below for server-driven provisioning.
 
 ```python
-lw.multicast_add(
+idx = lw.multicast_add(
     group=0,
     addr=0x11223344,
     mc_nwk_s_key=bytes.fromhex("01" * 16),
@@ -635,6 +663,7 @@ lw.multicast_add(
     f_count_min=0,
     f_count_max=0xFFFFFFFF,
 )
+# idx == 0
 ```
 
 #### `lw.multicast_rx_params(group, device_class, frequency, datarate, *, periodicity=0)`
@@ -666,7 +695,14 @@ Removes a group and clears its crypto state.
 
 #### `lw.multicast_list()` → `list[dict]`
 
-Returns the active groups with their metadata. RX-param keys (`device_class`, `frequency`, `datarate`, `periodicity`) are only present after `multicast_rx_params()` has been called.
+Returns the active groups with their metadata. `addr` is an int (use `hex(g['addr'])` or `f"0x{g['addr']:08X}"` to display it). RX-param keys (`device_class`, `frequency`, `datarate`, `periodicity`) are only present after `multicast_rx_params()` has been called.
+
+```python
+lw.multicast_list()
+# [{'group': 0, 'addr': 0x11223344, 'is_remote': False,
+#   'f_count_min': 0, 'f_count_max': 4294967295,
+#   'device_class': 2, 'frequency': 869525000, 'datarate': 0}]
+```
 
 #### `lw.remote_multicast_enable()` → `bool`
 
@@ -682,16 +718,14 @@ Reassembles a firmware image delivered via multicast, with recovery of up to `re
 
 Registers `LmhpFragmentation` (port 201) and allocates a flat RAM reassembly buffer.
 
-- `on_progress(counter, nb, size, lost)` — fragment counter, total fragments, fragment size (bytes), fragments lost so far. Called with a single 4-tuple.
-- `on_done(status, size)` — `status=0` means success; `status>0` is the number of unrecoverable missing fragments. Called with a single 2-tuple.
+- `on_progress(counter, nb, size, lost)` — fragment counter, total fragments, fragment size (bytes), fragments lost so far. Four separate positional args.
+- `on_done(status, size)` — `status=0` means success; `status>0` is the number of unrecoverable missing fragments. Two separate positional args.
 
 ```python
-def on_progress(info):
-    n, total, sz, lost = info
-    print(f"frag {n}/{total} size={sz} lost={lost}")
+def on_progress(counter, nb, size, lost):
+    print(f"frag {counter}/{nb} size={size} lost={lost}")
 
-def on_done(info):
-    status, size = info
+def on_done(status, size):
     if status == 0:
         data = lw.fragmentation_data()[:size]
         print(f"FUOTA complete: {size} bytes")
@@ -723,7 +757,7 @@ If the MAC ever stalls past the 2 s bounded wait on teardown, the Python side lo
 lw = lorawan.LoRaWAN(region=lorawan.EU868)
 # ...
 lw.deinit()
-lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_3)   # now safe
+lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_datarate=lorawan.DR_3)   # now safe
 ```
 
 #### Soft-reset safety
@@ -739,7 +773,7 @@ Hard-reset (power cycle, `machine.reset()`) is always safe: the radio comes up f
 `__enter__` returns `self`; `__exit__` calls `deinit()` regardless of exception state. Use `with` when you want teardown guaranteed at scope exit:
 
 ```python
-with lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_3) as lw:
+with lorawan.LoRaWAN(region=lorawan.EU868, rx2_datarate=lorawan.DR_3) as lw:
     lw.nvram_restore() if lw.joined() else lw.join_otaa(...)
     lw.send(b"data")
     lw.nvram_save()
@@ -784,7 +818,7 @@ lorawan.DR_3   # SF9  / 125 kHz
 lorawan.DR_4   # SF8  / 125 kHz
 lorawan.DR_5   # SF7  / 125 kHz — maximum throughput
 
-# Beacon states (first arg to on_beacon callback tuple)
+# Beacon states (first arg to on_beacon callback)
 lorawan.BEACON_ACQUISITION_OK
 lorawan.BEACON_ACQUISITION_FAIL
 lorawan.BEACON_LOCKED
@@ -801,7 +835,7 @@ lorawan.BEACON_LOST
 ```python
 import lorawan
 
-lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_3)
+lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_datarate=lorawan.DR_3)
 
 try:
     lw.nvram_restore()
@@ -825,7 +859,7 @@ lw.nvram_save()
 ```python
 import lorawan
 
-lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_3)
+lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_datarate=lorawan.DR_3)
 
 try:
     lw.nvram_restore()
@@ -864,11 +898,10 @@ lw.tx_power()     # → current value in dBm
 ```python
 import lorawan
 
-lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_3)
+lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_datarate=lorawan.DR_3)
 # ... join ...
 
-def on_downlink(pkt):
-    data, port, rssi, snr, mc = pkt
+def on_downlink(data, port, rssi, snr, mc):
     print(f"rx port={port} rssi={rssi} snr={snr} mcast={mc}: {data}")
 
 lw.on_rx(on_downlink)
@@ -963,13 +996,13 @@ pins = tbeam.lora_pins(hw)         # (cs, irq, rst) or (cs, irq, rst, busy)
 
 **TX power hardware maximums.** The SX1262 outputs up to +22 dBm; the SX1276 (PA_BOOST) up to +20 dBm. Both are well above the EU868 regulatory EIRP limit of 16 dBm. Going above 16 dBm requires a hardware TX-power override (see `tx_power()` above) and is the user's responsibility. Reaching +30 dBm requires an external PA (e.g. Ebyte E22-900M30S module); the software hook point is `SX126xAntSwOn()` / `SX126xAntSwOff()` in `sx126x_board.c`.
 
-**RX2 default.** The MAC uses the region's `PHY_DEF_RX2` unless overridden via `rx2_dr=` / `rx2_freq=`. TTN EU868 wants `rx2_dr=DR_3` (SF9) — 869.525 MHz is already the region default. Standard LoRaWAN specifies DR_0 (SF12) on the same frequency.
+**RX2 default.** The MAC uses the region's `PHY_DEF_RX2` unless overridden via `rx2_datarate=` / `rx2_freq=`. TTN EU868 wants `rx2_datarate=DR_3` (SF9) — 869.525 MHz is already the region default. Standard LoRaWAN specifies DR_0 (SF12) on the same frequency.
 
 ---
 
 ## Project status
 
-**v0.18.0.** Phase 1–5 of the roadmap are complete end-to-end on hardware:
+**v1.0.0.** Phase 1–5 of the roadmap are complete end-to-end on hardware:
 
 - Phase 1: T-Beam board definition (all variants, runtime auto-detect).
 - Phase 2: USER_C_MODULE skeleton.

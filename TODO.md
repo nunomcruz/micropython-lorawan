@@ -415,17 +415,17 @@ Review of the full Python API surface identified several inconsistencies to fix 
 
 #### Naming
 
-- [ ] Rename `request_class(cls)` → overload `device_class(cls)` as setter. All other getter/setters use one name (`datarate()`, `adr()`, `tx_power()`, etc.), but class uses two (`device_class()` getter + `request_class()` setter). Keep `request_class` as a deprecated alias for one release. For Class B (async), `device_class(CLASS_B)` returns immediately and `on_class_change` fires later — document this clearly.
-- [ ] Rename constructor kwarg `rx2_dr` → `rx2_datarate` for consistency with the `datarate()` method name. Keep `rx2_dr` as a deprecated alias. Similarly `rx2_freq` is fine (no `frequency()` method).
+- [x] Rename `request_class(cls)` → overload `device_class(cls)` as setter. All other getter/setters use one name (`datarate()`, `adr()`, `tx_power()`, etc.), but class uses two (`device_class()` getter + `request_class()` setter). Keep `request_class` as a deprecated alias for one release. For Class B (async), `device_class(CLASS_B)` returns immediately and `on_class_change` fires later — document this clearly.
+- [x] Rename constructor kwarg `rx2_dr` → `rx2_datarate` for consistency with the `datarate()` method name. Keep `rx2_dr` as a deprecated alias. Similarly `rx2_freq` is fine (no `frequency()` method).
 
 #### Callbacks
 
-- [ ] Unify callback argument passing — currently `on_rx` receives 5 separate args, `on_beacon` receives a 2-tuple, fragmentation callbacks receive tuples. Pick one convention. Recommendation: all callbacks receive separate named-position args (not tuples), matching `on_rx(data, port, rssi, snr, multicast)` pattern. Update `on_beacon(state, info)` to two separate args (currently a single 2-tuple). Update fragmentation `on_progress(counter, nb, size, lost)` and `on_done(status, size)` to separate args.
-- [ ] `recv()` returns 5-tuple `(data, port, rssi, snr, multicast)` — verify this matches `on_rx` shape. The Session 14 notes say `recv()` still returns 4-tuple for backwards compat — if so, update to 5-tuple for consistency.
+- [x] Unify callback argument passing — currently `on_rx` receives 5 separate args, `on_beacon` receives a 2-tuple, fragmentation callbacks receive tuples. Pick one convention. Recommendation: all callbacks receive separate named-position args (not tuples), matching `on_rx(data, port, rssi, snr, multicast)` pattern. Update `on_beacon(state, info)` to two separate args (currently a single 2-tuple). Update fragmentation `on_progress(counter, nb, size, lost)` and `on_done(status, size)` to separate args.
+- [x] `recv()` returns 5-tuple `(data, port, rssi, snr, multicast)` — verify this matches `on_rx` shape. The Session 14 notes say `recv()` still returns 4-tuple for backwards compat — if so, update to 5-tuple for consistency.
 
 #### Error handling
 
-- [ ] Standardise exception types: `OSError(errno)` for I/O and timeout conditions, `ValueError` for invalid arguments, `RuntimeError` only for state errors. Specific changes:
+- [x] Standardise exception types: `OSError(errno)` for I/O and timeout conditions, `ValueError` for invalid arguments, `RuntimeError` only for state errors. Specific changes:
       - `send()` timeout: change from `RuntimeError("send timeout")` to `OSError(ETIMEDOUT)` (matches `join_otaa` timeout)
       - `request_class()` failure: change from `RuntimeError("class switch failed")` to `OSError(EIO)` or similar
       - Keep `RuntimeError` for state precondition failures (e.g. "not joined", "package not enabled")
@@ -436,12 +436,13 @@ Review of the full Python API surface identified several inconsistencies to fix 
 
 #### Documentation
 
+- [x] Document recv() vs on_rx() interaction: recv() has priority (pops queue while VM is blocked); on_rx silenced during recv() call. Class C guidance added to README.
 - [ ] Add `__doc__` strings to all Python-facing methods in modlorawan.c (MP_DEFINE_CONST_FUN_OBJ accepts a doc string via the MP_ROM_xxx macros — check if MicroPython v1.29 supports this, otherwise skip)
-- [ ] Verify README API reference matches the actual implementation after all renames
+- [x] Verify README API reference matches the actual implementation after all renames
 
 #### Version bump
 
-- [ ] Bump version to 1.0.0 after API refinement — signals stable API surface
+- [x] Bump version to 1.0.0 after API refinement — signals stable API surface
 
 ## Notes
 

@@ -50,8 +50,7 @@ def beacon_name(state):
     return f"?({state})"
 
 
-def on_beacon(evt):
-    state, info = evt
+def on_beacon(state, info):
     _beacon_state[0] = state
     print(f"[beacon] {beacon_name(state)}")
     if info:
@@ -64,8 +63,7 @@ def on_class_change(new_class):
     print(f"[class] now CLASS_{names.get(new_class, '?')}")
 
 
-def on_downlink(pkt):
-    data, port, rssi, snr, mc = pkt
+def on_downlink(data, port, rssi, snr, mc):
     kind = "mcast" if mc else "unicast"
     print(f"[rx] {kind} port={port} rssi={rssi} snr={snr}: {data!r}")
 
@@ -74,7 +72,7 @@ def main():
     hw = tbeam.detect()
     print("tbeam:", hw)
 
-    lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_3)
+    lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_datarate=lorawan.DR_3)
     lw.on_beacon(on_beacon)
     lw.on_class_change(on_class_change)
     lw.on_rx(on_downlink)
@@ -108,9 +106,9 @@ def main():
     # --- request Class B (asynchronous; beacon acquisition drives state) ---
     print("\nrequesting Class B (beacon acquisition starts now)...")
     try:
-        lw.request_class(lorawan.CLASS_B)
-    except RuntimeError as e:
-        print("request_class failed:", e)
+        lw.device_class(lorawan.CLASS_B)
+    except OSError as e:
+        print("device_class failed:", e)
         return
 
     # Wait for beacon lock. on_beacon updates _beacon_state from MLME context.
@@ -138,7 +136,7 @@ def main():
             try:
                 lw.send(b"")
                 lw.nvram_save()
-            except RuntimeError as e:
+            except (OSError, RuntimeError) as e:
                 print("heartbeat send failed:", e)
     except KeyboardInterrupt:
         print("stopped")

@@ -44,8 +44,7 @@ MC_FREQ   = 869525000
 MC_DR     = lorawan.DR_3
 
 
-def on_downlink(pkt):
-    data, port, rssi, snr, mc = pkt
+def on_downlink(data, port, rssi, snr, mc):
     kind = "MULTICAST" if mc else "unicast  "
     print(f"[rx] {kind} port={port} rssi={rssi} snr={snr}: {data!r}")
 
@@ -54,7 +53,7 @@ def main():
     hw = tbeam.detect()
     print("tbeam:", hw)
 
-    lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_3)
+    lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_datarate=lorawan.DR_3)
     lw.on_rx(on_downlink)
 
     try:
@@ -92,7 +91,7 @@ def main():
 
     # --- switch to Class C so the radio listens continuously ---
     print("\nswitching to Class C...")
-    lw.request_class(lorawan.CLASS_C)
+    lw.device_class(lorawan.CLASS_C)
     print(f"device_class = {lw.device_class()} (CLASS_C={lorawan.CLASS_C})")
 
     # --- listen forever ---
@@ -108,7 +107,7 @@ def main():
             lw.multicast_remove(MC_GROUP)
         except RuntimeError:
             pass
-        lw.request_class(lorawan.CLASS_A)
+        lw.device_class(lorawan.CLASS_A)
         lw.nvram_save()
 
 

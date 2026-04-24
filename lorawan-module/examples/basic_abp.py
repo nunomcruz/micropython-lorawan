@@ -21,7 +21,7 @@ def main():
     hw = tbeam.detect()
     print("tbeam:", hw)
 
-    lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_3)
+    lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_datarate=lorawan.DR_3)
 
     # Restore FCntUp across reboots. If nothing is saved yet, provision the
     # ABP session from scratch.
@@ -43,7 +43,7 @@ def main():
     print(f"sending {len(payload)} B, confirmed=True...")
     try:
         lw.send(payload, port=1, confirmed=True)
-    except RuntimeError as e:
+    except (OSError, RuntimeError) as e:
         print("send failed:", e)
         return
 

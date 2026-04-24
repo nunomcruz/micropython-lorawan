@@ -3,7 +3,7 @@
 //                         recv, on_rx, on_tx_done, confirmed uplink ACK tracking,
 //                         nvram_save/restore (ESP32 NVS via MIB_NVM_CTXS),
 //                         datarate/adr/tx_power getters+setters.
-// Phase 5, Session 11:   runtime pin config; lorawan_version (1.0.4/1.1), rx2_dr/freq,
+// Phase 5, Session 11:   runtime pin config; lorawan_version (1.0.4/1.1), rx2_datarate/freq,
 //                         tx_power kwargs on __init__; nwk_key kwarg on join_otaa;
 //                         request_class / device_class / on_class_change (Class A <-> C);
 //                         antenna_gain kwarg + getter/setter (MIB_ANTENNA_GAIN).
@@ -484,6 +484,7 @@ static mp_obj_t lorawan_beacon_info_dict(lorawan_obj_t *self);
 // Called on every MLME_BEACON / MLME_BEACON_LOST / MLME_BEACON_ACQUISITION
 // event. The scheduler arg carries the LW_BEACON_* state code (small int);
 // info is read from the object snapshot updated in the MLME handler.
+// Callback signature: on_beacon(state, info)
 static mp_obj_t lorawan_beacon_trampoline(mp_obj_t arg) {
     if (!s_lora_obj || s_lora_obj->beacon_callback == mp_const_none) {
         return mp_const_none;
@@ -491,14 +492,13 @@ static mp_obj_t lorawan_beacon_trampoline(mp_obj_t arg) {
     mp_obj_t info = s_lora_obj->beacon_info_valid
                     ? lorawan_beacon_info_dict(s_lora_obj)
                     : mp_const_none;
-    mp_obj_t items[2] = { arg, info };
-    mp_call_function_1(s_lora_obj->beacon_callback, mp_obj_new_tuple(2, items));
+    mp_call_function_2(s_lora_obj->beacon_callback, arg, info);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_beacon_trampoline_obj, lorawan_beacon_trampoline);
 
-// Fragmentation progress — a full 4-tuple (counter, total, size, lost) would
-// overflow the scheduler arg, so we snapshot the values on a static buffer
+// Fragmentation progress — passing 4 args through the scheduler arg would
+// overflow (only one mp_obj_t slot), so we snapshot the values on a static buffer
 // (single-producer: the LoRaWAN task) and the trampoline reads them in VM
 // context. Last-one-wins semantics: if progress fires faster than Python can
 // dispatch we only keep the newest snapshot. Typical case: slow downlinks
@@ -513,13 +513,13 @@ static mp_obj_t lorawan_frag_progress_trampoline(mp_obj_t arg) {
     if (!s_lora_obj || s_lora_obj->fragmentation_progress_callback == mp_const_none) {
         return mp_const_none;
     }
+    // Callback signature: on_progress(counter, nb, size, lost)
     mp_obj_t items[4];
     items[0] = mp_obj_new_int(s_frag_progress_counter);
     items[1] = mp_obj_new_int(s_frag_progress_nb);
     items[2] = mp_obj_new_int(s_frag_progress_size);
     items[3] = mp_obj_new_int(s_frag_progress_lost);
-    mp_call_function_1(s_lora_obj->fragmentation_progress_callback,
-                       mp_obj_new_tuple(4, items));
+    mp_call_function_n_kw(s_lora_obj->fragmentation_progress_callback, 4, 0, items);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_frag_progress_trampoline_obj,
@@ -530,15 +530,12 @@ static mp_obj_t lorawan_frag_done_trampoline(mp_obj_t arg) {
     if (!s_lora_obj || s_lora_obj->fragmentation_done_callback == mp_const_none) {
         return mp_const_none;
     }
+    // Callback signature: on_done(status, size)
     // status=0 → success; >0 → number of missing fragments; -1 → ongoing; -2 → not started.
-    // size is the file size after reassembly; buffer is read back via
-    // lorawan_fragmentation_buffer() — exposed to Python via the
-    // fragmentation_data() method.
-    mp_obj_t items[2];
-    items[0] = mp_obj_new_int(s_lora_obj->fragmentation_last_status);
-    items[1] = mp_obj_new_int_from_uint(s_lora_obj->fragmentation_last_size);
-    mp_call_function_1(s_lora_obj->fragmentation_done_callback,
-                       mp_obj_new_tuple(2, items));
+    // size is the file size after reassembly; read the buffer back via fragmentation_data().
+    mp_obj_t status = mp_obj_new_int(s_lora_obj->fragmentation_last_status);
+    mp_obj_t size   = mp_obj_new_int_from_uint(s_lora_obj->fragmentation_last_size);
+    mp_call_function_2(s_lora_obj->fragmentation_done_callback, status, size);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_frag_done_trampoline_obj,
@@ -2050,7 +2047,7 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
         ARG_region, ARG_radio, ARG_device_class,
         ARG_spi_id, ARG_mosi, ARG_miso, ARG_sclk,
         ARG_cs, ARG_reset, ARG_irq, ARG_busy,
-        ARG_lorawan_version, ARG_rx2_dr, ARG_rx2_freq, ARG_tx_power,
+        ARG_lorawan_version, ARG_rx2_datarate, ARG_rx2_dr, ARG_rx2_freq, ARG_tx_power,
         ARG_antenna_gain,
     };
     static const mp_arg_t allowed_args[] = {
@@ -2070,9 +2067,10 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
         { MP_QSTR_lorawan_version,  MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = LORAWAN_V1_0_4} },
         // RX2 window — each field independently falls through to the region's
         // PHY_DEF_RX2 (standard LoRaWAN DR_0 / region default freq). For TTN
-        // EU868, typically just rx2_dr=DR_3 is needed (the 869.525 MHz freq
-        // matches the EU868 default).
-        { MP_QSTR_rx2_dr,           MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
+        // EU868, typically just rx2_datarate=DR_3 is needed (the 869.525 MHz
+        // freq matches the EU868 region default).
+        { MP_QSTR_rx2_datarate,     MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_rx2_dr,           MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },  // deprecated alias
         { MP_QSTR_rx2_freq,         MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = -1} },
         // TX power in dBm EIRP. None = use region maximum (16 dBm for EU868).
         // Internally converted to MAC TX_POWER index; getter also returns dBm.
@@ -2105,12 +2103,16 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
 
     // RX2 override: each kwarg is independent. Unset fields fall through to
     // the MAC's PHY_DEF_RX2 (standard LoRaWAN DR_0 / region default freq).
-    // TTN EU868 users typically only need rx2_dr=DR_3 — the 869.525 MHz freq
-    // is already the EU868 region default. Sentinel: rx2_dr=0xFF, rx2_freq=0
-    // mean "not overridden".
-    int rx2_dr_arg   = args[ARG_rx2_dr].u_int;
+    // TTN EU868 users typically only need rx2_datarate=DR_3 — the 869.525 MHz
+    // freq is already the EU868 region default.
+    // Sentinels: rx2_dr (internal field) = 0xFF, rx2_freq = 0 mean "not overridden".
+    // rx2_datarate takes precedence over the deprecated rx2_dr alias.
+    int rx2_datarate_arg = args[ARG_rx2_datarate].u_int;
+    int rx2_dr_arg       = args[ARG_rx2_dr].u_int;
+    int rx2_dr_val       = (rx2_datarate_arg >= 0) ? rx2_datarate_arg
+                         : (rx2_dr_arg       >= 0) ? rx2_dr_arg : -1;
     int rx2_freq_arg = args[ARG_rx2_freq].u_int;
-    self->rx2_dr   = (rx2_dr_arg   < 0) ? 0xFF : (uint8_t)rx2_dr_arg;
+    self->rx2_dr   = (rx2_dr_val   < 0) ? 0xFF : (uint8_t)rx2_dr_val;
     self->rx2_freq = (rx2_freq_arg < 0) ? 0    : (uint32_t)rx2_freq_arg;
     self->rx_callback        = mp_const_none;
     self->tx_callback        = mp_const_none;
@@ -2449,7 +2451,7 @@ static mp_obj_t lorawan_send(size_t n_args, const mp_obj_t *pos_args,
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("send failed"));
     }
     if (!(bits & EVT_TX_DONE)) {
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("send timeout"));
+        mp_raise_OSError(MP_ETIMEDOUT);
     }
 
     return mp_const_none;
@@ -2491,7 +2493,7 @@ static mp_obj_t lorawan_stats(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_stats_obj, lorawan_stats);
 
-// recv(timeout=10) -> (data, port, rssi, snr) or None
+// recv(timeout=10) -> (data, port, rssi, snr, multicast) or None
 // Blocks until a downlink arrives or the timeout (seconds) expires.
 // Use timeout=0 to poll without blocking.
 static mp_obj_t lorawan_recv(size_t n_args, const mp_obj_t *pos_args,
@@ -2766,43 +2768,50 @@ static mp_obj_t lorawan_time_until_tx(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_time_until_tx_obj, lorawan_time_until_tx);
 
-// request_class(cls) — request a switch to CLASS_A, CLASS_B or CLASS_C.
-// CLASS_A / CLASS_C: LoRaMAC-node performs the transition synchronously via
-// MIB_DEVICE_CLASS; on_class_change fires before the call returns.
-// CLASS_B: requires time sync (call request_device_time() + send() first) and
-// is multi-step — the call returns once beacon acquisition starts; the actual
-// class change is signalled later via on_class_change(CLASS_B). Beacon events
-// (lock, loss, acquisition fail) are surfaced via on_beacon(cb).
-static mp_obj_t lorawan_request_class(mp_obj_t self_in, mp_obj_t cls_in) {
-    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+// device_class(cls=None) — getter/setter for the current device class.
+//
+// Getter (no arg): returns CLASS_A, CLASS_B, or CLASS_C.
+//
+// Setter (with cls): requests a class transition.
+//   CLASS_A / CLASS_C: transition is synchronous via MIB_DEVICE_CLASS;
+//   on_class_change fires before the call returns.
+//   CLASS_B: transition is asynchronous — requires prior time sync
+//   (request_device_time() + send()). The call returns immediately once
+//   beacon acquisition starts; on_class_change(CLASS_B) fires later when
+//   the beacon is locked and the ping slot is negotiated. Beacon events
+//   (lock, loss, acquisition fail) are surfaced via on_beacon(cb).
+static mp_obj_t lorawan_device_class(size_t n_args, const mp_obj_t *args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    if (n_args == 1) {
+        return mp_obj_new_int((int)self->device_class);
+    }
     if (!self->initialized) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
     }
-    int cls = mp_obj_get_int(cls_in);
+    int cls = mp_obj_get_int(args[1]);
     if (cls != CLASS_A && cls != CLASS_B && cls != CLASS_C) {
         mp_raise_ValueError(MP_ERROR_TEXT("class must be CLASS_A, CLASS_B or CLASS_C"));
     }
     if (cls == CLASS_B && !self->joined) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("CLASS_B requires a joined session"));
     }
-
     lorawan_cmd_data_t cmd;
     cmd.cmd = CMD_SET_CLASS;
     cmd.device_class = (uint8_t)cls;
     EventBits_t bits = send_cmd_wait_result(&cmd, EVT_CLASS_OK | EVT_CLASS_ERROR);
     if (bits & EVT_CLASS_ERROR) {
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("class switch failed"));
+        mp_raise_OSError(MP_EIO);
     }
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_request_class_obj, lorawan_request_class);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_device_class_obj, 1, 2, lorawan_device_class);
 
-// device_class() — returns the current device class (CLASS_A, CLASS_B, CLASS_C).
-static mp_obj_t lorawan_device_class(mp_obj_t self_in) {
-    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    return mp_obj_new_int((int)self->device_class);
+// request_class(cls) — deprecated alias for device_class(cls).
+static mp_obj_t lorawan_request_class(mp_obj_t self_in, mp_obj_t cls_in) {
+    const mp_obj_t fwd[2] = { self_in, cls_in };
+    return lorawan_device_class(2, fwd);
 }
-static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_device_class_obj, lorawan_device_class);
+static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_request_class_obj, lorawan_request_class);
 
 // region() — returns the LORAMAC_REGION_* the object was constructed with.
 // Cached on lorawan_obj_t.region at __init__ — no MAC round-trip.
@@ -2956,7 +2965,7 @@ static mp_obj_t lorawan_link_check(size_t n_args, const mp_obj_t *pos_args,
             mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("link_check send failed"));
         }
         if (!(bits & EVT_TX_DONE)) {
-            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("link_check send timeout"));
+            mp_raise_OSError(MP_ETIMEDOUT);
         }
     }
 
@@ -3577,7 +3586,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("0.18.0", 6);
+    return mp_obj_new_str("1.0.0", 5);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 

@@ -100,7 +100,7 @@ def main():
     hw = tbeam.detect()
     print("tbeam:", hw)
 
-    lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_dr=lorawan.DR_3)
+    lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_datarate=lorawan.DR_3)
 
     # ADR lets the server pick the most efficient DR for this node — crucial
     # for battery life on a device that sleeps most of the time.
@@ -122,7 +122,7 @@ def main():
 
     try:
         lw.send(payload, port=UPLINK_PORT)
-    except RuntimeError as e:
+    except (OSError, RuntimeError) as e:
         # Transient failure — persist whatever state we have and sleep anyway.
         # The FCntUp isn't advanced on a failed send, so the network stays in
         # sync.
@@ -135,7 +135,7 @@ def main():
 
         pkt = lw.recv(timeout=0)
         if pkt:
-            data, port, rssi, snr = pkt
+            data, port, rssi, snr, multicast = pkt
             print(f"downlink port={port} rssi={rssi} snr={snr}: {data!r}")
 
     # Always save before sleep — otherwise FCntUp is lost and next boot
