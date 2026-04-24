@@ -1,6 +1,8 @@
 MicroPython + LoRaWAN (T-Beam)
 ==============================
 
+[![Flash firmware](https://img.shields.io/badge/Flash_firmware-from_browser-blue?logo=googlechrome&logoColor=white)](https://nunomcruz.github.io/micropython-lorawan/)
+
 Fork of [MicroPython](https://micropython.org/) v1.29.0-preview with a full LoRaWAN MAC stack for LILYGO TTGO T-Beam boards.
 
 ## What this fork adds
