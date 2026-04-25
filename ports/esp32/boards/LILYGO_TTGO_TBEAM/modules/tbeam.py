@@ -77,6 +77,9 @@ def _detect_radio():
     spi.write_readinto(b"\x42\x00", buf)
     cs.value(1)
     spi.deinit()
+    # Release GPIOs so the C HAL can reconfigure them cleanly from scratch.
+    Pin(SPI_CS, Pin.IN)
+    Pin(LORA_RST, Pin.IN)
 
     return "sx1276" if buf[1] == 0x12 else "sx1262"
 
@@ -84,15 +87,18 @@ def _detect_radio():
 def _detect_pmu():
     """Detect PMU chip via I2C. Returns 'axp192', 'axp2101', or None for v0.7 (no PMU)."""
     i2c = I2C(0, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=400_000)
-    if PMU_ADDR not in i2c.scan():
-        return None  # v0.7 has no I2C PMU (uses TP4054 charger + ADC divider)
     try:
-        # AXP2101 chip ID register 0x03 returns 0x4A or 0x4B (>= 0x40)
-        # AXP192 register 0x03 is power status, always < 0x10
-        val = i2c.readfrom_mem(PMU_ADDR, 0x03, 1)[0]
-        return "axp2101" if val >= 0x40 else "axp192"
-    except Exception:
-        return None
+        if PMU_ADDR not in i2c.scan():
+            return None  # v0.7 has no I2C PMU (uses TP4054 charger + ADC divider)
+        try:
+            # AXP2101 chip ID register 0x03 returns 0x4A or 0x4B (>= 0x40)
+            # AXP192 register 0x03 is power status, always < 0x10
+            val = i2c.readfrom_mem(PMU_ADDR, 0x03, 1)[0]
+            return "axp2101" if val >= 0x40 else "axp192"
+        except Exception:
+            return None
+    finally:
+        i2c.deinit()
 
 
 def _detect_gps_pins(has_pmu):
@@ -103,8 +109,10 @@ def _detect_gps_pins(has_pmu):
     # v1.0+ default. Try to confirm with live NMEA data.
     try:
         uart = UART(1, baudrate=9600, rx=34, tx=12, timeout=2000)
-        data = uart.read(32)
-        uart.deinit()
+        try:
+            data = uart.read(32)
+        finally:
+            uart.deinit()
         if data and b"$G" in data:
             return _GPS_V10_PLUS
     except Exception:
@@ -117,7 +125,10 @@ def _detect_gps_pins(has_pmu):
 def _detect_oled():
     """Return True if an SSD1306 OLED is present on I2C address 0x3C."""
     i2c = I2C(0, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=400_000)
-    return OLED_ADDR in i2c.scan()
+    try:
+        return OLED_ADDR in i2c.scan()
+    finally:
+        i2c.deinit()
 
 
 def detect():
