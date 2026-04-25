@@ -62,7 +62,7 @@ class HardwareInfo:
 
 def _detect_radio():
     """Read SPI register 0x42 (SX1276 RegVersion). Returns 'sx1276' if 0x12, else 'sx1262'."""
-    spi = SPI(1, baudrate=1_000_000, polarity=0, phase=0,
+    spi = SPI(2, baudrate=1_000_000, polarity=0, phase=0,
               sck=Pin(SPI_SCLK), mosi=Pin(SPI_MOSI), miso=Pin(SPI_MISO))
     cs = Pin(SPI_CS, Pin.OUT, value=1)
     rst = Pin(LORA_RST, Pin.OUT, value=1)
@@ -152,7 +152,7 @@ def detect():
 
 def lora_spi(baudrate=10_000_000):
     """Return the SPI bus configured for the LoRa radio."""
-    return SPI(1, baudrate=baudrate, polarity=0, phase=0,
+    return SPI(2, baudrate=baudrate, polarity=0, phase=0,
                sck=Pin(SPI_SCLK), mosi=Pin(SPI_MOSI), miso=Pin(SPI_MISO))
 
 
