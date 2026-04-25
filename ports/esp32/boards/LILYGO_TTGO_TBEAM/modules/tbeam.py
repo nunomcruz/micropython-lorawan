@@ -87,18 +87,15 @@ def _detect_radio():
 def _detect_pmu():
     """Detect PMU chip via I2C. Returns 'axp192', 'axp2101', or None for v0.7 (no PMU)."""
     i2c = I2C(0, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=400_000)
+    if PMU_ADDR not in i2c.scan():
+        return None  # v0.7 has no I2C PMU (uses TP4054 charger + ADC divider)
     try:
-        if PMU_ADDR not in i2c.scan():
-            return None  # v0.7 has no I2C PMU (uses TP4054 charger + ADC divider)
-        try:
-            # AXP2101 chip ID register 0x03 returns 0x4A or 0x4B (>= 0x40)
-            # AXP192 register 0x03 is power status, always < 0x10
-            val = i2c.readfrom_mem(PMU_ADDR, 0x03, 1)[0]
-            return "axp2101" if val >= 0x40 else "axp192"
-        except Exception:
-            return None
-    finally:
-        i2c.deinit()
+        # AXP2101 chip ID register 0x03 returns 0x4A or 0x4B (>= 0x40)
+        # AXP192 register 0x03 is power status, always < 0x10
+        val = i2c.readfrom_mem(PMU_ADDR, 0x03, 1)[0]
+        return "axp2101" if val >= 0x40 else "axp192"
+    except Exception:
+        return None
 
 
 def _detect_gps_pins(has_pmu):
@@ -125,10 +122,7 @@ def _detect_gps_pins(has_pmu):
 def _detect_oled():
     """Return True if an SSD1306 OLED is present on I2C address 0x3C."""
     i2c = I2C(0, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=400_000)
-    try:
-        return OLED_ADDR in i2c.scan()
-    finally:
-        i2c.deinit()
+    return OLED_ADDR in i2c.scan()
 
 
 def detect():
