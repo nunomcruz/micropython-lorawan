@@ -345,9 +345,9 @@ The reason back-to-back `send()` calls *appear* to ignore the duty cycle is a ha
 
 #### Channel management (optional — needed if anyone deploys outside TTN defaults)
 
-- [ ] `lw.add_channel(index, freq, dr_min, dr_max)` — wraps `MIB_CHANNELS` + `LoRaMacChannelAdd`. Only meaningful on regions with dynamic channels (EU868, EU433).
-- [ ] `lw.remove_channel(index)` — `LoRaMacChannelRemove`.
-- [ ] `lw.channels()` — list of active channels with their params (from `MIB_CHANNELS`).
+- [x] `lw.add_channel(index, freq, dr_min, dr_max)` — wraps `LoRaMacChannelAdd`. CMD_CHANNEL_ADD dispatched via FreeRTOS queue; Python validates index 0..15 and dr range; MAC enforces EU868 protection of indexes 0..2.
+- [x] `lw.remove_channel(index)` — `LoRaMacChannelRemove`. CMD_CHANNEL_REMOVE.
+- [x] `lw.channels()` — list of active channels with their params. CMD_QUERY / LW_QUERY_CHANNELS snapshots MIB_CHANNELS + MIB_CHANNELS_MASK into static buffers; Python builds list filtering by mask and non-zero frequency.
 
 #### Stats expansion
 

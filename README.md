@@ -648,6 +648,44 @@ Unlike `link_check()` / `request_device_time()` (piggy-back), a rejoin is itself
 
 ---
 
+### Channel management
+
+By default the EU868 region starts with three mandatory channels (868.1 / 868.3 / 868.5 MHz). With OTAA, TTN sends five additional channels (867.1 / 867.3 / 867.5 / 867.7 / 867.9 MHz) in the CFList of the Join-Accept. With ABP those channels are never provisioned automatically — add them manually after `join_abp()`.
+
+#### `lw.add_channel(index, frequency, dr_min, dr_max)`
+
+Adds or replaces a MAC channel. Indexes 0–2 are the three EU868 default channels protected by the MAC (attempting to overwrite them raises `RuntimeError`). Use indexes 3–15 for extra channels.
+
+```python
+# Add the 5 extra TTN EU868 channels after ABP join
+extra = [867100000, 867300000, 867500000, 867700000, 867900000]
+for i, freq in enumerate(extra, start=3):
+    lw.add_channel(index=i, frequency=freq, dr_min=0, dr_max=5)
+```
+
+#### `lw.remove_channel(index)`
+
+Disables a channel and clears it from the region channel mask. Indexes 0–2 are protected and cannot be removed.
+
+```python
+lw.remove_channel(index=7)
+```
+
+#### `lw.channels()` → `list[dict]`
+
+Returns all currently active channels. Each dict has `index`, `frequency` (Hz), `dr_min`, and `dr_max`.
+
+```python
+lw.channels()
+# [{'index': 0, 'frequency': 868100000, 'dr_min': 0, 'dr_max': 5},
+#  {'index': 1, 'frequency': 868300000, 'dr_min': 0, 'dr_max': 5},
+#  {'index': 2, 'frequency': 868500000, 'dr_min': 0, 'dr_max': 5},
+#  {'index': 3, 'frequency': 867100000, 'dr_min': 0, 'dr_max': 5},
+#  ...]
+```
+
+---
+
 ### Multicast
 
 Up to 4 multicast groups (indices 0–3) can be active simultaneously. Multicast frames are received on either the Class C continuous RX window or the Class B ping slots, depending on the group's RX params.

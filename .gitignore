@@ -37,3 +37,4 @@ CLAUDE.md
 
 # Flasher binaries (live on gh-pages branch only)
 flasher/*.bin
+.mpy-workbench/tree-paths.json

@@ -10,6 +10,10 @@
 // Phase 5, Session 16:   lifecycle — deinit() / __del__ / __enter__ / __exit__.
 //                         Finaliser-backed allocation so the GC sweep during
 //                         soft-reset tears down the FreeRTOS task + radio HAL.
+// Channel management:     add_channel / remove_channel / channels — wraps
+//                         LoRaMacChannelAdd / LoRaMacChannelRemove and MIB_CHANNELS
+//                         query. Needed for ABP on EU868 to add the 5 extra TTN
+//                         channels (867.1–867.9 MHz) that OTAA gets via CFList.
 // FreeRTOS task owns all MAC calls; Python thread communicates via queue + event group.
 
 #include <stdint.h>
@@ -146,12 +150,19 @@ typedef enum {
     CMD_FRAGMENTATION_ENABLE,
     CMD_DEINIT,
     CMD_QUERY,
+    CMD_CHANNEL_ADD,
+    CMD_CHANNEL_REMOVE,
 } lorawan_cmd_t;
 
 // Query sub-types for CMD_QUERY. Result is written to s_query_* statics
 // before EVT_COMPLETED fires; the Python caller reads them after send_cmd_wait.
 #define LW_QUERY_DEV_ADDR        0
 #define LW_QUERY_MAX_PAYLOAD_LEN 1
+#define LW_QUERY_CHANNELS        2
+
+// EU868 / EU433 have at most 16 channels (one mask word). Other dynamic-channel
+// regions also fit in 16. Fixed-plan regions (US915, AU915) do not use these APIs.
+#define LW_MAX_CHANNELS  16
 
 typedef struct {
     uint32_t dev_addr;
@@ -179,6 +190,13 @@ typedef struct {
 typedef struct {
     uint32_t buffer_size;
 } cmd_frag_enable_t;
+
+typedef struct {
+    uint8_t  index;       // 0..15; EU868 protects 0..2 (MAC returns error)
+    uint32_t frequency;   // Hz
+    int8_t   dr_min;      // DR_0..DR_5
+    int8_t   dr_max;      // DR_0..DR_5
+} cmd_channel_add_t;
 
 typedef struct {
     uint8_t dev_eui[8];
@@ -223,6 +241,8 @@ typedef struct {
         cmd_frag_enable_t frag_enable;
         uint8_t         query_type;         // CMD_QUERY: LW_QUERY_*
         int8_t          dr_override;        // CMD_CLOCK_SYNC_REQUEST: DR_0..DR_5; -1 = keep MIB
+        cmd_channel_add_t channel_add;      // CMD_CHANNEL_ADD
+        uint8_t         channel_index;      // CMD_CHANNEL_REMOVE: 0..15
     };
 } lorawan_cmd_data_t;
 
@@ -386,8 +406,10 @@ static uint8_t       s_otaa_nwk_key[16]; // 1.0.x: same as app_key; 1.1: separat
 // CMD_QUERY result statics. Written by the LoRaWAN task before EVT_COMPLETED;
 // read by the Python thread after send_cmd_wait returns. Safe because the
 // caller is blocked on the event group while the task fills these.
-static uint32_t      s_query_dev_addr;
-static uint8_t       s_query_max_payload_len;
+static uint32_t        s_query_dev_addr;
+static uint8_t         s_query_max_payload_len;
+static ChannelParams_t s_query_channels[LW_MAX_CHANNELS];
+static uint16_t        s_query_channels_mask;
 
 // ---- TX power dBm ↔ MAC index conversion ----
 //
@@ -1908,10 +1930,62 @@ static void lorawan_task(void *arg) {
                     }
                     break;
                 }
+                case LW_QUERY_CHANNELS: {
+                    memset(s_query_channels, 0, sizeof(s_query_channels));
+                    s_query_channels_mask = 0;
+                    MibRequestConfirm_t ch_mib;
+                    ch_mib.Type = MIB_CHANNELS;
+                    if (LoRaMacMibGetRequestConfirm(&ch_mib) == LORAMAC_STATUS_OK
+                        && ch_mib.Param.ChannelList != NULL) {
+                        memcpy(s_query_channels, ch_mib.Param.ChannelList,
+                               LW_MAX_CHANNELS * sizeof(ChannelParams_t));
+                    }
+                    ch_mib.Type = MIB_CHANNELS_MASK;
+                    if (LoRaMacMibGetRequestConfirm(&ch_mib) == LORAMAC_STATUS_OK
+                        && ch_mib.Param.ChannelsMask != NULL) {
+                        s_query_channels_mask = ch_mib.Param.ChannelsMask[0];
+                    }
+                    break;
+                }
                 default:
                     break;
                 }
                 xEventGroupSetBits(s_events, EVT_COMPLETED);
+                break;
+            }
+
+            case CMD_CHANNEL_ADD: {
+                ChannelParams_t params;
+                params.Frequency    = cmd.channel_add.frequency;
+                params.Rx1Frequency = 0;
+                params.DrRange.Fields.Min = cmd.channel_add.dr_min;
+                params.DrRange.Fields.Max = cmd.channel_add.dr_max;
+                params.Band         = 0;
+                LoRaMacStatus_t st = LoRaMacChannelAdd(cmd.channel_add.index, params);
+                if (st == LORAMAC_STATUS_OK) {
+                    esp_rom_printf("lorawan: channel %u added freq=%lu DR=%d..%d\n",
+                                   (unsigned)cmd.channel_add.index,
+                                   (unsigned long)cmd.channel_add.frequency,
+                                   (int)cmd.channel_add.dr_min,
+                                   (int)cmd.channel_add.dr_max);
+                    xEventGroupSetBits(s_events, EVT_COMPLETED);
+                } else {
+                    esp_rom_printf("lorawan: LoRaMacChannelAdd failed: %d\n", (int)st);
+                    xEventGroupSetBits(s_events, EVT_TX_ERROR);
+                }
+                break;
+            }
+
+            case CMD_CHANNEL_REMOVE: {
+                LoRaMacStatus_t st = LoRaMacChannelRemove(cmd.channel_index);
+                if (st == LORAMAC_STATUS_OK) {
+                    esp_rom_printf("lorawan: channel %u removed\n",
+                                   (unsigned)cmd.channel_index);
+                    xEventGroupSetBits(s_events, EVT_COMPLETED);
+                } else {
+                    esp_rom_printf("lorawan: LoRaMacChannelRemove failed: %d\n", (int)st);
+                    xEventGroupSetBits(s_events, EVT_TX_ERROR);
+                }
                 break;
             }
 
@@ -3357,6 +3431,108 @@ static mp_obj_t lorawan_multicast_list(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_multicast_list_obj, lorawan_multicast_list);
 
+// add_channel(index, frequency, dr_min, dr_max) — adds or replaces a MAC channel.
+// On EU868 indexes 0..2 are the default protected channels; the MAC will return
+// an error if you try to overwrite them. Use indexes 3..15 for extra channels.
+// On TTN EU868 the 5 extra channels (867.1 / 867.3 / 867.5 / 867.7 / 867.9 MHz)
+// are sent in the CFList of a Join-Accept; with ABP they must be added manually.
+static mp_obj_t lorawan_add_channel(size_t n_args, const mp_obj_t *pos_args,
+                                     mp_map_t *kw_args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    enum { ARG_index, ARG_frequency, ARG_dr_min, ARG_dr_max };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_index,     MP_ARG_REQUIRED | MP_ARG_INT },
+        { MP_QSTR_frequency, MP_ARG_REQUIRED | MP_ARG_INT },
+        { MP_QSTR_dr_min,    MP_ARG_REQUIRED | MP_ARG_INT },
+        { MP_QSTR_dr_max,    MP_ARG_REQUIRED | MP_ARG_INT },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
+                     MP_ARRAY_SIZE(allowed), allowed, args);
+    int index  = args[ARG_index].u_int;
+    int dr_min = args[ARG_dr_min].u_int;
+    int dr_max = args[ARG_dr_max].u_int;
+    if (index < 0 || index >= LW_MAX_CHANNELS) {
+        mp_raise_ValueError(MP_ERROR_TEXT("index must be 0..15"));
+    }
+    if (dr_min < 0 || dr_min > 15 || dr_max < 0 || dr_max > 15 || dr_min > dr_max) {
+        mp_raise_ValueError(MP_ERROR_TEXT("dr_min/dr_max out of range or dr_min > dr_max"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_CHANNEL_ADD };
+    cmd.channel_add.index     = (uint8_t)index;
+    cmd.channel_add.frequency = (uint32_t)args[ARG_frequency].u_int;
+    cmd.channel_add.dr_min    = (int8_t)dr_min;
+    cmd.channel_add.dr_max    = (int8_t)dr_max;
+    EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
+    if (bits & EVT_TX_ERROR) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("add_channel failed"));
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_add_channel_obj, 1, lorawan_add_channel);
+
+// remove_channel(index) — disables a channel; index 0..15.
+// On EU868 indexes 0..2 are the default protected channels and cannot be removed.
+static mp_obj_t lorawan_remove_channel(size_t n_args, const mp_obj_t *pos_args,
+                                        mp_map_t *kw_args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    enum { ARG_index };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_index, MP_ARG_REQUIRED | MP_ARG_INT },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
+                     MP_ARRAY_SIZE(allowed), allowed, args);
+    int index = args[ARG_index].u_int;
+    if (index < 0 || index >= LW_MAX_CHANNELS) {
+        mp_raise_ValueError(MP_ERROR_TEXT("index must be 0..15"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_CHANNEL_REMOVE };
+    cmd.channel_index = (uint8_t)index;
+    EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
+    if (bits & EVT_TX_ERROR) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("remove_channel failed"));
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_remove_channel_obj, 1, lorawan_remove_channel);
+
+// channels() — returns a list of active channel dicts (index, frequency, dr_min, dr_max).
+// Channels not set in the region mask are excluded, as are slots with frequency==0.
+static mp_obj_t lorawan_channels(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_QUERY };
+    cmd.query_type = LW_QUERY_CHANNELS;
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+
+    mp_obj_t list = mp_obj_new_list(0, NULL);
+    for (int i = 0; i < LW_MAX_CHANNELS; i++) {
+        if (!(s_query_channels_mask & (uint16_t)(1u << i))) continue;
+        if (s_query_channels[i].Frequency == 0) continue;
+        mp_obj_t d = mp_obj_new_dict(0);
+        mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_index),
+                          mp_obj_new_int(i));
+        mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_frequency),
+                          mp_obj_new_int_from_uint(s_query_channels[i].Frequency));
+        mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_dr_min),
+                          mp_obj_new_int(s_query_channels[i].DrRange.Fields.Min));
+        mp_obj_dict_store(d, MP_ROM_QSTR(MP_QSTR_dr_max),
+                          mp_obj_new_int(s_query_channels[i].DrRange.Fields.Max));
+        mp_obj_list_append(list, d);
+    }
+    return list;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_channels_obj, lorawan_channels);
+
 // remote_multicast_enable() — register LmhpRemoteMcastSetup (port 200).
 // After registration the network server may provision groups remotely via
 // McGroupSetupReq / McGroupClassCSessionReq; the package forwards the class
@@ -3557,6 +3733,10 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_clock_sync_enable),  MP_ROM_PTR(&lorawan_clock_sync_enable_obj) },
     { MP_ROM_QSTR(MP_QSTR_clock_sync_request), MP_ROM_PTR(&lorawan_clock_sync_request_obj) },
     { MP_ROM_QSTR(MP_QSTR_synced_time),        MP_ROM_PTR(&lorawan_synced_time_obj) },
+    // Channel management
+    { MP_ROM_QSTR(MP_QSTR_add_channel),    MP_ROM_PTR(&lorawan_add_channel_obj) },
+    { MP_ROM_QSTR(MP_QSTR_remove_channel), MP_ROM_PTR(&lorawan_remove_channel_obj) },
+    { MP_ROM_QSTR(MP_QSTR_channels),       MP_ROM_PTR(&lorawan_channels_obj) },
     // Multicast (Session 14)
     { MP_ROM_QSTR(MP_QSTR_multicast_add),       MP_ROM_PTR(&lorawan_multicast_add_obj) },
     { MP_ROM_QSTR(MP_QSTR_multicast_rx_params), MP_ROM_PTR(&lorawan_multicast_rx_params_obj) },
