@@ -176,6 +176,14 @@
         </span>
       </esp-web-install-button>
 
+      <div class="install-notes">
+        <p>The install dialog shows an <strong>"Erase device"</strong> option:</p>
+        <ul>
+          <li><strong>First install</strong> – check "Erase device" for a clean start</li>
+          <li><strong>Firmware update</strong> – leave it unchecked to keep your Python files (main.py, config.py, lib/) on the device</li>
+        </ul>
+      </div>
+
       <div class="warning">
         On Windows you may need to install the
         <a href="https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers"
@@ -189,6 +197,7 @@
       <ul class="steps">
         <li>Connect the T-Beam to your computer with a USB cable</li>
         <li>Click "Install firmware" above and select the serial port</li>
+        <li>First install: check "Erase device"; update: leave unchecked</li>
         <li>Wait for the flash to complete (about 30 seconds)</li>
         <li>Open a serial terminal at 115200 baud to access the REPL</li>
       </ul>

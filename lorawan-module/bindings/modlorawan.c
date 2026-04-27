@@ -2114,6 +2114,8 @@ static EventBits_t send_cmd_wait_result(lorawan_cmd_data_t *cmd, EventBits_t wai
 
 // ---- Python type: lorawan.LoRaWAN ----
 
+static mp_obj_t lorawan_deinit(mp_obj_t self_in);  // forward declaration
+
 static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
                                   size_t n_args, size_t n_kw,
                                   const mp_obj_t *all_args) {
@@ -2159,8 +2161,7 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
                                MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
     if (s_task_handle != NULL) {
-        mp_raise_msg(&mp_type_RuntimeError,
-                     MP_ERROR_TEXT("LoRaWAN already initialized; reset first"));
+        lorawan_deinit(MP_OBJ_FROM_PTR(s_lora_obj));
     }
 
     // Finaliser-backed allocation so the GC's sweep during soft-reset

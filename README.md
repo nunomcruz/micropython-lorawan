@@ -785,19 +785,21 @@ Returns the reassembled buffer (full size — slice down to the `size` reported 
 
 ### Lifecycle
 
-The LoRaWAN stack owns a FreeRTOS task, the SPI bus, DIO interrupt handlers and an `esp_timer` — resources that live outside the MicroPython heap. Tearing them down cleanly matters whenever you want to re-create the object without a hard reset, or when the REPL's soft-reset (`Ctrl-D`) runs.
+The LoRaWAN stack owns a FreeRTOS task, the SPI bus, DIO interrupt handlers and an `esp_timer` — resources that live outside the MicroPython heap. Tearing them down cleanly matters when the REPL's soft-reset (`Ctrl-D`) runs, or when you want to re-create the object with different parameters.
 
 #### `lw.deinit()`
 
-Ordered teardown, strict order: (1) deregister DIO ISRs first so no in-flight interrupt can dispatch into half-torn-down MAC state; (2) stop the MAC (`LoRaMacDeInitialization`, falling back to a radio sleep if a TX/RX is in flight — SPI is still up at this point so the sleep command reaches the radio); (3) drop LmHandler package registrations and any FUOTA buffer; (4) release the SPI bus, delete the `esp_timer` backing the MAC timer list, and let the LoRaWAN task self-delete. Idempotent — safe to call twice. After `deinit()` a fresh `lorawan.LoRaWAN(...)` in the same REPL session works.
+Ordered teardown, strict order: (1) deregister DIO ISRs first so no in-flight interrupt can dispatch into half-torn-down MAC state; (2) stop the MAC (`LoRaMacDeInitialization`, falling back to a radio sleep if a TX/RX is in flight — SPI is still up at this point so the sleep command reaches the radio); (3) drop LmHandler package registrations and any FUOTA buffer; (4) release the SPI bus, delete the `esp_timer` backing the MAC timer list, and let the LoRaWAN task self-delete. Idempotent — safe to call twice.
 
 If the MAC ever stalls past the 2 s bounded wait on teardown, the Python side logs a warning and leaves the internal command queue / rx queue / event group in place rather than free them while the task may still be using them — a small leak is strictly preferable to a use-after-free.
+
+Calling `lorawan.LoRaWAN(...)` when an instance already exists automatically tears down the previous one — no explicit `deinit()` required. This matches the behaviour of `machine.SPI` and other MicroPython peripherals that simply reconfigure on re-creation.
 
 ```python
 lw = lorawan.LoRaWAN(region=lorawan.EU868)
 # ...
-lw.deinit()
-lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_datarate=lorawan.DR_3)   # now safe
+# Re-create with different parameters — previous instance is torn down automatically.
+lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_datarate=lorawan.DR_3)
 ```
 
 #### Soft-reset safety
