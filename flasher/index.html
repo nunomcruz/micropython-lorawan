@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MicroPython LoRaWAN – T-Beam Flasher</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px 20px;
+    }
+
+    .container {
+      max-width: 600px;
+      width: 100%;
+    }
+
+    h1 {
+      font-size: 1.8rem;
+      font-weight: 700;
+      margin-bottom: 8px;
+      color: #f8fafc;
+    }
+
+    .version {
+      font-size: 0.9rem;
+      color: #64748b;
+      margin-bottom: 32px;
+    }
+
+    .card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 32px;
+      margin-bottom: 24px;
+    }
+
+    .card h2 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin-bottom: 16px;
+      color: #f1f5f9;
+    }
+
+    .card p, .card li {
+      font-size: 0.95rem;
+      line-height: 1.6;
+      color: #94a3b8;
+    }
+
+    .card ul {
+      list-style: none;
+      padding: 0;
+    }
+
+    .card li::before {
+      content: "→ ";
+      color: #3b82f6;
+    }
+
+    .card li + li {
+      margin-top: 6px;
+    }
+
+    .flash-section {
+      text-align: center;
+      padding: 40px 32px;
+    }
+
+    .flash-section p {
+      margin-bottom: 24px;
+    }
+
+    esp-web-install-button {
+      display: inline-block;
+    }
+
+    /* Style the default button inside the web component */
+    esp-web-install-button::part(button) {
+      background: #3b82f6;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      padding: 14px 32px;
+      font-size: 1.05rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    esp-web-install-button::part(button):hover {
+      background: #2563eb;
+    }
+
+    .warning {
+      background: #1c1917;
+      border: 1px solid #854d0e;
+      border-radius: 8px;
+      padding: 16px;
+      margin-top: 16px;
+      font-size: 0.85rem;
+      color: #fbbf24;
+    }
+
+    .steps li {
+      padding: 4px 0;
+    }
+
+    footer {
+      margin-top: 40px;
+      font-size: 0.8rem;
+      color: #475569;
+      text-align: center;
+    }
+
+    footer a {
+      color: #64748b;
+      text-decoration: none;
+    }
+
+    footer a:hover {
+      color: #94a3b8;
+    }
+
+    .no-browser {
+      display: none;
+      background: #1c1917;
+      border: 1px solid #991b1b;
+      border-radius: 8px;
+      padding: 16px;
+      color: #fca5a5;
+      font-size: 0.9rem;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>MicroPython LoRaWAN</h1>
+    <p class="version">LILYGO T-Beam (v0.7 – v1.2) · SX1276 &amp; SX1262</p>
+
+    <div class="card">
+      <h2>What's included</h2>
+      <ul>
+        <li>MicroPython v1.29 with LoRaWAN support</li>
+        <li>LoRaMAC-node v4.7.0 (Class A/C, OTAA/ABP)</li>
+        <li>EU868 region (TTN compatible)</li>
+        <li>Runtime auto-detection of T-Beam hardware variant</li>
+      </ul>
+    </div>
+
+    <div class="card flash-section">
+      <h2>Flash firmware</h2>
+      <p>Connect your T-Beam via USB and click the button below.</p>
+
+      <script type="module"
+        src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module">
+      </script>
+
+      <esp-web-install-button manifest="manifest.json">
+        <button slot="activate">Install firmware</button>
+        <span slot="unsupported">
+          <div class="no-browser" style="display:block">
+            Your browser doesn't support Web Serial.<br>
+            Use <strong>Google Chrome</strong> or <strong>Microsoft Edge</strong>.
+          </div>
+        </span>
+      </esp-web-install-button>
+
+      <div class="install-notes">
+        <p>The install dialog shows an <strong>"Erase device"</strong> option:</p>
+        <ul>
+          <li><strong>First install</strong> – check "Erase device" for a clean start</li>
+          <li><strong>Firmware update</strong> – leave it unchecked to keep your Python files (main.py, config.py, lib/) on the device</li>
+        </ul>
+      </div>
+
+      <div class="warning">
+        On Windows you may need to install the
+        <a href="https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers"
+           target="_blank" style="color: #fbbf24; text-decoration: underline;">
+          CP210x USB driver</a> first.
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Instructions</h2>
+      <ul class="steps">
+        <li>Connect the T-Beam to your computer with a USB cable</li>
+        <li>Click "Install firmware" above and select the serial port</li>
+        <li>First install: check "Erase device"; update: leave unchecked</li>
+        <li>Wait for the flash to complete (about 30 seconds)</li>
+        <li>Open a serial terminal at 115200 baud to access the REPL</li>
+      </ul>
+    </div>
+  </div>
+
+  <footer>
+    Powered by <a href="https://esphome.github.io/esp-web-tools/" target="_blank">ESP Web Tools</a>
+    · <a href="https://github.com/ncruz/micropython-lorawan" target="_blank">Source on GitHub</a>
+  </footer>
+</body>
+</html>
