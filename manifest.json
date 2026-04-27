@@ -1,6 +1,7 @@
 {
   "name": "MicroPython LoRaWAN (T-Beam)",
-  "version": "v1.0.5-lorawan",
+  "version": "1.0.0",
+  "new_install_prompt_erase": true,
   "builds": [
     {
       "chipFamily": "ESP32",
