@@ -41,7 +41,7 @@ the LNS console), erase the `lorawan` NVS namespace:
 
 ```python
 import esp32
-esp32.NVS("lorawan").erase_key("ctx")  # namespace + blob name used by the module
+esp32.NVS("lorawan").erase_key("nvm_ctx")  # namespace + blob name used by the module
 ```
 
 ## Prerequisites for some scripts
