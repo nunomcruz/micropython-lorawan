@@ -444,6 +444,192 @@ Review of the full Python API surface identified several inconsistencies to fix 
 
 - [x] Bump version to 1.0.0 after API refinement — signals stable API surface
 
+### Session 21: Error handling and diagnostics
+
+Goal: every failure path raises a typed exception that carries the underlying
+LoRaMAC status code, plus a `last_error()` accessor for post-mortem. Today
+about a dozen call sites collapse the `LoRaMacStatus_t` (e.g. `MC_GROUP_UNDEFINED`
+vs `PARAMETER_INVALID` vs `BUSY`) to a generic `RuntimeError("<api> failed")`,
+which gives users no way to branch.
+
+- [ ] `send()` MAC-failure path: change `RuntimeError("send failed")` (modlorawan.c:2526)
+      to `OSError(EIO, "send: event_status=N")` where `N` is the
+      `LORAMAC_EVENT_INFO_STATUS_*` captured from `mcps_confirm`. Covers
+      `TX_TIMEOUT`, `RX1_TIMEOUT`, `RX2_TIMEOUT`, `MIC_FAIL`, `ADDRESS_FAIL`,
+      etc. The `OSError(ETIMEDOUT)` path on Python-side timeout already
+      matches the convention.
+- [ ] Plumb `LoRaMacStatus_t` through every CMD_* error path: replace the ~12
+      generic `mp_raise_msg(&mp_type_RuntimeError, "<api> failed")` sites in
+      `multicast_add`, `multicast_rx_params`, `multicast_remove`, `add_channel`,
+      `remove_channel`, `link_check send`, `fragmentation_enable`, etc., with
+      `OSError(EIO, "<api>: status=N")`. Capture the status into a per-cmd
+      `s_last_status` static before signalling `EVT_TX_ERROR`, then read it
+      from the Python wrapper before raising.
+- [ ] OTAA join failure: capture `c->Status` from the last `MLME_JOIN` confirm
+      into `s_last_join_status` (currently only printed via `esp_rom_printf`).
+      Append the status code to the existing `OSError(ETIMEDOUT)` from
+      `join_otaa`: `OSError(ETIMEDOUT, "join: last_status=N")`.
+- [ ] `lw.last_error()` → `dict | None`: returns
+      `{"loramac_status": int, "event_status": int, "context": "send|join|...",
+      "epoch_us": int}` from the most recent failure or `None`. Cleared after
+      a successful operation in the same context. Lets users post-mortem
+      without scraping `esp_rom_printf` UART logs.
+- [ ] Verify `EBUSY` semantics match the README. The README claims the
+      `OSError(EBUSY)` path means the frame was **not** queued; the LoRaMAC-node
+      v4.7.0 source returns `DUTYCYCLE_RESTRICTED` in some band-restricted
+      cases but returns `OK` with a non-zero `DutyCycleWaitTime` (queued via
+      `TxDelayedTimer`) in others. Audit the two paths to confirm
+      `EVT_TX_DUTY_CYCLE` is only raised in the not-queued case. If both
+      cases hit the same path, document precisely or split.
+- [ ] Tighten constructor's auto-deinit (`lorawan_make_new`, modlorawan.c:2163):
+      drop the `lorawan_deinit(MP_OBJ_FROM_PTR(s_lora_obj))` call and drive
+      teardown purely off the `s_task_handle` static. `s_lora_obj` could be a
+      dangling pointer if GC freed the previous instance before `__del__`
+      fired; today this happens to be benign (the deref only clears
+      `self->initialized`) but is a latent UAF.
+- [ ] README: expand the `send()` "Exceptions" block, replace the
+      `RuntimeError("send failed")` line with `OSError(EIO)`, document
+      `last_error()` with a worked example, and clarify `EBUSY` vs the
+      120 s blocking timeout for queued duty-cycle waits.
+- [ ] Version bump 1.0.0 → 1.1.0 (breaking change in exception types).
+
+### Session 22: API consistency cleanup
+
+Carryover items from Session 20 plus a few rough edges surfaced during the
+v1.0.0 review.
+
+- [ ] Drop the deprecated `request_class` alias (locals_dict_table:3719 +
+      modlorawan.c:2884). `device_class(cls)` has been the canonical setter
+      since Session 20; v1.0.0 was the "one release" grace window.
+- [ ] Decision on `network_time()` (modlorawan.c:2960): either remove or
+      rename to `last_sync_epoch()`. It returns the snapshot at last
+      DeviceTimeAns, which is rarely what users want — `synced_time()` covers
+      live and is already documented. Recommendation: remove; the snapshot is
+      available via `on_time_sync(cb)` capture.
+- [ ] Make `recv()` and `on_rx()` mutually exclusive at the binding level:
+      raise `RuntimeError("on_rx is registered; recv() disabled")` in `recv()`
+      when `self->rx_callback != mp_const_none`. Today both consume
+      `s_rx_queue`, with whichever wakes first winning — the README documents
+      "do not use both" but nothing enforces it. Concrete error beats latent
+      silently-dropped callbacks.
+- [ ] `tx_counter` in `stats()` is set only on TX success (modlorawan.c:638),
+      so failed sends leave it stale. Either also update on failure (mirror
+      the MAC FCntUp at the moment of failure) or rename the dict key to
+      `last_tx_fcnt_up`. Recommendation: rename + add the live `frame_counters()`
+      getter (Session 23) for users who want MAC truth.
+- [ ] Export `DR_6` (SF7/BW250 EU868) and `DR_7` (FSK 50 kbps EU868) in
+      `lorawan_module_globals_table`. The setter already accepts integers, but
+      the constants are missing for discoverability — and FSK at DR_7 is a
+      real use case for high-throughput EU868 deployments.
+- [ ] Parameterise `link_check(send_now=True, port=1, confirmed=False)`. Hard
+      coding to port 1 / unconfirmed at modlorawan.c:3027–3030 is a problem
+      for users whose LNS has port-1 filtering or who want a confirmed probe
+      that doubles as keep-alive.
+- [ ] README: reflect the dropped `request_class` alias, the
+      `recv()`/`on_rx` mutual-exclusion error, the renamed `stats()` key, and
+      the new DR constants.
+- [ ] Sweep `lorawan-module/examples/` for the `tx_counter` rename:
+      `basic_otaa.py:68`, `basic_abp.py:51`, `sensor_node.py:132` all read
+      `stats()['tx_counter']` and need to switch to `stats()['last_tx_fcnt_up']`
+      together with the binding change. Forward-compat fallback (`stats().get('last_tx_fcnt_up', stats.get('tx_counter'))`)
+      is unnecessary — examples ship with the firmware that introduces the
+      rename.
+- [ ] Sweep `lorawan-module/examples/` for the `network_time()` removal:
+      `class_b_beacon.py` and `time_sync.py` reference it. `class_b_beacon.py`
+      already uses `synced_time()` after Session 20+; `time_sync.py` keeps
+      both calls for pedagogy — remove the `network_time()` lines and rewrite
+      the surrounding prose to compare the on-time-sync callback's snapshot
+      arg vs `synced_time()`'s live value.
+
+### Session 23: Expanded MIB getters/setters
+
+Cheap wrappers on MIB types the MAC already maintains. Each is ≤ ~30 LoC.
+The big functional reach is for users on private LNS deployments and for
+power-tuning sensor nodes.
+
+- [ ] `lw.nb_trans([n])` → int. Wraps `MIB_CHANNELS_NB_TRANS`. Range 1..15,
+      default 1. Cheapest reliability knob: every unconfirmed uplink transmits
+      N times; the LNS dedupes. No new airtime budget (still gated by duty
+      cycle), but huge delivery-rate improvement when the user only calls
+      `send()` once per period. Annotate `examples/sensor_node.py` with a
+      sensible default (e.g. `lw.nb_trans(2)`).
+- [ ] `lw.channel_mask([mask])` → int (16-bit bitmap). Wraps `MIB_CHANNELS_MASK`
+      / `MIB_CHANNELS_DEFAULT_MASK`. Setter writes both so `ResetMacParameters`
+      keeps the user's mask. Required for masking out the EU868 high-power
+      869.4–869.65 MHz band on private gateways, or for restricting to specific
+      channels on US915 (sub-band selection).
+- [ ] `lw.frame_counters()` → `(fcnt_up, fcnt_down)`. Reads
+      `MacGroup1.UpLinkCounter` + `FCtrlNvm.DownlinkCounter` from the live
+      `MIB_NVM_CTXS` snapshot. Returns the MAC truth, distinct from the
+      success-path-only `last_tx_fcnt_up` exposed in `stats()`.
+- [ ] `lw.public_network([enabled])` → bool. Wraps `MIB_PUBLIC_NETWORK`.
+      Default true (sync word 0x34). Some private deployments (industrial
+      gateways, pre-2023 Helium) want sync word 0x12.
+- [ ] `lw.rx_window_timing([rx_delay_1, rx_delay_2, ja_delay_1, ja_delay_2,
+      max_rx_window])` → dict (kwargs all optional). Wraps `MIB_RECEIVE_DELAY_1/2`,
+      `MIB_JOIN_ACCEPT_DELAY_1/2`, `MIB_MAX_RX_WINDOW_DURATION`. Most users
+      won't touch — TTN sets these via Join Accept. Useful for private LNS
+      deployments and for matching exotic gateway timing.
+- [ ] `lw.rx_clock_drift([max_rx_error_ms, min_rx_symbols])` → dict. Wraps
+      `MIB_SYSTEM_MAX_RX_ERROR` / `MIB_MIN_RX_SYMBOLS`. ESP32 default is 10 ms
+      — bumping to 50 ms helps cold-start joins after a long deepsleep where
+      the RTC has drifted. Worth annotating in `examples/sensor_node.py`.
+- [ ] `lw.rejoin_cycle(type, period_s)`. Wraps `MIB_REJOIN_0_CYCLE` /
+      `MIB_REJOIN_1_CYCLE`. LoRaWAN 1.1 only; the MAC re-authenticates
+      automatically every `period_s` once configured. Complements the manual
+      `rejoin(type)` already exposed.
+- [ ] `lw.net_id()` → int. Read-only, wraps `MIB_NET_ID`. Useful for
+      diagnostics on roaming and DevAddr-allocation issues.
+- [ ] README: new "Advanced MAC tuning" sub-section under "Configuration"
+      covering `nb_trans` (with the SensorNode case study), `channel_mask`,
+      `frame_counters`, `public_network`, `rx_clock_drift`, `rejoin_cycle`,
+      `net_id`. Keep concise — these are power-user knobs.
+
+### Session 24: New MAC primitives (TXCW, Compliance, multicast key derivation)
+
+- [ ] `lw.tx_cw(freq_hz, power_dbm, duration_s)`. Wraps `MLME_TXCW`.
+      Continuous wave transmission for radio bring-up, antenna SWR check,
+      FCC/CE pre-compliance scans. ~30 LoC: build `MlmeReq_t`, fire
+      `LoRaMacMlmeRequest`, block on `EVT_COMPLETED` (the MAC handles the
+      duration timer internally and returns to STDBY on completion). Raises
+      `OSError(EIO)` if the radio is mid-RX/TX.
+- [ ] Compliance package (`LmhpCompliance.c`). Add to `micropython.cmake`
+      target_sources, register in `lmhandler_shim.c` alongside the existing
+      ClockSync / RemoteMcastSetup / Fragmentation packages, expose
+      `lw.compliance_enable()`. Required for LoRa Alliance certification
+      testing. Mostly server-driven via port 224 — small Python surface.
+- [ ] `lw.derive_mc_keys(addr, mc_root_key)` → `(nwk_s_key, app_s_key)`.
+      Wraps `MLME_DERIVE_MC_KE_KEY` + `MLME_DERIVE_MC_KEY_PAIR`. Gives users
+      LoRaWAN 1.1 multicast key derivation without manually plumbing AES;
+      today `multicast_add` requires the user to supply derived keys.
+- [ ] README: new sub-section under "Multicast" for derived keys; new
+      sub-section under "Hardware setup" for `tx_cw` (bench testing,
+      antenna SWR validation).
+
+### Session 25: Additional regions
+
+- [ ] Make region selection a build-time opt-in. `micropython.cmake` already
+      has `REGION_US915` / `REGION_AU915` commented out — turn the region list
+      into a CMake variable so users can build with a custom subset. Add
+      `REGION_AS923`, `REGION_KR920`, `REGION_IN865`, `REGION_RU864`,
+      `REGION_CN470`, `REGION_CN779` as opt-in flags; each adds the matching
+      `RegionXxx.c` to the source list (~5 KB firmware per region).
+- [ ] Region-specific tx_power table fix. Today `tx_power_to_dbm()` and
+      `dbm_to_tx_power()` (pin_config.c) hardcode the EU868 table (16 dBm max,
+      step 2 dB). On other regions this gives wrong dBm readouts — flagged in
+      Session 11 as a known limitation for EU433. Add a region-dispatching
+      helper that picks the right table per `g_lorawan_region`.
+- [ ] Export region constants for whichever regions are compiled in:
+      `lorawan.US915`, `lorawan.AU915`, `lorawan.AS923`, `lorawan.KR920`,
+      `lorawan.IN865`, `lorawan.RU864`, `lorawan.CN470`, `lorawan.CN779`.
+      Guard each `MP_REGISTER_QSTR` with the corresponding `#ifdef REGION_*`.
+- [ ] Verify `tbeam.detect()` pin map across regions — pins are unchanged but
+      flag the FCC vs ETSI hardware variants of the SX127x family in the
+      README hardware table.
+- [ ] README: add a region table mapping constant → frequency band → typical
+      LNS support (TTN, Helium, ChirpStack). Note the firmware-size cost for
+      multi-region builds.
+
 ## Notes
 
 - TCXO register: T-Beam uses crystal (0x09), NOT TCXO (0x19). Wrong value = radio doesn't work.

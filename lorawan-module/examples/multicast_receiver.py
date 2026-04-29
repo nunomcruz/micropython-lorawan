@@ -105,7 +105,10 @@ def main():
         # Tidy up so the next boot starts clean.
         try:
             lw.multicast_remove(MC_GROUP)
-        except RuntimeError:
+        except (OSError, RuntimeError):
+            # v1.0 raises RuntimeError on MAC failure; v1.1 will switch this
+            # to OSError(EIO) (see TODO Session 21). Catching both is
+            # forward-compatible.
             pass
         lw.device_class(lorawan.CLASS_A)
         lw.nvram_save()

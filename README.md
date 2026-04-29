@@ -212,7 +212,7 @@ Transmits an uplink frame. Blocks until TX is complete (includes waiting for RX1
 
 **Exceptions:**
 - `OSError(EBUSY)` — the regional duty cycle is currently restricting TX. The frame was **not** queued; call `lw.time_until_tx()` to get the wait in milliseconds, sleep, then retry.
-- `RuntimeError("send failed")` — the MAC rejected the frame for another reason (not joined, length error, etc.).
+- `RuntimeError("send failed")` — the MAC reported a TX/RX failure (TX_TIMEOUT, RX1/RX2_TIMEOUT, MIC_FAIL, ADDRESS_FAIL, etc.). The exception type will switch to `OSError(EIO, "send: event_status=N")` in v1.1; see [TODO.md](TODO.md) Session 21. Callers should catch both for forward compatibility.
 - `OSError(ETIMEDOUT)` — `timeout` elapsed before TX completed.
 
 `timeout` defaults to 120 s. Pass `timeout=None` to block until TX completes (non-positive ints are treated the same way).
@@ -406,6 +406,8 @@ lw.stats()
 ```
 
 `last_tx_dr`, `last_tx_freq`, and `last_tx_power` all default to 0 before the first uplink (`tx_counter == 0`). `last_tx_power` is in dBm EIRP, consistent with `tx_power()`.
+
+`tx_counter` mirrors the MAC FCntUp captured from the most recent **successful** `mcps_confirm`. It does not advance on failed uplinks, so after a string of failures the value can lag the live counter inside the MAC. A live `frame_counters()` getter (returning `(fcnt_up, fcnt_down)` from the live `MIB_NVM_CTXS` snapshot) is planned for v1.1 — see [TODO.md](TODO.md) Session 23.
 
 ---
 
@@ -1053,6 +1055,16 @@ pins = tbeam.lora_pins(hw)         # (cs, irq, rst) or (cs, irq, rst, busy)
 - Phase 5: runtime pin config, LoRaWAN 1.1, RX2 / TX-power / antenna-gain control, Class C, EU433, DeviceTimeReq, LinkCheckReq, ReJoin, Clock Sync package, Class B (beacon + ping slots), multicast (local and remote), fragmentation (FUOTA).
 
 See [TODO.md](TODO.md) for the development roadmap and per-session notes. See [CLAUDE.md](../CLAUDE.md) for project context including hardware constants and FreeRTOS pitfalls.
+
+## Roadmap (post-1.0)
+
+The v1.0.0 surface is stable, but a v1.0 review found a handful of consistency gaps and exposed Semtech features. Sessions 21–25 are tracked in [TODO.md](TODO.md):
+
+- **Session 21 — Error handling and diagnostics.** Replace the generic `RuntimeError("<api> failed")` raises across `send()`, `multicast_*`, channel management, link-check and FUOTA with `OSError(EIO, "<api>: status=N")` carrying the underlying `LoRaMacStatus_t`. Add `lw.last_error()` for post-mortem (LoRaMAC status + event status + context). Append the join-failure status to the `OSError(ETIMEDOUT)` from `join_otaa`. Bumps to v1.1.
+- **Session 22 — API consistency.** Drop the deprecated `request_class` alias and (likely) `network_time()`. Make `recv()` and `on_rx()` mutually exclusive at the binding level. Rename the success-only `tx_counter` in `stats()` to `last_tx_fcnt_up`. Export `DR_6` and `DR_7` constants. Parameterise `link_check(send_now=True, port=, confirmed=)`.
+- **Session 23 — Expanded MIB getters/setters.** `nb_trans()` (cheapest reliability knob — multi-TX of unconfirmed uplinks), `channel_mask()`, live `frame_counters()`, `public_network()`, `rx_window_timing()`, `rx_clock_drift()`, `rejoin_cycle()`, `net_id()`. Wraps existing MAC state with no new MAC code.
+- **Session 24 — New MAC primitives.** `tx_cw(freq, power, duration)` for continuous-wave bench tests and FCC/CE pre-compliance. LoRa Alliance Compliance package (LmhpCompliance) for certification testing. `derive_mc_keys(addr, mc_root_key)` so multicast keys can be derived in-MAC instead of supplied by the caller.
+- **Session 25 — Additional regions.** Build-time opt-in for US915 / AU915 / AS923 / KR920 / IN865 / RU864 / CN470 / CN779. Region-aware dBm ↔ TX-power index conversion (today the EU868 table is hardcoded, so the `tx_power()` getter returns wrong dBm on EU433).
 
 ## Architecture
 

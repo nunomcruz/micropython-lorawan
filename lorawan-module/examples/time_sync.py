@@ -11,6 +11,13 @@ Two independent paths update the same internal time snapshot:
 Both update .network_time_gps / .time_synced and both fire the on_time_sync
 callback. Use DeviceTimeReq when you just need a one-shot timestamp; use the
 Clock Sync package if you want periodic re-sync with drift compensation.
+
+`network_time()` returns the snapshot taken at the moment the answer was
+processed; `synced_time()` returns the live advancing GPS epoch. New code
+should prefer `synced_time()` — `network_time()` is kept here only to show
+the difference and is scheduled for removal in v1.1 (see TODO Session 22).
+If you need the snapshot timestamp specifically, capture it from the
+on_time_sync callback's argument.
 """
 
 import tbeam
@@ -76,10 +83,13 @@ def main():
 
     # ----- Path 2: Clock Sync application package (port 202) -----
     print("\n--- Clock Sync package (AppTimeReq on port 202) ---")
+    # v1.0 raises RuntimeError on MAC failure; v1.1 will switch the I/O
+    # failure path to OSError(EIO) (see TODO Session 21). Catching both keeps
+    # this script forward-compatible.
     try:
         ok = lw.clock_sync_enable()
         print(f"clock_sync_enable → {ok}")
-    except RuntimeError as e:
+    except (OSError, RuntimeError) as e:
         print("clock_sync_enable failed:", e)
         return
 
@@ -92,7 +102,7 @@ def main():
         # MIB_CHANNELS_DATARATE on the MCPS confirm, so subsequent telemetry
         # uplinks keep the ADR-negotiated DR.
         lw.clock_sync_request(datarate=lorawan.DR_0)
-    except RuntimeError as e:
+    except (OSError, RuntimeError) as e:
         print("clock_sync_request failed:", e)
         return
 

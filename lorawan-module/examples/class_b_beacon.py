@@ -92,7 +92,10 @@ def main():
     lw.request_device_time()
     lw.send(b"")  # carries the DeviceTimeReq
 
-    t = lw.network_time()
+    # synced_time() returns the live GPS-epoch second once any sync path has
+    # answered. Pre-1.1 the equivalent snapshot was network_time(); that name
+    # is going away in v1.1 (see TODO Session 22).
+    t = lw.synced_time()
     if t is None:
         print("no time sync — the network did not answer DeviceTimeReq.")
         print("Class B cannot be requested without a time sync. Aborting.")
