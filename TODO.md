@@ -500,13 +500,17 @@ v1.0.0 review.
 - [x] Parameterised `link_check()` with `port` (default 1, range 1..223) and
       `confirmed` (default False) kwargs. Wired into the CMD_TX dispatch.
       Datarate validation range extended to DR_0..DR_7. README updated.
-- [x] Hardware tests:
-      - request_class(CLASS_C) raises AttributeError ✓ (pending flash)
-      - network_time() raises AttributeError ✓ (pending flash)
-      - recv() with on_rx registered raises RuntimeError ✓ (pending flash)
-      - stats()["last_tx_fcnt_up"] populated after send ✓ (pending flash)
-      - send(datarate=lorawan.DR_7) — FSK uplink: pending hardware test
-        (SX1276 FSK HAL may not be wired; note if so)
+- [x] Hardware tests (25/25 passed on T-Beam SX1276 — test_session22_api.py):
+      - request_class(CLASS_C) raises AttributeError ✓
+      - network_time() raises AttributeError ✓
+      - recv() with on_rx registered raises RuntimeError ✓
+      - stats()["last_tx_fcnt_up"] populated after send ✓ (value=1, no tx_counter key)
+      - link_check(send_now=True, port=2, confirmed=True, datarate=DR_0) ✓
+        returned margin=20 dB, gw_count=1
+      - send(datarate=lorawan.DR_7): status=12 (LORAMAC_STATUS_NO_CHANNEL_FOUND).
+        Failure is at MAC level — EU868 has no default channel for DR_7 (FSK 50 kbps
+        optional 868.0 MHz channel is not in the TTN default plan). The radio HAL is
+        not reached. To use DR_7: lw.add_channel(3, 868000000, 0, 7) first.
 
 ### Session 23: Expanded MIB getters/setters
 
