@@ -65,7 +65,7 @@ def main():
     lw.send(payload, port=1, datarate=lorawan.DR_0)
 
     stats = lw.stats()
-    print(f"tx_counter={stats['tx_counter']} "
+    print(f"last_tx_fcnt_up={stats['last_tx_fcnt_up']} "
           f"time_on_air={stats['tx_time_on_air']} ms")
 
     # Check for a scheduled downlink (non-blocking poll).

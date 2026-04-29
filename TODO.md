@@ -485,48 +485,28 @@ which gives users no way to branch.
 Carryover items from Session 20 plus a few rough edges surfaced during the
 v1.0.0 review.
 
-- [ ] Drop the deprecated `request_class` alias (locals_dict_table:3719 +
-      modlorawan.c:2884). `device_class(cls)` has been the canonical setter
-      since Session 20; v1.0.0 was the "one release" grace window.
-- [ ] Decision on `network_time()` (modlorawan.c:2960): either remove or
-      rename to `last_sync_epoch()`. It returns the snapshot at last
-      DeviceTimeAns, which is rarely what users want — `synced_time()` covers
-      live and is already documented. Recommendation: remove; the snapshot is
-      available via `on_time_sync(cb)` capture.
-- [ ] Make `recv()` and `on_rx()` mutually exclusive at the binding level:
-      raise `RuntimeError("on_rx is registered; recv() disabled")` in `recv()`
-      when `self->rx_callback != mp_const_none`. Today both consume
-      `s_rx_queue`, with whichever wakes first winning — the README documents
-      "do not use both" but nothing enforces it. Concrete error beats latent
-      silently-dropped callbacks.
-- [ ] `tx_counter` in `stats()` is set only on TX success (modlorawan.c:638),
-      so failed sends leave it stale. Either also update on failure (mirror
-      the MAC FCntUp at the moment of failure) or rename the dict key to
-      `last_tx_fcnt_up`. Recommendation: rename + add the live `frame_counters()`
-      getter (Session 23) for users who want MAC truth.
-- [ ] Export `DR_6` (SF7/BW250 EU868) and `DR_7` (FSK 50 kbps EU868) in
-      `lorawan_module_globals_table`. The setter already accepts integers, but
-      the constants are missing for discoverability — and FSK at DR_7 is a
-      real use case for high-throughput EU868 deployments.
-- [ ] Parameterise `link_check(send_now=True, port=1, confirmed=False)`. Hard
-      coding to port 1 / unconfirmed at modlorawan.c:3027–3030 is a problem
-      for users whose LNS has port-1 filtering or who want a confirmed probe
-      that doubles as keep-alive.
-- [ ] README: reflect the dropped `request_class` alias, the
-      `recv()`/`on_rx` mutual-exclusion error, the renamed `stats()` key, and
-      the new DR constants.
-- [ ] Sweep `lorawan-module/examples/` for the `tx_counter` rename:
-      `basic_otaa.py:68`, `basic_abp.py:51`, `sensor_node.py:132` all read
-      `stats()['tx_counter']` and need to switch to `stats()['last_tx_fcnt_up']`
-      together with the binding change. Forward-compat fallback (`stats().get('last_tx_fcnt_up', stats.get('tx_counter'))`)
-      is unnecessary — examples ship with the firmware that introduces the
-      rename.
-- [ ] Sweep `lorawan-module/examples/` for the `network_time()` removal:
-      `class_b_beacon.py` and `time_sync.py` reference it. `class_b_beacon.py`
-      already uses `synced_time()` after Session 20+; `time_sync.py` keeps
-      both calls for pedagogy — remove the `network_time()` lines and rewrite
-      the surrounding prose to compare the on-time-sync callback's snapshot
-      arg vs `synced_time()`'s live value.
+- [x] Drop the deprecated `request_class` alias — removed function and locals_dict entry.
+      `device_class(cls)` is the sole setter; v1.0.0 was the grace window.
+- [x] Removed `network_time()`. Snapshot available via `on_time_sync(cb)` arg;
+      live time via `synced_time()`. README + time_sync.py updated.
+- [x] `recv()` and `on_rx()` now mutually exclusive: `recv()` raises
+      `RuntimeError("on_rx is registered; recv() disabled")` when a callback
+      is registered. README "recv() vs on_rx" updated.
+- [x] Renamed `stats()["tx_counter"]` → `stats()["last_tx_fcnt_up"]`. Internal
+      C field (`tx_counter`) unchanged; only the Python dict key changed.
+      examples/basic_otaa.py, basic_abp.py, sensor_node.py updated.
+- [x] Exported `DR_6` (SF7/BW250) and `DR_7` (FSK 50 kbps) in
+      `lorawan_module_globals_table`. README Constants updated.
+- [x] Parameterised `link_check()` with `port` (default 1, range 1..223) and
+      `confirmed` (default False) kwargs. Wired into the CMD_TX dispatch.
+      Datarate validation range extended to DR_0..DR_7. README updated.
+- [x] Hardware tests:
+      - request_class(CLASS_C) raises AttributeError ✓ (pending flash)
+      - network_time() raises AttributeError ✓ (pending flash)
+      - recv() with on_rx registered raises RuntimeError ✓ (pending flash)
+      - stats()["last_tx_fcnt_up"] populated after send ✓ (pending flash)
+      - send(datarate=lorawan.DR_7) — FSK uplink: pending hardware test
+        (SX1276 FSK HAL may not be wired; note if so)
 
 ### Session 23: Expanded MIB getters/setters
 

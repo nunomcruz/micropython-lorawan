@@ -8,16 +8,12 @@ Two independent paths update the same internal time snapshot:
   2. Clock Sync application package (LoRa-Alliance v1.0.0, port 202). Sends
      its own AppTimeReq (which also carries a DeviceTimeReq as a MAC option).
 
-Both update .network_time_gps / .time_synced and both fire the on_time_sync
-callback. Use DeviceTimeReq when you just need a one-shot timestamp; use the
+Both fire the on_time_sync callback with the GPS epoch seconds at the moment
+of sync. Use DeviceTimeReq when you just need a one-shot timestamp; use the
 Clock Sync package if you want periodic re-sync with drift compensation.
 
-`network_time()` returns the snapshot taken at the moment the answer was
-processed; `synced_time()` returns the live advancing GPS epoch. New code
-should prefer `synced_time()` — `network_time()` is kept here only to show
-the difference and is scheduled for removal in v1.1 (see TODO Session 22).
-If you need the snapshot timestamp specifically, capture it from the
-on_time_sync callback's argument.
+To capture the snapshot timestamp: record it in on_time_sync(gps_seconds).
+To read the live advancing time: call synced_time() at any point after sync.
 """
 
 import tbeam
@@ -76,16 +72,15 @@ def main():
     # request_device_time() only queues the MAC command. An uplink is still
     # needed to carry it over the air; any uplink works.
     lw.send(b"")
-    print(f"network_time (snapshot): {format_gps(lw.network_time())}")
-    print(f"synced_time (live):      {format_gps(lw.synced_time())}")
+    # on_time_sync fired; read the live advancing time via synced_time().
+    # To get the snapshot captured at the moment of sync, record it inside
+    # the on_time_sync callback instead.
+    print(f"synced_time (live): {format_gps(lw.synced_time())}")
 
     lw.nvram_save()
 
     # ----- Path 2: Clock Sync application package (port 202) -----
     print("\n--- Clock Sync package (AppTimeReq on port 202) ---")
-    # v1.0 raises RuntimeError on MAC failure; v1.1 will switch the I/O
-    # failure path to OSError(EIO) (see TODO Session 21). Catching both keeps
-    # this script forward-compatible.
     try:
         ok = lw.clock_sync_enable()
         print(f"clock_sync_enable → {ok}")
@@ -108,8 +103,7 @@ def main():
 
     # Give the MAC a moment to process the answer.
     sleep(2)
-    print(f"network_time (snapshot): {format_gps(lw.network_time())}")
-    print(f"synced_time (live):      {format_gps(lw.synced_time())}")
+    print(f"synced_time (live): {format_gps(lw.synced_time())}")
 
     # ----- Bonus: synchronous link_check at DR_0 -----
     # Default link_check() only queues the MAC command and relies on the next

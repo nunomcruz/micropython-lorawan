@@ -129,7 +129,7 @@ def main():
         print("send failed:", e)
     else:
         stats = lw.stats()
-        print(f"tx_counter={stats['tx_counter']} "
+        print(f"last_tx_fcnt_up={stats['last_tx_fcnt_up']} "
               f"time_on_air={stats['tx_time_on_air']} ms "
               f"rssi={stats['rssi']} snr={stats['snr']}")
 

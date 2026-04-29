@@ -275,27 +275,22 @@ lw.on_rx(on_downlink)
 lw.on_rx(None)  # deregister
 ```
 
-#### `recv()` vs `on_rx` — pick one
+#### `recv()` vs `on_rx` — pick one, enforced
 
-Both read from the same internal queue. **`recv()` has priority**: while it is blocking, the MicroPython VM cannot run scheduled callbacks, so when a packet arrives `recv()` pops it and the `on_rx` trampoline runs later against an empty queue — the callback never fires for that message.
+`recv()` and `on_rx` are mutually exclusive. Calling `recv()` while an `on_rx` callback is registered raises `RuntimeError("on_rx is registered; recv() disabled")`. Deregister first with `lw.on_rx(None)` if you need to switch modes.
 
 | Pattern | Right for |
 |---------|-----------|
 | `recv(timeout=N)` | Request/response flows: send an uplink, then block waiting for the reply. |
 | `on_rx(callback)` | Event-driven flows: Class C continuous listen, sensor node sleeping between uplinks. |
 
-Do not use both simultaneously. For Class C in particular, downlinks can arrive at any time; `on_rx` is the right choice:
+For Class C in particular, downlinks can arrive at any time; `on_rx` is the right choice:
 
 ```python
 # Class C — correct pattern: on_rx only
 lw.on_rx(on_downlink)
 lw.device_class(lorawan.CLASS_C)
-# recv() is never called — on_rx fires for every downlink
-
-# Class C — incorrect pattern: mixing both
-lw.on_rx(on_downlink)
-lw.device_class(lorawan.CLASS_C)
-pkt = lw.recv(timeout=30)  # while this blocks, on_rx is silenced
+# recv() must not be called while on_rx is registered
 ```
 
 ---
@@ -395,21 +390,21 @@ Returns a snapshot of runtime statistics:
 ```python
 lw.stats()
 # {
-#   'rssi': -109,           # last downlink RSSI (dBm)
-#   'snr': 6,               # last downlink SNR (dB)
-#   'tx_counter': 4,        # uplink frame counter
-#   'rx_counter': 1,        # downlink frame counter
-#   'tx_time_on_air': 991,  # last uplink time on air (ms)
-#   'last_tx_ack': True,    # confirmed uplink: True if ACKed
-#   'last_tx_dr': 3,        # DR used for the last uplink (DR_0..DR_5)
-#   'last_tx_freq': 868100000,  # frequency of the last uplink (Hz)
-#   'last_tx_power': 14,    # TX power of the last uplink (dBm EIRP)
+#   'rssi': -109,              # last downlink RSSI (dBm)
+#   'snr': 6,                  # last downlink SNR (dB)
+#   'last_tx_fcnt_up': 4,      # FCntUp from the last successful uplink
+#   'rx_counter': 1,           # downlink frame counter
+#   'tx_time_on_air': 991,     # last uplink time on air (ms)
+#   'last_tx_ack': True,       # confirmed uplink: True if ACKed
+#   'last_tx_dr': 3,           # DR used for the last uplink (DR_0..DR_7)
+#   'last_tx_freq': 868100000, # frequency of the last uplink (Hz)
+#   'last_tx_power': 14,       # TX power of the last uplink (dBm EIRP)
 # }
 ```
 
-`last_tx_dr`, `last_tx_freq`, and `last_tx_power` all default to 0 before the first uplink (`tx_counter == 0`). `last_tx_power` is in dBm EIRP, consistent with `tx_power()`.
+`last_tx_dr`, `last_tx_freq`, and `last_tx_power` all default to 0 before the first uplink (`last_tx_fcnt_up == 0`). `last_tx_power` is in dBm EIRP, consistent with `tx_power()`.
 
-`tx_counter` mirrors the MAC FCntUp captured from the most recent **successful** `mcps_confirm`. It does not advance on failed uplinks, so after a string of failures the value can lag the live counter inside the MAC. A live `frame_counters()` getter (returning `(fcnt_up, fcnt_down)` from the live `MIB_NVM_CTXS` snapshot) is planned for v1.1 — see [TODO.md](TODO.md) Session 23.
+`last_tx_fcnt_up` mirrors the MAC FCntUp captured from the most recent **successful** `mcps_confirm`. It does not advance on failed uplinks, so after a string of failures the value can lag the live counter inside the MAC. A live `frame_counters()` getter (returning `(fcnt_up, fcnt_down)` from the live `MIB_NVM_CTXS` snapshot) is planned for Session 23.
 
 ---
 
@@ -493,7 +488,6 @@ Getter/setter for the device class.
 
 Raises `OSError(EIO)` if the transition fails (setter only). Raises `RuntimeError` for state preconditions (not initialised, CLASS_B requires a joined session).
 
-`request_class(cls)` is a deprecated alias for `device_class(cls)`.
 
 ```python
 lw.device_class()                  # → CLASS_A
@@ -571,7 +565,7 @@ Two independent paths are available:
 - **MAC DeviceTimeReq** (LoRaWAN 1.0.3+). Piggy-backed on the next uplink. Simpler; needed as a prerequisite for Class B.
 - **Clock Sync application package** (LoRa-Alliance v1.0.0, port 202). Sends its own uplink; also handles periodic re-sync and provides drift estimation.
 
-Both update the same internal `network_time_gps` snapshot, so `on_time_sync(cb)` and `network_time()` / `synced_time()` work identically regardless of which path caused the sync.
+Both fire `on_time_sync(cb)` with the GPS epoch seconds at the moment of sync. `synced_time()` then returns the live advancing time for as long as the device stays powered.
 
 #### `lw.request_device_time()`
 
@@ -579,14 +573,10 @@ Queues an MLME DeviceTimeReq. Does **not** transmit — the request piggy-backs 
 
 ```python
 lw.request_device_time()
-lw.send(b"")                # carries the DeviceTimeReq over the air
-# after RX window closes:
-print(lw.network_time())    # → GPS epoch seconds, or None if no answer yet
+lw.send(b"")            # carries the DeviceTimeReq over the air
+# after RX window closes, on_time_sync fires and synced_time() returns a value:
+print(lw.synced_time()) # → GPS epoch seconds, or None if no answer yet
 ```
-
-#### `lw.network_time()` → `int | None`
-
-Returns the GPS epoch seconds captured at the moment of the last sync, or `None` if time has never been synced.
 
 #### `lw.synced_time()` → `int | None`
 
@@ -612,7 +602,7 @@ Sends an `AppTimeReq` on port 202 (which also piggy-backs a MAC DeviceTimeReq). 
 
 ### Link quality
 
-#### `lw.link_check(*, send_now=False, datarate=None)` → `dict | None`
+#### `lw.link_check(*, send_now=False, datarate=None, port=1, confirmed=False)` → `dict | None`
 
 Queues an MLME `LinkCheckReq` MAC command. Returns the most recent `LinkCheckAns` as `{"margin": N, "gw_count": N}`, or `None` if no answer has been received yet.
 
@@ -628,13 +618,18 @@ if result:
     print(f"margin={result['margin']} dB, seen by {result['gw_count']} gateways")
 ```
 
-- **`send_now=True`** — also emits an empty unconfirmed uplink on port 1 to carry the piggy-back, waits for the TX+RX cycle to complete, and returns the fresh answer in a single call. Costs one uplink of airtime and bumps `FCntUp` by one. Raises `OSError(EIO, "send: event_status=N")` on radio/network failure, `OSError(EIO, "send: status=N")` on MAC API rejection, or `OSError(ETIMEDOUT)` on timeout.
+- **`send_now=True`** — also emits an empty uplink to carry the piggy-back, waits for the TX+RX cycle to complete, and returns the fresh answer in a single call. Costs one uplink of airtime and bumps `FCntUp` by one. Raises `OSError(EIO, "send: event_status=N")` on radio/network failure, `OSError(EIO, "send: status=N")` on MAC API rejection, or `OSError(ETIMEDOUT)` on timeout.
 
 ```python
 result = lw.link_check(send_now=True, datarate=lorawan.DR_0)
+
+# Confirmed link probe on a non-default port (e.g. LNS filters port 1):
+result = lw.link_check(send_now=True, port=2, confirmed=True, datarate=lorawan.DR_0)
 ```
 
-- `datarate` (optional, `DR_0`..`DR_5`): only meaningful when `send_now=True`; sets the DR for that uplink. Defaults to the MAC's current `MIB_CHANNELS_DATARATE`. Pass `DR_0` for range-critical probes when ADR may have ratcheted the DR up to SF7.
+- `datarate` (optional, `DR_0`..`DR_7`): only meaningful when `send_now=True`; sets the DR for that uplink. Defaults to the MAC's current `MIB_CHANNELS_DATARATE`. Pass `DR_0` for range-critical probes when ADR may have ratcheted the DR up to SF7.
+- `port` (optional, 1..223, default 1): application port for the probe uplink. Override when your LNS filters port 1.
+- `confirmed` (optional, default `False`): send the probe as a confirmed uplink. Doubles as a keep-alive that requires an ACK.
 
 ---
 
@@ -903,7 +898,9 @@ lorawan.DR_1   # SF11 / 125 kHz
 lorawan.DR_2   # SF10 / 125 kHz
 lorawan.DR_3   # SF9  / 125 kHz
 lorawan.DR_4   # SF8  / 125 kHz
-lorawan.DR_5   # SF7  / 125 kHz — maximum throughput
+lorawan.DR_5   # SF7  / 125 kHz — maximum throughput (LoRa)
+lorawan.DR_6   # SF7  / 250 kHz — double bandwidth variant
+lorawan.DR_7   # FSK  / 50 kbps — highest throughput, short range
 
 # Beacon states (first arg to on_beacon callback)
 lorawan.BEACON_ACQUISITION_OK
@@ -1104,7 +1101,7 @@ See [TODO.md](TODO.md) for the development roadmap and per-session notes. See [C
 The v1.0.0 surface is stable, but a v1.0 review found a handful of consistency gaps and exposed Semtech features. Sessions 21–25 are tracked in [TODO.md](TODO.md):
 
 - **Session 21 — Error handling and diagnostics (v1.1.0).** All `RuntimeError("<api> failed")` sites replaced with `OSError(EIO, "<api>: status=N")` carrying the underlying `LoRaMacStatus_t` or `LoRaMacEventInfoStatus_t`. `lw.last_error()` returns a full diagnostic dict for post-mortem. `join_otaa()` timeout now raises `OSError(ETIMEDOUT, "join: last_status=N")`. Constructor auto-deinit tightened to avoid UAF on the previous object.
-- **Session 22 — API consistency.** Drop the deprecated `request_class` alias and (likely) `network_time()`. Make `recv()` and `on_rx()` mutually exclusive at the binding level. Rename the success-only `tx_counter` in `stats()` to `last_tx_fcnt_up`. Export `DR_6` and `DR_7` constants. Parameterise `link_check(send_now=True, port=, confirmed=)`.
+- **Session 22 — API consistency (done).** Dropped deprecated `request_class` alias. Removed `network_time()` (use `synced_time()` or capture snapshot in `on_time_sync` callback). `recv()` now raises `RuntimeError` when `on_rx` is registered. Renamed `stats()["tx_counter"]` → `stats()["last_tx_fcnt_up"]`. Exported `DR_6` (SF7/250 kHz) and `DR_7` (FSK 50 kbps). `link_check()` gained `port` and `confirmed` kwargs.
 - **Session 23 — Expanded MIB getters/setters.** `nb_trans()` (cheapest reliability knob — multi-TX of unconfirmed uplinks), `channel_mask()`, live `frame_counters()`, `public_network()`, `rx_window_timing()`, `rx_clock_drift()`, `rejoin_cycle()`, `net_id()`. Wraps existing MAC state with no new MAC code.
 - **Session 24 — New MAC primitives.** `tx_cw(freq, power, duration)` for continuous-wave bench tests and FCC/CE pre-compliance. LoRa Alliance Compliance package (LmhpCompliance) for certification testing. `derive_mc_keys(addr, mc_root_key)` so multicast keys can be derived in-MAC instead of supplied by the caller.
 - **Session 25 — Additional regions.** Build-time opt-in for US915 / AU915 / AS923 / KR920 / IN865 / RU864 / CN470 / CN779. Region-aware dBm ↔ TX-power index conversion (today the EU868 table is hardcoded, so the `tx_power()` getter returns wrong dBm on EU433).

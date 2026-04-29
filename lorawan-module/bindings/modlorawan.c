@@ -2673,7 +2673,7 @@ static mp_obj_t lorawan_stats(mp_obj_t self_in) {
                       mp_obj_new_int(self->rssi));
     mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_snr),
                       mp_obj_new_int(self->snr));
-    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_tx_counter),
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_last_tx_fcnt_up),
                       mp_obj_new_int_from_uint(self->tx_counter));
     mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_rx_counter),
                       mp_obj_new_int_from_uint(self->rx_counter));
@@ -2711,6 +2711,11 @@ static mp_obj_t lorawan_recv(size_t n_args, const mp_obj_t *pos_args,
     TickType_t ticks = (timeout_s > 0)
                        ? pdMS_TO_TICKS((uint32_t)timeout_s * 1000)
                        : 0;
+
+    if (s_lora_obj && s_lora_obj->rx_callback != mp_const_none) {
+        mp_raise_msg(&mp_type_RuntimeError,
+                     MP_ERROR_TEXT("on_rx is registered; recv() disabled"));
+    }
 
     lorawan_rx_pkt_t pkt;
     if (xQueueReceive(s_rx_queue, &pkt, ticks) != pdTRUE) {
@@ -3007,13 +3012,6 @@ static mp_obj_t lorawan_device_class(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_device_class_obj, 1, 2, lorawan_device_class);
 
-// request_class(cls) — deprecated alias for device_class(cls).
-static mp_obj_t lorawan_request_class(mp_obj_t self_in, mp_obj_t cls_in) {
-    const mp_obj_t fwd[2] = { self_in, cls_in };
-    return lorawan_device_class(2, fwd);
-}
-static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_request_class_obj, lorawan_request_class);
-
 // region() — returns the LORAMAC_REGION_* the object was constructed with.
 // Cached on lorawan_obj_t.region at __init__ — no MAC round-trip.
 static mp_obj_t lorawan_region(mp_obj_t self_in) {
@@ -3078,20 +3076,6 @@ static mp_obj_t lorawan_request_device_time(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_request_device_time_obj, lorawan_request_device_time);
 
-// network_time() — returns GPS epoch seconds from the last DeviceTimeAns,
-// or None if no sync has happened yet. The stored value is the epoch at the
-// moment the answer was processed; callers that need "now" should combine
-// this with a local tick offset. For most applications the granularity
-// (~second) is sufficient and reading again after a fresh sync is simpler.
-static mp_obj_t lorawan_network_time(mp_obj_t self_in) {
-    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    if (!self->time_synced) {
-        return mp_const_none;
-    }
-    return mp_obj_new_int_from_uint(self->network_time_gps);
-}
-static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_network_time_obj, lorawan_network_time);
-
 // link_check(send_now=False, datarate=None) — queue an MLME_LINK_CHECK
 // request and return the most recent LinkCheckAns as
 // {"margin": N, "gw_count": N}, or None if no answer has been received yet.
@@ -3122,10 +3106,12 @@ static mp_obj_t lorawan_link_check(size_t n_args, const mp_obj_t *pos_args,
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not joined"));
     }
 
-    enum { ARG_send_now, ARG_datarate };
+    enum { ARG_send_now, ARG_datarate, ARG_port, ARG_confirmed };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_send_now, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} },
         { MP_QSTR_datarate, MP_ARG_KW_ONLY | MP_ARG_OBJ,  {.u_obj  = mp_const_none} },
+        { MP_QSTR_port,     MP_ARG_KW_ONLY | MP_ARG_INT,  {.u_int  = 1} },
+        { MP_QSTR_confirmed, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
@@ -3135,25 +3121,30 @@ static mp_obj_t lorawan_link_check(size_t n_args, const mp_obj_t *pos_args,
     int8_t dr = -1;
     if (args[ARG_datarate].u_obj != mp_const_none) {
         int dr_int = mp_obj_get_int(args[ARG_datarate].u_obj);
-        if (dr_int < DR_0 || dr_int > DR_5) {
-            mp_raise_ValueError(MP_ERROR_TEXT("datarate must be DR_0..DR_5"));
+        if (dr_int < DR_0 || dr_int > DR_7) {
+            mp_raise_ValueError(MP_ERROR_TEXT("datarate must be DR_0..DR_7"));
         }
         dr = (int8_t)dr_int;
     }
+    int port = (int)args[ARG_port].u_int;
+    if (port < 1 || port > 223) {
+        mp_raise_ValueError(MP_ERROR_TEXT("port must be 1..223"));
+    }
+    bool confirmed = args[ARG_confirmed].u_bool;
 
     lorawan_cmd_data_t cmd = { .cmd = CMD_REQUEST_LINK_CHECK };
     send_cmd_wait(&cmd, EVT_COMPLETED);
 
     if (send_now) {
-        // Empty unconfirmed uplink carries the piggy-backed LinkCheckReq.
+        // Empty uplink carries the piggy-backed LinkCheckReq.
         // mcps_confirm fires after RX2 closes; mlme_confirm for MLME_LINK_CHECK
         // runs in the same callback chain (before mcps_confirm), so by the
         // time EVT_TX_DONE is set, link_check_received has been updated if
         // the network answered.
         lorawan_cmd_data_t tx = { .cmd = CMD_TX };
         tx.tx.len       = 0;
-        tx.tx.port      = 1;
-        tx.tx.confirmed = false;
+        tx.tx.port      = (uint8_t)port;
+        tx.tx.confirmed = confirmed;
         tx.tx.datarate  = (dr >= 0) ? (uint8_t)dr : (uint8_t)self->channels_datarate;
         xEventGroupClearBits(s_events, EVT_TX_DONE | EVT_TX_ERROR);
         xQueueSend(s_cmd_queue, &tx, portMAX_DELAY);
@@ -3862,7 +3853,6 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_antenna_gain),   MP_ROM_PTR(&lorawan_antenna_gain_obj) },
     { MP_ROM_QSTR(MP_QSTR_duty_cycle),     MP_ROM_PTR(&lorawan_duty_cycle_obj) },
     { MP_ROM_QSTR(MP_QSTR_time_until_tx),  MP_ROM_PTR(&lorawan_time_until_tx_obj) },
-    { MP_ROM_QSTR(MP_QSTR_request_class),  MP_ROM_PTR(&lorawan_request_class_obj) },
     { MP_ROM_QSTR(MP_QSTR_device_class),   MP_ROM_PTR(&lorawan_device_class_obj) },
     { MP_ROM_QSTR(MP_QSTR_region),         MP_ROM_PTR(&lorawan_region_obj) },
     { MP_ROM_QSTR(MP_QSTR_dev_addr),       MP_ROM_PTR(&lorawan_dev_addr_obj) },
@@ -3873,7 +3863,6 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_ping_slot_periodicity),
                                             MP_ROM_PTR(&lorawan_ping_slot_periodicity_obj) },
     { MP_ROM_QSTR(MP_QSTR_request_device_time), MP_ROM_PTR(&lorawan_request_device_time_obj) },
-    { MP_ROM_QSTR(MP_QSTR_network_time),   MP_ROM_PTR(&lorawan_network_time_obj) },
     { MP_ROM_QSTR(MP_QSTR_link_check),     MP_ROM_PTR(&lorawan_link_check_obj) },
     { MP_ROM_QSTR(MP_QSTR_rejoin),         MP_ROM_PTR(&lorawan_rejoin_obj) },
     { MP_ROM_QSTR(MP_QSTR_on_time_sync),   MP_ROM_PTR(&lorawan_on_time_sync_obj) },
@@ -3979,12 +3968,15 @@ static const mp_rom_map_elem_t lorawan_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_V1_0_4),    MP_ROM_INT(LORAWAN_V1_0_4) },
     { MP_ROM_QSTR(MP_QSTR_V1_1),      MP_ROM_INT(LORAWAN_V1_1) },
     // Data rate constants (EU868): DR_0=SF12/BW125 .. DR_5=SF7/BW125
+    // DR_6=SF7/BW250, DR_7=FSK 50 kbps
     { MP_ROM_QSTR(MP_QSTR_DR_0),      MP_ROM_INT(DR_0) },
     { MP_ROM_QSTR(MP_QSTR_DR_1),      MP_ROM_INT(DR_1) },
     { MP_ROM_QSTR(MP_QSTR_DR_2),      MP_ROM_INT(DR_2) },
     { MP_ROM_QSTR(MP_QSTR_DR_3),      MP_ROM_INT(DR_3) },
     { MP_ROM_QSTR(MP_QSTR_DR_4),      MP_ROM_INT(DR_4) },
     { MP_ROM_QSTR(MP_QSTR_DR_5),      MP_ROM_INT(DR_5) },
+    { MP_ROM_QSTR(MP_QSTR_DR_6),      MP_ROM_INT(DR_6) },
+    { MP_ROM_QSTR(MP_QSTR_DR_7),      MP_ROM_INT(DR_7) },
     // Class B beacon state codes (passed to on_beacon callback first arg)
     { MP_ROM_QSTR(MP_QSTR_BEACON_ACQUISITION_OK),   MP_ROM_INT(LW_BEACON_ACQUISITION_OK) },
     { MP_ROM_QSTR(MP_QSTR_BEACON_ACQUISITION_FAIL), MP_ROM_INT(LW_BEACON_ACQUISITION_FAIL) },
