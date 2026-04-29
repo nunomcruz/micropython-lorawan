@@ -212,7 +212,9 @@ Transmits an uplink frame. Blocks until TX is complete (includes waiting for RX1
 
 **Exceptions:**
 - `OSError(EBUSY)` — the regional duty cycle is currently restricting TX. The frame was **not** queued; call `lw.time_until_tx()` to get the wait in milliseconds, sleep, then retry.
-- `RuntimeError("send failed")` — the MAC reported a TX/RX failure (TX_TIMEOUT, RX1/RX2_TIMEOUT, MIC_FAIL, ADDRESS_FAIL, etc.). The exception type will switch to `OSError(EIO, "send: event_status=N")` in v1.1; see [TODO.md](TODO.md) Session 21. Callers should catch both for forward compatibility.
+- `OSError(EIO, "send: event_status=N")` — the radio/network layer reported a failure after transmission (TX_TIMEOUT, RX1/RX2_TIMEOUT, MIC_FAIL, ADDRESS_FAIL, etc.). `N` is the `LORAMAC_EVENT_INFO_STATUS_*` code from `McpsConfirm`.
+- `OSError(EIO, "send: status=N")` — the MAC API rejected the request before transmission (e.g. payload too large for current DR, MAC busy). `N` is the `LoRaMacStatus_t` code.
+- Call `lw.last_error()` immediately after either `EIO` form for the full diagnostic dict.
 - `OSError(ETIMEDOUT)` — `timeout` elapsed before TX completed.
 
 `timeout` defaults to 120 s. Pass `timeout=None` to block until TX completes (non-positive ints are treated the same way).
@@ -626,7 +628,7 @@ if result:
     print(f"margin={result['margin']} dB, seen by {result['gw_count']} gateways")
 ```
 
-- **`send_now=True`** — also emits an empty unconfirmed uplink on port 1 to carry the piggy-back, waits for the TX+RX cycle to complete, and returns the fresh answer in a single call. Costs one uplink of airtime and bumps `FCntUp` by one. Raises `RuntimeError("link_check send failed")` on MAC rejection or `OSError(ETIMEDOUT)` on timeout.
+- **`send_now=True`** — also emits an empty unconfirmed uplink on port 1 to carry the piggy-back, waits for the TX+RX cycle to complete, and returns the fresh answer in a single call. Costs one uplink of airtime and bumps `FCntUp` by one. Raises `OSError(EIO, "send: event_status=N")` on radio/network failure, `OSError(EIO, "send: status=N")` on MAC API rejection, or `OSError(ETIMEDOUT)` on timeout.
 
 ```python
 result = lw.link_check(send_now=True, datarate=lorawan.DR_0)
@@ -656,7 +658,7 @@ By default the EU868 region starts with three mandatory channels (868.1 / 868.3 
 
 #### `lw.add_channel(index, frequency, dr_min, dr_max)`
 
-Adds or replaces a MAC channel. Indexes 0–2 are the three EU868 default channels protected by the MAC (attempting to overwrite them raises `RuntimeError`). Use indexes 3–15 for extra channels.
+Adds or replaces a MAC channel. Indexes 0–2 are the three EU868 default channels protected by the MAC (attempting to overwrite them raises `OSError(EIO, "add_channel: status=N")`). Use indexes 3–15 for extra channels.
 
 ```python
 # Add the 5 extra TTN EU868 channels after ABP join
@@ -784,6 +786,47 @@ lw.fragmentation_enable(buffer_size=32 * 1024,
 Returns the reassembled buffer (full size — slice down to the `size` reported by `on_done`). Returns `None` if fragmentation was never enabled.
 
 ---
+
+### Diagnostics
+
+#### `lw.last_error()` → `dict | None`
+
+Returns a dict describing the most recent MAC-layer failure, or `None` if no failure has been recorded. Fields:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `loramac_status` | `int` | `LoRaMacStatus_t` from the failing API call (0 = OK; see `LoRaMac.h`) |
+| `event_status` | `int` | `LoRaMacEventInfoStatus_t` from `McpsConfirm`/`MlmeConfirm` (0 = OK) |
+| `context` | `str` | Which API failed: `"send"`, `"join"`, `"multicast_add"`, `"add_channel"`, etc. |
+| `epoch_us` | `int` | `esp_timer_get_time()` at the moment of failure (µs since boot) |
+
+When `event_status != 0`, the MAC-layer event code is the most informative field. Common values: `1 = TX_TIMEOUT`, `2 = RX1_TIMEOUT`, `3 = RX2_TIMEOUT`, `4 = MIC_FAIL`, `5 = ADDRESS_FAIL`, `6 = JOIN_FAIL`. When `event_status == 0` but `loramac_status != 0`, the API itself rejected the call (e.g. `LORAMAC_STATUS_BUSY = 1`, `LORAMAC_STATUS_MC_GROUP_UNDEFINED = 22`).
+
+```python
+import errno
+
+try:
+    lw.send(b"hello")
+except OSError as e:
+    if e.args[0] == errno.EIO:
+        err = lw.last_error()
+        print(f"TX failed: context={err['context']} "
+              f"event_status={err['event_status']} loramac_status={err['loramac_status']}")
+        if err['event_status'] != 0:
+            # Radio/network-layer failure from McpsConfirm/MlmeConfirm.
+            # Branch on LoRaMacEventInfoStatus_t values:
+            if err['event_status'] == 3:   # RX2_TIMEOUT — missed downlink window
+                pass
+            elif err['event_status'] == 4: # MIC_FAIL — key mismatch
+                pass
+        else:
+            # MAC API rejected the call before transmission.
+            # Branch on LoRaMacStatus_t values:
+            if err['loramac_status'] == 1:  # LORAMAC_STATUS_BUSY
+                pass
+            elif err['loramac_status'] == 11: # LORAMAC_STATUS_LENGTH_ERROR
+                pass
+```
 
 ### Lifecycle
 
@@ -1060,7 +1103,7 @@ See [TODO.md](TODO.md) for the development roadmap and per-session notes. See [C
 
 The v1.0.0 surface is stable, but a v1.0 review found a handful of consistency gaps and exposed Semtech features. Sessions 21–25 are tracked in [TODO.md](TODO.md):
 
-- **Session 21 — Error handling and diagnostics.** Replace the generic `RuntimeError("<api> failed")` raises across `send()`, `multicast_*`, channel management, link-check and FUOTA with `OSError(EIO, "<api>: status=N")` carrying the underlying `LoRaMacStatus_t`. Add `lw.last_error()` for post-mortem (LoRaMAC status + event status + context). Append the join-failure status to the `OSError(ETIMEDOUT)` from `join_otaa`. Bumps to v1.1.
+- **Session 21 — Error handling and diagnostics (v1.1.0).** All `RuntimeError("<api> failed")` sites replaced with `OSError(EIO, "<api>: status=N")` carrying the underlying `LoRaMacStatus_t` or `LoRaMacEventInfoStatus_t`. `lw.last_error()` returns a full diagnostic dict for post-mortem. `join_otaa()` timeout now raises `OSError(ETIMEDOUT, "join: last_status=N")`. Constructor auto-deinit tightened to avoid UAF on the previous object.
 - **Session 22 — API consistency.** Drop the deprecated `request_class` alias and (likely) `network_time()`. Make `recv()` and `on_rx()` mutually exclusive at the binding level. Rename the success-only `tx_counter` in `stats()` to `last_tx_fcnt_up`. Export `DR_6` and `DR_7` constants. Parameterise `link_check(send_now=True, port=, confirmed=)`.
 - **Session 23 — Expanded MIB getters/setters.** `nb_trans()` (cheapest reliability knob — multi-TX of unconfirmed uplinks), `channel_mask()`, live `frame_counters()`, `public_network()`, `rx_window_timing()`, `rx_clock_drift()`, `rejoin_cycle()`, `net_id()`. Wraps existing MAC state with no new MAC code.
 - **Session 24 — New MAC primitives.** `tx_cw(freq, power, duration)` for continuous-wave bench tests and FCC/CE pre-compliance. LoRa Alliance Compliance package (LmhpCompliance) for certification testing. `derive_mc_keys(addr, mc_root_key)` so multicast keys can be derived in-MAC instead of supplied by the caller.

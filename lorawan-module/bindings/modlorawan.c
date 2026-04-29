@@ -20,6 +20,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <limits.h>
 
 #include "py/runtime.h"
@@ -411,6 +412,24 @@ static uint8_t         s_query_max_payload_len;
 static ChannelParams_t s_query_channels[LW_MAX_CHANNELS];
 static uint16_t        s_query_channels_mask;
 
+// Last error statics — written by the LoRaWAN task just before setting EVT_TX_ERROR;
+// read by the Python thread in lorawan_raise_last_error() and last_error(). Safe:
+// the Python caller blocks on the event group while the task writes these.
+static volatile LoRaMacStatus_t          s_last_loramac_status;
+static volatile LoRaMacEventInfoStatus_t s_last_event_status;
+static volatile uint64_t                 s_last_error_epoch_us;
+static const char                       *s_last_error_context;
+
+// Set s_last_* statics from task context, just before signalling EVT_TX_ERROR.
+// ctx must be a string literal (static duration). mac_st is the LoRaMacStatus_t
+// returned by the failing API; evt_st is the McpsConfirm / MlmeConfirm Status.
+#define CAPTURE_LORAMAC_ERROR(ctx, mac_st, evt_st) do {              \
+    s_last_loramac_status = (mac_st);                                 \
+    s_last_event_status   = (evt_st);                                 \
+    s_last_error_epoch_us = (uint64_t)esp_timer_get_time();           \
+    s_last_error_context  = (ctx);                                    \
+} while (0)
+
 // ---- TX power dBm ↔ MAC index conversion ----
 //
 // EU868 EIRP table: index 0 = 16 dBm, each step down = -2 dBm, max index 7 = 2 dBm.
@@ -429,6 +448,26 @@ static int8_t dbm_to_tx_power(int dbm) {
     if (dbm <= 2)  return 7;
     int8_t i = (int8_t)((16 - dbm + 1) / 2);
     return (i > 7) ? 7 : i;
+}
+
+// Raise OSError(EIO, "<context>: event_status=N") or "status=N" from the
+// s_last_* statics populated by the LoRaWAN task before EVT_TX_ERROR.
+// Must be called from Python-thread context (holds GIL, heap allocation is safe).
+static void lorawan_raise_last_error(void) {
+    char errmsg[64];
+    const char *ctx = s_last_error_context ? s_last_error_context : "unknown";
+    if (s_last_event_status != LORAMAC_EVENT_INFO_STATUS_OK) {
+        snprintf(errmsg, sizeof(errmsg), "%s: event_status=%d",
+                 ctx, (int)s_last_event_status);
+    } else {
+        snprintf(errmsg, sizeof(errmsg), "%s: status=%d",
+                 ctx, (int)s_last_loramac_status);
+    }
+    mp_obj_t exc_args[2] = {
+        MP_OBJ_NEW_SMALL_INT(MP_EIO),
+        mp_obj_new_str(errmsg, strlen(errmsg))
+    };
+    nlr_raise(mp_obj_new_exception_args(&mp_type_OSError, 2, exc_args));
 }
 
 // ---- Scheduler trampolines (run in MicroPython VM context) ----
@@ -668,6 +707,7 @@ static void mcps_confirm(McpsConfirm_t *c) {
         xEventGroupSetBits(s_events, EVT_TX_DONE);
     } else {
         if (s_lora_obj) s_lora_obj->last_tx_ack = false;
+        CAPTURE_LORAMAC_ERROR("send", LORAMAC_STATUS_OK, c->Status);
         xEventGroupSetBits(s_events, EVT_TX_ERROR);
     }
 
@@ -729,6 +769,10 @@ static void mlme_confirm(MlmeConfirm_t *c) {
         } else {
             esp_rom_printf("lorawan: OTAA join attempt failed (status=%d), retrying\n",
                            (int)c->Status);
+            // Capture for last_error() and join_otaa() timeout message.
+            s_last_event_status   = c->Status;
+            s_last_error_epoch_us = (uint64_t)esp_timer_get_time();
+            s_last_error_context  = "join";
             // Set flag; lorawan_task re-sends MLME_JOIN on next iteration so we
             // stay out of a LoRaMAC callback when calling LoRaMacMlmeRequest.
             if (s_otaa_active) {
@@ -1220,6 +1264,10 @@ static void lorawan_task(void *arg) {
             }
 
             case CMD_JOIN_OTAA: {
+                s_last_loramac_status = LORAMAC_STATUS_OK;
+                s_last_event_status   = LORAMAC_EVENT_INFO_STATUS_OK;
+                s_last_error_epoch_us = 0;
+                s_last_error_context  = NULL;
                 // Store credentials for retry loop (mlme_confirm re-reads them).
                 memcpy(s_otaa_dev_eui,  cmd.join_otaa.dev_eui,  8);
                 memcpy(s_otaa_join_eui, cmd.join_otaa.join_eui, 8);
@@ -1274,15 +1322,21 @@ static void lorawan_task(void *arg) {
             }
 
             case CMD_TX: {
-                LoRaMacTxInfo_t tx_info;
+                s_last_loramac_status = LORAMAC_STATUS_OK;
+                s_last_event_status   = LORAMAC_EVENT_INFO_STATUS_OK;
+                s_last_error_epoch_us = 0;
+                s_last_error_context  = NULL;
 
-                if (LoRaMacQueryTxPossible(cmd.tx.len, &tx_info) != LORAMAC_STATUS_OK) {
+                LoRaMacTxInfo_t tx_info;
+                LoRaMacStatus_t qst = LoRaMacQueryTxPossible(cmd.tx.len, &tx_info);
+                if (qst != LORAMAC_STATUS_OK) {
                     // Flush pending MAC commands with an empty unconfirmed frame
                     mcps.Type = MCPS_UNCONFIRMED;
                     mcps.Req.Unconfirmed.fBuffer     = NULL;
                     mcps.Req.Unconfirmed.fBufferSize = 0;
                     mcps.Req.Unconfirmed.Datarate    = DR_5;
                     LoRaMacMcpsRequest(&mcps);
+                    CAPTURE_LORAMAC_ERROR("send", qst, LORAMAC_EVENT_INFO_STATUS_OK);
                     xEventGroupSetBits(s_events, EVT_TX_ERROR);
                     break;
                 }
@@ -1317,6 +1371,7 @@ static void lorawan_task(void *arg) {
                     xEventGroupSetBits(s_events, EVT_TX_DUTY_CYCLE);
                 } else if (st != LORAMAC_STATUS_OK) {
                     esp_rom_printf("lorawan: McpsRequest failed: %d\n", (int)st);
+                    CAPTURE_LORAMAC_ERROR("send", st, LORAMAC_EVENT_INFO_STATUS_OK);
                     xEventGroupSetBits(s_events, EVT_TX_ERROR);
                 }
                 // EVT_TX_DONE / EVT_TX_ERROR set asynchronously by mcps_confirm
@@ -1697,6 +1752,10 @@ static void lorawan_task(void *arg) {
             }
 
             case CMD_MC_ADD: {
+                s_last_loramac_status = LORAMAC_STATUS_OK;
+                s_last_event_status   = LORAMAC_EVENT_INFO_STATUS_OK;
+                s_last_error_epoch_us = 0;
+                s_last_error_context  = NULL;
                 // Local multicast setup — keys provisioned by the app out of
                 // band. LoRaMacMcChannelSetup copies the key bytes into the
                 // soft-SE immediately, so the stack-local buffers we pass in
@@ -1734,12 +1793,17 @@ static void lorawan_task(void *arg) {
                     xEventGroupSetBits(s_events, EVT_COMPLETED);
                 } else {
                     esp_rom_printf("lorawan: LoRaMacMcChannelSetup failed: %d\n", (int)st);
-                    xEventGroupSetBits(s_events, EVT_TX_ERROR); // reuse generic error bit
+                    CAPTURE_LORAMAC_ERROR("multicast_add", st, LORAMAC_EVENT_INFO_STATUS_OK);
+                    xEventGroupSetBits(s_events, EVT_TX_ERROR);
                 }
                 break;
             }
 
             case CMD_MC_RX_PARAMS: {
+                s_last_loramac_status = LORAMAC_STATUS_OK;
+                s_last_event_status   = LORAMAC_EVENT_INFO_STATUS_OK;
+                s_last_error_epoch_us = 0;
+                s_last_error_context  = NULL;
                 cmd_mc_rx_params_t *p = &cmd.mc_rx_params;
                 McRxParams_t rx;
                 rx.Class = (DeviceClass_t)p->device_class;
@@ -1769,12 +1833,17 @@ static void lorawan_task(void *arg) {
                 } else {
                     esp_rom_printf("lorawan: LoRaMacMcChannelSetupRxParams failed: %d status=0x%02x\n",
                                    (int)st, (unsigned)status);
+                    CAPTURE_LORAMAC_ERROR("multicast_rx_params", st, LORAMAC_EVENT_INFO_STATUS_OK);
                     xEventGroupSetBits(s_events, EVT_TX_ERROR);
                 }
                 break;
             }
 
             case CMD_MC_REMOVE: {
+                s_last_loramac_status = LORAMAC_STATUS_OK;
+                s_last_event_status   = LORAMAC_EVENT_INFO_STATUS_OK;
+                s_last_error_epoch_us = 0;
+                s_last_error_context  = NULL;
                 uint8_t group = cmd.mc_group;
                 LoRaMacStatus_t st = LoRaMacMcChannelDelete((AddressIdentifier_t)group);
                 if (st == LORAMAC_STATUS_OK && s_lora_obj) {
@@ -1785,14 +1854,24 @@ static void lorawan_task(void *arg) {
                     xEventGroupSetBits(s_events, EVT_COMPLETED);
                 } else {
                     esp_rom_printf("lorawan: LoRaMacMcChannelDelete failed: %d\n", (int)st);
+                    CAPTURE_LORAMAC_ERROR("multicast_remove", st, LORAMAC_EVENT_INFO_STATUS_OK);
                     xEventGroupSetBits(s_events, EVT_TX_ERROR);
                 }
                 break;
             }
 
             case CMD_REMOTE_MCAST_ENABLE: {
+                s_last_loramac_status = LORAMAC_STATUS_OK;
+                s_last_event_status   = LORAMAC_EVENT_INFO_STATUS_OK;
+                s_last_error_epoch_us = 0;
+                s_last_error_context  = NULL;
                 bool ok = lorawan_remote_mcast_setup_register();
                 if (s_lora_obj) s_lora_obj->remote_mcast_enabled = ok;
+                if (!ok) {
+                    CAPTURE_LORAMAC_ERROR("remote_multicast_enable",
+                                          LORAMAC_STATUS_ERROR,
+                                          LORAMAC_EVENT_INFO_STATUS_OK);
+                }
                 xEventGroupSetBits(s_events, ok ? EVT_COMPLETED : EVT_TX_ERROR);
                 break;
             }
@@ -1872,6 +1951,10 @@ static void lorawan_task(void *arg) {
             }
 
             case CMD_FRAGMENTATION_ENABLE: {
+                s_last_loramac_status = LORAMAC_STATUS_OK;
+                s_last_event_status   = LORAMAC_EVENT_INFO_STATUS_OK;
+                s_last_error_epoch_us = 0;
+                s_last_error_context  = NULL;
                 uint32_t sz = cmd.frag_enable.buffer_size;
                 // Allocate via malloc (raw heap) — the MAC accesses this from
                 // the LoRaWAN task, which is outside MicroPython's GC scope.
@@ -1880,6 +1963,9 @@ static void lorawan_task(void *arg) {
                 // would leak the previous buffer, so reject that here.
                 if (s_lora_obj && s_lora_obj->fragmentation_enabled) {
                     esp_rom_printf("lorawan: fragmentation already enabled\n");
+                    CAPTURE_LORAMAC_ERROR("fragmentation_enable",
+                                          LORAMAC_STATUS_ERROR,
+                                          LORAMAC_EVENT_INFO_STATUS_OK);
                     xEventGroupSetBits(s_events, EVT_TX_ERROR);
                     break;
                 }
@@ -1887,6 +1973,9 @@ static void lorawan_task(void *arg) {
                 if (buf == NULL) {
                     esp_rom_printf("lorawan: fragmentation buffer alloc failed (%lu)\n",
                                    (unsigned long)sz);
+                    CAPTURE_LORAMAC_ERROR("fragmentation_enable",
+                                          LORAMAC_STATUS_ERROR,
+                                          LORAMAC_EVENT_INFO_STATUS_OK);
                     xEventGroupSetBits(s_events, EVT_TX_ERROR);
                     break;
                 }
@@ -1898,6 +1987,9 @@ static void lorawan_task(void *arg) {
                     xEventGroupSetBits(s_events, EVT_COMPLETED);
                 } else {
                     free(buf);
+                    CAPTURE_LORAMAC_ERROR("fragmentation_enable",
+                                          LORAMAC_STATUS_ERROR,
+                                          LORAMAC_EVENT_INFO_STATUS_OK);
                     xEventGroupSetBits(s_events, EVT_TX_ERROR);
                 }
                 break;
@@ -1955,6 +2047,10 @@ static void lorawan_task(void *arg) {
             }
 
             case CMD_CHANNEL_ADD: {
+                s_last_loramac_status = LORAMAC_STATUS_OK;
+                s_last_event_status   = LORAMAC_EVENT_INFO_STATUS_OK;
+                s_last_error_epoch_us = 0;
+                s_last_error_context  = NULL;
                 ChannelParams_t params;
                 params.Frequency    = cmd.channel_add.frequency;
                 params.Rx1Frequency = 0;
@@ -1971,12 +2067,17 @@ static void lorawan_task(void *arg) {
                     xEventGroupSetBits(s_events, EVT_COMPLETED);
                 } else {
                     esp_rom_printf("lorawan: LoRaMacChannelAdd failed: %d\n", (int)st);
+                    CAPTURE_LORAMAC_ERROR("add_channel", st, LORAMAC_EVENT_INFO_STATUS_OK);
                     xEventGroupSetBits(s_events, EVT_TX_ERROR);
                 }
                 break;
             }
 
             case CMD_CHANNEL_REMOVE: {
+                s_last_loramac_status = LORAMAC_STATUS_OK;
+                s_last_event_status   = LORAMAC_EVENT_INFO_STATUS_OK;
+                s_last_error_epoch_us = 0;
+                s_last_error_context  = NULL;
                 LoRaMacStatus_t st = LoRaMacChannelRemove(cmd.channel_index);
                 if (st == LORAMAC_STATUS_OK) {
                     esp_rom_printf("lorawan: channel %u removed\n",
@@ -1984,6 +2085,7 @@ static void lorawan_task(void *arg) {
                     xEventGroupSetBits(s_events, EVT_COMPLETED);
                 } else {
                     esp_rom_printf("lorawan: LoRaMacChannelRemove failed: %d\n", (int)st);
+                    CAPTURE_LORAMAC_ERROR("remove_channel", st, LORAMAC_EVENT_INFO_STATUS_OK);
                     xEventGroupSetBits(s_events, EVT_TX_ERROR);
                 }
                 break;
@@ -2161,7 +2263,22 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
                                MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
     if (s_task_handle != NULL) {
-        lorawan_deinit(MP_OBJ_FROM_PTR(s_lora_obj));
+        // A previous instance left its task alive. Tear it down without
+        // dereferencing s_lora_obj — the GC may have already freed it if
+        // __del__ was not called before make_new re-entered.
+        lorawan_cmd_data_t dcmd = { .cmd = CMD_DEINIT };
+        xEventGroupClearBits(s_events, EVT_COMPLETED);
+        xQueueSend(s_cmd_queue, &dcmd, portMAX_DELAY);
+        xTaskNotifyGive(s_task_handle);
+        xEventGroupWaitBits(s_events, EVT_COMPLETED,
+                            pdTRUE, pdFALSE, pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(10));
+        if (s_cmd_queue) { vQueueDelete(s_cmd_queue); s_cmd_queue = NULL; }
+        if (s_rx_queue)  { vQueueDelete(s_rx_queue);  s_rx_queue  = NULL; }
+        if (s_events)    { vEventGroupDelete(s_events); s_events = NULL; }
+        s_task_handle = NULL;
+        s_lora_obj    = NULL;
+        g_tx_power_hw_override = LORAWAN_TX_POWER_NO_OVERRIDE;
     }
 
     // Finaliser-backed allocation so the GC's sweep during soft-reset
@@ -2445,7 +2562,16 @@ static mp_obj_t lorawan_join_otaa(size_t n_args, const mp_obj_t *pos_args,
 
     if (!(bits & EVT_JOIN_DONE)) {
         s_otaa_active = false;  // stop retry loop
-        mp_raise_OSError(MP_ETIMEDOUT);
+        // Embed the last join-attempt status so the caller can distinguish
+        // "network never replied" (event_status=0) from "rejected" (e.g. 4 = JOIN_FAIL).
+        char errmsg[48];
+        snprintf(errmsg, sizeof(errmsg), "join: last_status=%d",
+                 (int)s_last_event_status);
+        mp_obj_t exc_args[2] = {
+            MP_OBJ_NEW_SMALL_INT(MP_ETIMEDOUT),
+            mp_obj_new_str(errmsg, strlen(errmsg))
+        };
+        nlr_raise(mp_obj_new_exception_args(&mp_type_OSError, 2, exc_args));
     }
 
     return mp_const_none;
@@ -2523,7 +2649,7 @@ static mp_obj_t lorawan_send(size_t n_args, const mp_obj_t *pos_args,
         mp_raise_OSError(MP_EBUSY);
     }
     if (bits & EVT_TX_ERROR) {
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("send failed"));
+        lorawan_raise_last_error();
     }
     if (!(bits & EVT_TX_DONE)) {
         mp_raise_OSError(MP_ETIMEDOUT);
@@ -3037,7 +3163,7 @@ static mp_obj_t lorawan_link_check(size_t n_args, const mp_obj_t *pos_args,
                                                pdTRUE, pdFALSE,
                                                pdMS_TO_TICKS(120000));
         if (bits & EVT_TX_ERROR) {
-            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("link_check send failed"));
+            lorawan_raise_last_error();
         }
         if (!(bits & EVT_TX_DONE)) {
             mp_raise_OSError(MP_ETIMEDOUT);
@@ -3321,7 +3447,7 @@ static mp_obj_t lorawan_multicast_add(size_t n_args, const mp_obj_t *pos_args,
 
     EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
     if (bits & EVT_TX_ERROR) {
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("multicast_add failed"));
+        lorawan_raise_last_error();
     }
     return mp_obj_new_int(group);
 }
@@ -3367,8 +3493,7 @@ static mp_obj_t lorawan_multicast_rx_params(size_t n_args, const mp_obj_t *pos_a
 
     EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
     if (bits & EVT_TX_ERROR) {
-        mp_raise_msg(&mp_type_RuntimeError,
-                     MP_ERROR_TEXT("multicast_rx_params failed"));
+        lorawan_raise_last_error();
     }
     return mp_const_none;
 }
@@ -3389,8 +3514,7 @@ static mp_obj_t lorawan_multicast_remove(mp_obj_t self_in, mp_obj_t group_in) {
     cmd.mc_group = (uint8_t)group;
     EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
     if (bits & EVT_TX_ERROR) {
-        mp_raise_msg(&mp_type_RuntimeError,
-                     MP_ERROR_TEXT("multicast_remove failed"));
+        lorawan_raise_last_error();
     }
     return mp_const_none;
 }
@@ -3469,7 +3593,7 @@ static mp_obj_t lorawan_add_channel(size_t n_args, const mp_obj_t *pos_args,
     cmd.channel_add.dr_max    = (int8_t)dr_max;
     EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
     if (bits & EVT_TX_ERROR) {
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("add_channel failed"));
+        lorawan_raise_last_error();
     }
     return mp_const_none;
 }
@@ -3498,7 +3622,7 @@ static mp_obj_t lorawan_remove_channel(size_t n_args, const mp_obj_t *pos_args,
     cmd.channel_index = (uint8_t)index;
     EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
     if (bits & EVT_TX_ERROR) {
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("remove_channel failed"));
+        lorawan_raise_last_error();
     }
     return mp_const_none;
 }
@@ -3546,8 +3670,7 @@ static mp_obj_t lorawan_remote_multicast_enable(mp_obj_t self_in) {
     lorawan_cmd_data_t cmd = { .cmd = CMD_REMOTE_MCAST_ENABLE };
     EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
     if (bits & EVT_TX_ERROR) {
-        mp_raise_msg(&mp_type_RuntimeError,
-                     MP_ERROR_TEXT("remote_multicast_enable failed"));
+        lorawan_raise_last_error();
     }
     return mp_obj_new_bool(self->remote_mcast_enabled);
 }
@@ -3596,8 +3719,7 @@ static mp_obj_t lorawan_fragmentation_enable(size_t n_args, const mp_obj_t *pos_
     cmd.frag_enable.buffer_size = (uint32_t)sz;
     EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
     if (bits & EVT_TX_ERROR) {
-        mp_raise_msg(&mp_type_RuntimeError,
-                     MP_ERROR_TEXT("fragmentation_enable failed"));
+        lorawan_raise_last_error();
     }
     return mp_const_none;
 }
@@ -3621,6 +3743,30 @@ static mp_obj_t lorawan_fragmentation_data(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_fragmentation_data_obj,
                                   lorawan_fragmentation_data);
+
+// last_error() → dict | None
+// Returns {"loramac_status", "event_status", "context", "epoch_us"} from the
+// most recent failure, or None if no failure has been recorded since boot or
+// since the last successful operation cleared the context. Users can call this
+// immediately after an OSError(EIO, ...) to get the numeric codes for branching.
+static mp_obj_t lorawan_last_error(mp_obj_t self_in) {
+    (void)self_in;
+    if (!s_last_error_context) {
+        return mp_const_none;
+    }
+    mp_obj_t d = mp_obj_new_dict(4);
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_loramac_status),
+                      mp_obj_new_int((int)s_last_loramac_status));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_event_status),
+                      mp_obj_new_int((int)s_last_event_status));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_context),
+                      mp_obj_new_str(s_last_error_context,
+                                     strlen(s_last_error_context)));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_epoch_us),
+                      mp_obj_new_int_from_ull(s_last_error_epoch_us));
+    return d;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_last_error_obj, lorawan_last_error);
 
 // deinit() — ordered teardown so a fresh lorawan.LoRaWAN(...) can be
 // created in the same REPL session. Idempotent: calling after the task has
@@ -3747,6 +3893,8 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
                                                  MP_ROM_PTR(&lorawan_remote_multicast_enable_obj) },
     { MP_ROM_QSTR(MP_QSTR_fragmentation_enable), MP_ROM_PTR(&lorawan_fragmentation_enable_obj) },
     { MP_ROM_QSTR(MP_QSTR_fragmentation_data),   MP_ROM_PTR(&lorawan_fragmentation_data_obj) },
+    // Diagnostics (Session 21)
+    { MP_ROM_QSTR(MP_QSTR_last_error),           MP_ROM_PTR(&lorawan_last_error_obj) },
     // Lifecycle (Session 16). __del__ fires on GC sweep, including the
     // sweep done by the ESP32 port during soft-reset (Ctrl-D in REPL).
     { MP_ROM_QSTR(MP_QSTR_deinit),               MP_ROM_PTR(&lorawan_deinit_obj) },
@@ -3767,7 +3915,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("1.0.0", 5);
+    return mp_obj_new_str("1.1.0", 5);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 

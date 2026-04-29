@@ -452,46 +452,33 @@ about a dozen call sites collapse the `LoRaMacStatus_t` (e.g. `MC_GROUP_UNDEFINE
 vs `PARAMETER_INVALID` vs `BUSY`) to a generic `RuntimeError("<api> failed")`,
 which gives users no way to branch.
 
-- [ ] `send()` MAC-failure path: change `RuntimeError("send failed")` (modlorawan.c:2526)
-      to `OSError(EIO, "send: event_status=N")` where `N` is the
-      `LORAMAC_EVENT_INFO_STATUS_*` captured from `mcps_confirm`. Covers
-      `TX_TIMEOUT`, `RX1_TIMEOUT`, `RX2_TIMEOUT`, `MIC_FAIL`, `ADDRESS_FAIL`,
-      etc. The `OSError(ETIMEDOUT)` path on Python-side timeout already
-      matches the convention.
-- [ ] Plumb `LoRaMacStatus_t` through every CMD_* error path: replace the ~12
-      generic `mp_raise_msg(&mp_type_RuntimeError, "<api> failed")` sites in
-      `multicast_add`, `multicast_rx_params`, `multicast_remove`, `add_channel`,
-      `remove_channel`, `link_check send`, `fragmentation_enable`, etc., with
-      `OSError(EIO, "<api>: status=N")`. Capture the status into a per-cmd
-      `s_last_status` static before signalling `EVT_TX_ERROR`, then read it
-      from the Python wrapper before raising.
-- [ ] OTAA join failure: capture `c->Status` from the last `MLME_JOIN` confirm
-      into `s_last_join_status` (currently only printed via `esp_rom_printf`).
-      Append the status code to the existing `OSError(ETIMEDOUT)` from
-      `join_otaa`: `OSError(ETIMEDOUT, "join: last_status=N")`.
-- [ ] `lw.last_error()` → `dict | None`: returns
-      `{"loramac_status": int, "event_status": int, "context": "send|join|...",
-      "epoch_us": int}` from the most recent failure or `None`. Cleared after
-      a successful operation in the same context. Lets users post-mortem
-      without scraping `esp_rom_printf` UART logs.
-- [ ] Verify `EBUSY` semantics match the README. The README claims the
-      `OSError(EBUSY)` path means the frame was **not** queued; the LoRaMAC-node
-      v4.7.0 source returns `DUTYCYCLE_RESTRICTED` in some band-restricted
-      cases but returns `OK` with a non-zero `DutyCycleWaitTime` (queued via
-      `TxDelayedTimer`) in others. Audit the two paths to confirm
-      `EVT_TX_DUTY_CYCLE` is only raised in the not-queued case. If both
-      cases hit the same path, document precisely or split.
-- [ ] Tighten constructor's auto-deinit (`lorawan_make_new`, modlorawan.c:2163):
-      drop the `lorawan_deinit(MP_OBJ_FROM_PTR(s_lora_obj))` call and drive
-      teardown purely off the `s_task_handle` static. `s_lora_obj` could be a
-      dangling pointer if GC freed the previous instance before `__del__`
-      fired; today this happens to be benign (the deref only clears
-      `self->initialized`) but is a latent UAF.
-- [ ] README: expand the `send()` "Exceptions" block, replace the
-      `RuntimeError("send failed")` line with `OSError(EIO)`, document
-      `last_error()` with a worked example, and clarify `EBUSY` vs the
-      120 s blocking timeout for queued duty-cycle waits.
-- [ ] Version bump 1.0.0 → 1.1.0 (breaking change in exception types).
+- [x] `send()` MAC-failure path: changed to `OSError(EIO, "send: event_status=N")` where
+      N is the `LORAMAC_EVENT_INFO_STATUS_*` from `mcps_confirm`. Covers `TX_TIMEOUT`,
+      `RX1_TIMEOUT`, `RX2_TIMEOUT`, `MIC_FAIL`, `ADDRESS_FAIL`, etc.
+- [x] Plumb `LoRaMacStatus_t` through every CMD_* error path: replaced all ~12 generic
+      `RuntimeError("<api> failed")` sites with `OSError(EIO, "<api>: status=N")` via
+      `lorawan_raise_last_error()`. Four statics (`s_last_loramac_status`,
+      `s_last_event_status`, `s_last_error_epoch_us`, `s_last_error_context`) populated
+      by `CAPTURE_LORAMAC_ERROR()` macro just before each `EVT_TX_ERROR` set; reset to
+      zero/NULL at start of each CMD_* dispatch.
+- [x] OTAA join failure: `mlme_confirm(MLME_JOIN, != OK)` now sets `s_last_event_status`
+      and `s_last_error_context = "join"`. `join_otaa()` timeout raises
+      `OSError(ETIMEDOUT, "join: last_status=N")` with the captured value.
+- [x] `lw.last_error()` → `dict | None`: returns `{"loramac_status", "event_status",
+      "context", "epoch_us"}` from the most recent failure, or `None` if no failure
+      recorded. Context is `NULL` (returns `None`) until the first failure.
+- [x] Verify `EBUSY` semantics: `EVT_TX_DUTY_CYCLE` is only set on
+      `LORAMAC_STATUS_DUTYCYCLE_RESTRICTED` (frame NOT queued). The `OK` path with
+      non-zero `DutyCycleWaitTime` queues via `TxDelayedTimer` and eventually fires
+      `mcps_confirm` → `EVT_TX_DONE`. Semantics match README: `EBUSY` = not queued.
+- [x] Tighten constructor's auto-deinit: `lorawan_make_new` now sends `CMD_DEINIT`
+      directly without dereferencing `s_lora_obj` (which may be a dangling pointer
+      if the GC freed the old object before `__del__` fired).
+- [x] README: updated send() Exceptions block, added last_error() documentation with
+      worked example, clarified EBUSY vs 120 s blocking timeout.
+- [x] Version bump 1.0.0 → 1.1.0; compile clean, zero warnings; firmware 1649376 bytes
+      (+3680 B for error capture statics + lorawan_raise_last_error + last_error()).
+- [x] Hardware-verified: test_session21_errors.py — 16/16 passed on T-Beam SX1276.
 
 ### Session 22: API consistency cleanup
 
