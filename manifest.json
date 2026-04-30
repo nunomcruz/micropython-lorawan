@@ -1,6 +1,6 @@
 {
   "name": "MicroPython LoRaWAN (T-Beam)",
-  "version": "v1.3.1-lorawan",
+  "version": "v1.3.2-lorawan",
   "new_install_prompt_erase": true,
   "builds": [
     {
