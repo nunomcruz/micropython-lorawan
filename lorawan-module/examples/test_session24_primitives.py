@@ -24,9 +24,9 @@ import lorawan
 
 # Credentials for the MAC-init tests (tests 3-6). ABP is used so no network
 # round-trip is needed; replace the keys for tests involving a live LNS.
-ABP_DEV_ADDR  = 0x01020304
-ABP_NWK_S_KEY = bytes.fromhex("00000000000000000000000000000001")
-ABP_APP_S_KEY = bytes.fromhex("00000000000000000000000000000002")
+ABP_DEV_ADDR = 0x260B9E51                              # replace with your DevAddr
+ABP_NWK_S_KEY = bytes.fromhex("24E6F2A652D5466E994F56930DB92322")               # replace with your NwkSKey
+ABP_APP_S_KEY = bytes.fromhex("ED910C0E241BE2150AB52458B9E6EE23")               # replace with your AppSKey
 
 # LoRaWAN 1.1.1 spec Annex A.6 multicast session key derivation test vectors.
 # McKey  = 0x000102030405060708090a0b0c0d0e0f
@@ -206,13 +206,16 @@ try:
            "nwk=" + nwk_s_key.hex() + " app=" + app_s_key.hex())
     else:
         fail("derive_mc_keys non-zero", "one or both keys are all-zero")
-    # Group 1 should give different keys for the same McKey (different GroupID).
-    result1 = lw3.derive_mc_keys(MC_ADDR_VECTOR, MC_KEY_VECTOR, group=1)
+    # Group 1 with a DIFFERENT McKey must produce different keys. The LoRaWAN
+    # derivation formula (AES128(McKey, {diversifier | McAddr | pad})) does not
+    # include the group index, so isolation requires distinct McKeys per group.
+    mc_key_1 = bytes(b ^ 0xFF for b in MC_KEY_VECTOR)
+    result1 = lw3.derive_mc_keys(MC_ADDR_VECTOR, mc_key_1, group=1)
     nwk1, app1 = result1
     if nwk1 != nwk_s_key or app1 != app_s_key:
-        ok("derive_mc_keys group isolation", "group=1 keys differ from group=0")
+        ok("derive_mc_keys group isolation", "group=1 (different McKey) differs from group=0")
     else:
-        fail("derive_mc_keys group isolation", "group=1 and group=0 gave identical keys")
+        fail("derive_mc_keys group isolation", "group=1 and group=0 gave identical keys despite different McKey")
 except Exception as e:
     fail("derive_mc_keys functional", str(e))
 finally:
