@@ -15,6 +15,7 @@
 #include "LmHandler.h"
 #include "LmhPackage.h"
 #include "LmhpClockSync.h"
+#include "LmhpCompliance.h"
 #include "LmhpRemoteMcastSetup.h"
 #include "LmhpFragmentation.h"
 #include "FragDecoder.h"
@@ -32,6 +33,37 @@
 
 static LmhPackage_t *s_packages[SHIM_PKG_MAX];
 static uint8_t       s_pkg_buffer[SHIM_PKG_BUFFER_SIZE];
+
+// Compliance package parameters.  FwVersion fields match lorawan.version()
+// (1.3.0).  The three TX-control callbacks are no-ops: periodicity changes
+// and frame-type overrides come from the certification tool; we don't need
+// to mirror them into Python state for the basic compliance_enable() flow.
+static void compliance_on_tx_periodicity_changed(uint32_t periodicity) { (void)periodicity; }
+static void compliance_on_tx_frame_ctrl_changed(LmHandlerMsgTypes_t t) { (void)t; }
+static void compliance_on_ping_slot_periodicity_changed(uint8_t p) { (void)p; }
+
+static LmhpComplianceParams_t s_compliance_params = {
+    .FwVersion = { .Fields = { .Major = 1, .Minor = 3, .Patch = 0, .Revision = 0 } },
+    .OnTxPeriodicityChanged      = compliance_on_tx_periodicity_changed,
+    .OnTxFrameCtrlChanged        = compliance_on_tx_frame_ctrl_changed,
+    .OnPingSlotPeriodicityChanged = compliance_on_ping_slot_periodicity_changed,
+};
+
+// Called by LmhpCompliance when it executes COMPLIANCE_TX_CW_REQ or
+// COMPLIANCE_LINK_CHECK_REQ.  We only care that it is non-NULL; the
+// DutyCycleWaitTime is informational and we already track it separately.
+static void shim_on_mac_mlme_request(LoRaMacStatus_t status, MlmeReq_t *mlme,
+                                     TimerTime_t next_tx_delay) {
+    (void)status;
+    (void)mlme;
+    (void)next_tx_delay;
+}
+
+// Called by LmhpCompliance on COMPLIANCE_DUT_JOIN_REQ.  A full re-join
+// requires the device's OTAA credentials, which the shim does not hold.
+// Return without action; the certification tool can re-run the full join
+// by resetting the DUT instead.
+static void shim_on_join_request(bool is_otaa) { (void)is_otaa; }
 
 // ---- Callbacks injected into registered packages ----
 
@@ -97,6 +129,12 @@ LmHandlerErrorStatus_t LmHandlerSend(LmHandlerAppData_t *appData,
 LmHandlerErrorStatus_t LmHandlerPackageRegister(uint8_t id, void *params) {
     LmhPackage_t *pkg = NULL;
     switch (id) {
+    case PACKAGE_ID_COMPLIANCE:
+        pkg = LmphCompliancePackageFactory();
+        // Compliance params are held in our static (already configured above);
+        // override the caller's params pointer so Init gets the right struct.
+        params = &s_compliance_params;
+        break;
     case PACKAGE_ID_CLOCK_SYNC:
         pkg = LmphClockSyncPackageFactory();
         break;
@@ -113,12 +151,14 @@ LmHandlerErrorStatus_t LmHandlerPackageRegister(uint8_t id, void *params) {
         return LORAMAC_HANDLER_ERROR;
     }
 
-    // Wire the LmHandler-provided callbacks.  OnMacMcpsRequest /
-    // OnMacMlmeRequest / OnJoinRequest are unused by LmhpClockSync so we
-    // leave them NULL.
+    // Wire LmHandler callbacks.  Compliance uses OnMacMlmeRequest (TX_CW,
+    // LinkCheck) and OnJoinRequest (DUT_JOIN_REQ) — provide non-NULL stubs.
+    // ClockSync / RemoteMcast only need OnDeviceTimeRequest + OnSysTimeUpdate.
     pkg->OnMacMcpsRequest    = NULL;
-    pkg->OnMacMlmeRequest    = NULL;
-    pkg->OnJoinRequest       = NULL;
+    pkg->OnMacMlmeRequest    = (id == PACKAGE_ID_COMPLIANCE)
+                               ? shim_on_mac_mlme_request : NULL;
+    pkg->OnJoinRequest       = (id == PACKAGE_ID_COMPLIANCE)
+                               ? shim_on_join_request : NULL;
     pkg->OnDeviceTimeRequest = shim_on_device_time_request;
 #if( LMH_SYS_TIME_UPDATE_NEW_API == 1 )
     pkg->OnSysTimeUpdate     = shim_on_sys_time_update;
@@ -164,7 +204,39 @@ void lorawan_packages_on_mcps_indication(McpsIndication_t *ind) {
     }
 }
 
+void lorawan_packages_on_mlme_confirm(MlmeConfirm_t *c) {
+    if (c == NULL) return;
+    for (uint8_t i = 0; i < SHIM_PKG_MAX; i++) {
+        LmhPackage_t *pkg = s_packages[i];
+        if (pkg != NULL && pkg->OnMlmeConfirmProcess != NULL) {
+            pkg->OnMlmeConfirmProcess(c);
+        }
+    }
+}
+
+void lorawan_packages_on_mlme_indication(MlmeIndication_t *ind) {
+    if (ind == NULL) return;
+    for (uint8_t i = 0; i < SHIM_PKG_MAX; i++) {
+        LmhPackage_t *pkg = s_packages[i];
+        if (pkg != NULL && pkg->OnMlmeIndicationProcess != NULL) {
+            pkg->OnMlmeIndicationProcess(ind);
+        }
+    }
+}
+
+// Used by LmhpCompliance.Process() to throttle retransmissions.  Return 0
+// so the MAC's own duty-cycle enforcement (LoRaMacMcpsRequest) is the
+// gate rather than a separate timer in the package layer.
+TimerTime_t LmHandlerGetDutyCycleWaitTime(void) {
+    return 0;
+}
+
 // ---- Thin wrappers for modlorawan.c ----
+
+bool lorawan_compliance_register(void) {
+    return LmHandlerPackageRegister(PACKAGE_ID_COMPLIANCE, NULL)
+           == LORAMAC_HANDLER_SUCCESS;
+}
 
 bool lorawan_clock_sync_register(void) {
     return LmHandlerPackageRegister(PACKAGE_ID_CLOCK_SYNC, NULL)

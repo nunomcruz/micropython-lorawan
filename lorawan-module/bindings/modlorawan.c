@@ -153,6 +153,9 @@ typedef enum {
     CMD_QUERY,
     CMD_CHANNEL_ADD,
     CMD_CHANNEL_REMOVE,
+    CMD_TX_CW,
+    CMD_COMPLIANCE_ENABLE,
+    CMD_DERIVE_MC_KEYS,
 } lorawan_cmd_t;
 
 // Query sub-types for CMD_QUERY. Result is written to s_query_* statics
@@ -200,6 +203,18 @@ typedef struct {
 } cmd_channel_add_t;
 
 typedef struct {
+    uint32_t freq_hz;     // carrier frequency in Hz
+    int8_t   power_dbm;   // TX power in dBm (hardware cap: SX1276≤20, SX1262≤22)
+    uint16_t duration_s;  // seconds to transmit (1..30); 0 = until MAC stops it
+} cmd_tx_cw_t;
+
+typedef struct {
+    uint32_t addr;        // 32-bit multicast DevAddr
+    uint8_t  mc_key[16];  // McKey for the group (used to derive McAppSKey+McNwkSKey)
+    uint8_t  group;       // 0..3
+} cmd_derive_mc_keys_t;
+
+typedef struct {
     uint8_t dev_eui[8];
     uint8_t join_eui[8];
     uint8_t app_key[16];
@@ -244,6 +259,8 @@ typedef struct {
         int8_t          dr_override;        // CMD_CLOCK_SYNC_REQUEST: DR_0..DR_5; -1 = keep MIB
         cmd_channel_add_t channel_add;      // CMD_CHANNEL_ADD
         uint8_t         channel_index;      // CMD_CHANNEL_REMOVE: 0..15
+        cmd_tx_cw_t     tx_cw;             // CMD_TX_CW
+        cmd_derive_mc_keys_t derive_mc_keys; // CMD_DERIVE_MC_KEYS
     };
 } lorawan_cmd_data_t;
 
@@ -342,6 +359,9 @@ typedef struct {
     // path and the application-layer AppTimeReq path, so both update the same
     // snapshot.
     bool            clock_sync_enabled;
+    // Compliance (LmhpCompliance, port 224). Flips true once the package is
+    // registered via compliance_enable(). Required for LoRa Alliance certification.
+    bool            compliance_enabled;
     // Class B — beacon + ping slot state, populated by the MLME handlers.
     mp_obj_t        beacon_callback;           // fires on every MLME_BEACON indication
     uint8_t         ping_slot_periodicity;     // 0..7, period = 2^N seconds
@@ -411,6 +431,11 @@ static uint32_t        s_query_dev_addr;
 static uint8_t         s_query_max_payload_len;
 static ChannelParams_t s_query_channels[LW_MAX_CHANNELS];
 static uint16_t        s_query_channels_mask;
+
+// CMD_DERIVE_MC_KEYS result statics. Same lifecycle as s_query_*: written by
+// the LoRaWAN task before EVT_COMPLETED, read by Python after send_cmd_wait.
+static uint8_t s_derived_nwk_s_key[16];
+static uint8_t s_derived_app_s_key[16];
 
 // Last error statics — written by the LoRaWAN task just before setting EVT_TX_ERROR;
 // read by the Python thread in lorawan_raise_last_error() and last_error(). Safe:
@@ -758,6 +783,9 @@ static void mcps_indication(McpsIndication_t *ind) {
 static void mlme_confirm(MlmeConfirm_t *c) {
     if (!c) return;
 
+    // Fan out to registered packages (LmhpCompliance needs MLME events).
+    lorawan_packages_on_mlme_confirm(c);
+
     switch (c->MlmeRequest) {
     case MLME_JOIN:
         if (c->Status == LORAMAC_EVENT_INFO_STATUS_OK) {
@@ -891,6 +919,19 @@ static void mlme_confirm(MlmeConfirm_t *c) {
         }
         break;
 
+    case MLME_TXCW:
+        // Continuous wave transmission completed (MAC internal timer expired).
+        // Signal the Python caller waiting on EVT_COMPLETED/EVT_TX_ERROR.
+        if (c->Status == LORAMAC_EVENT_INFO_STATUS_OK) {
+            esp_rom_printf("lorawan: TXCW completed\n");
+            xEventGroupSetBits(s_events, EVT_COMPLETED);
+        } else {
+            esp_rom_printf("lorawan: TXCW failed (status=%d)\n", (int)c->Status);
+            CAPTURE_LORAMAC_ERROR("tx_cw", LORAMAC_STATUS_OK, c->Status);
+            xEventGroupSetBits(s_events, EVT_TX_ERROR);
+        }
+        break;
+
     default:
         break;
     }
@@ -898,6 +939,9 @@ static void mlme_confirm(MlmeConfirm_t *c) {
 
 static void mlme_indication(MlmeIndication_t *ind) {
     if (!ind || !s_lora_obj) return;
+
+    // Fan out to registered packages (LmhpCompliance needs beacon events).
+    lorawan_packages_on_mlme_indication(ind);
 
     switch (ind->MlmeIndication) {
     case MLME_BEACON: {
@@ -2091,6 +2135,101 @@ static void lorawan_task(void *arg) {
                 break;
             }
 
+            case CMD_TX_CW: {
+                s_last_loramac_status = LORAMAC_STATUS_OK;
+                s_last_event_status   = LORAMAC_EVENT_INFO_STATUS_OK;
+                s_last_error_epoch_us = 0;
+                s_last_error_context  = NULL;
+                cmd_tx_cw_t *cw = &cmd.tx_cw;
+                MlmeReq_t mlme;
+                mlme.Type              = MLME_TXCW;
+                mlme.Req.TxCw.Frequency = cw->freq_hz;
+                mlme.Req.TxCw.Power    = cw->power_dbm;
+                mlme.Req.TxCw.Timeout  = cw->duration_s;
+                LoRaMacStatus_t st = LoRaMacMlmeRequest(&mlme);
+                if (st == LORAMAC_STATUS_OK) {
+                    esp_rom_printf("lorawan: TXCW started freq=%lu power=%d duration=%us\n",
+                                   (unsigned long)cw->freq_hz, (int)cw->power_dbm,
+                                   (unsigned)cw->duration_s);
+                    // EVT_COMPLETED/EVT_TX_ERROR fired by mlme_confirm(MLME_TXCW)
+                } else {
+                    esp_rom_printf("lorawan: MLME_TXCW request failed: %d\n", (int)st);
+                    CAPTURE_LORAMAC_ERROR("tx_cw", st, LORAMAC_EVENT_INFO_STATUS_OK);
+                    xEventGroupSetBits(s_events, EVT_TX_ERROR);
+                }
+                break;
+            }
+
+            case CMD_COMPLIANCE_ENABLE: {
+                s_last_loramac_status = LORAMAC_STATUS_OK;
+                s_last_event_status   = LORAMAC_EVENT_INFO_STATUS_OK;
+                s_last_error_epoch_us = 0;
+                s_last_error_context  = NULL;
+                bool ok = lorawan_compliance_register();
+                if (s_lora_obj) s_lora_obj->compliance_enabled = ok;
+                if (!ok) {
+                    CAPTURE_LORAMAC_ERROR("compliance_enable",
+                                          LORAMAC_STATUS_ERROR,
+                                          LORAMAC_EVENT_INFO_STATUS_OK);
+                }
+                xEventGroupSetBits(s_events, ok ? EVT_COMPLETED : EVT_TX_ERROR);
+                break;
+            }
+
+            case CMD_DERIVE_MC_KEYS: {
+                s_last_loramac_status = LORAMAC_STATUS_OK;
+                s_last_event_status   = LORAMAC_EVENT_INFO_STATUS_OK;
+                s_last_error_epoch_us = 0;
+                s_last_error_context  = NULL;
+                cmd_derive_mc_keys_t *d = &cmd.derive_mc_keys;
+                uint8_t mc_key[16];
+                memcpy(mc_key, d->mc_key, 16);
+                McChannelParams_t ch;
+                memset(&ch, 0, sizeof(ch));
+                ch.IsRemotelySetup = true;  // use McKey path → derive session keys
+                ch.IsEnabled       = true;
+                ch.GroupID         = (AddressIdentifier_t)d->group;
+                ch.Address         = d->addr;
+                ch.McKeys.McKeyE   = mc_key;
+                ch.FCountMin       = 0;
+                ch.FCountMax       = 0xFFFFFFFFU;
+                LoRaMacStatus_t st = LoRaMacMcChannelSetup(&ch);
+                if (st == LORAMAC_STATUS_OK) {
+                    // Read back the derived session keys via MIB. The MIB
+                    // pointers reference the soft-SE keystore; copy before
+                    // the next MAC operation could change them.
+                    const Mib_t app_mibs[4] = {
+                        MIB_MC_APP_S_KEY_0, MIB_MC_APP_S_KEY_1,
+                        MIB_MC_APP_S_KEY_2, MIB_MC_APP_S_KEY_3,
+                    };
+                    const Mib_t nwk_mibs[4] = {
+                        MIB_MC_NWK_S_KEY_0, MIB_MC_NWK_S_KEY_1,
+                        MIB_MC_NWK_S_KEY_2, MIB_MC_NWK_S_KEY_3,
+                    };
+                    MibRequestConfirm_t km;
+                    km.Type = app_mibs[d->group];
+                    if (LoRaMacMibGetRequestConfirm(&km) == LORAMAC_STATUS_OK
+                        && km.Param.McAppSKey0 != NULL) {
+                        memcpy(s_derived_app_s_key, km.Param.McAppSKey0, 16);
+                    }
+                    km.Type = nwk_mibs[d->group];
+                    if (LoRaMacMibGetRequestConfirm(&km) == LORAMAC_STATUS_OK
+                        && km.Param.McNwkSKey0 != NULL) {
+                        memcpy(s_derived_nwk_s_key, km.Param.McNwkSKey0, 16);
+                    }
+                    esp_rom_printf("lorawan: MC keys derived for group %u addr=0x%08lx\n",
+                                   (unsigned)d->group, (unsigned long)d->addr);
+                    xEventGroupSetBits(s_events, EVT_COMPLETED);
+                } else {
+                    esp_rom_printf("lorawan: LoRaMacMcChannelSetup (derive) failed: %d\n",
+                                   (int)st);
+                    CAPTURE_LORAMAC_ERROR("derive_mc_keys", st,
+                                          LORAMAC_EVENT_INFO_STATUS_OK);
+                    xEventGroupSetBits(s_events, EVT_TX_ERROR);
+                }
+                break;
+            }
+
             default:
                 break;
             }
@@ -2351,6 +2490,7 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     self->link_check_margin   = 0;
     self->link_check_gw_count = 0;
     self->clock_sync_enabled  = false;
+    self->compliance_enabled  = false;
 
     self->beacon_callback       = mp_const_none;
     self->ping_slot_periodicity = 0;
@@ -3735,6 +3875,134 @@ static mp_obj_t lorawan_fragmentation_data(mp_obj_t self_in) {
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_fragmentation_data_obj,
                                   lorawan_fragmentation_data);
 
+// ---- Session 24 additions ----
+
+// tx_cw(freq_hz, power_dbm, duration_s)
+// Transmit a continuous wave carrier for radio bring-up and antenna SWR checks.
+// Wraps MLME_TXCW. Blocks until the MAC's internal timer expires (duration_s).
+// MUST be called in a non-joined or Class A idle state — the radio is hijacked
+// for the entire duration. Not suitable during active RX windows.
+static mp_obj_t lorawan_tx_cw(size_t n_args, const mp_obj_t *args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+
+    uint32_t freq_hz    = (uint32_t)mp_obj_get_int(args[1]);
+    int      power_dbm  = mp_obj_get_int(args[2]);
+    int      duration_s = mp_obj_get_int(args[3]);
+
+    // EU868 / EU433 frequency validation (rough bounds).
+    if (self->region == LORAMAC_REGION_EU868) {
+        if (freq_hz < 863000000UL || freq_hz > 870000000UL) {
+            mp_raise_ValueError(
+                MP_ERROR_TEXT("freq_hz out of EU868 range (863-870 MHz)"));
+        }
+    } else if (self->region == LORAMAC_REGION_EU433) {
+        if (freq_hz < 433050000UL || freq_hz > 434790000UL) {
+            mp_raise_ValueError(
+                MP_ERROR_TEXT("freq_hz out of EU433 range (433.05-434.79 MHz)"));
+        }
+    }
+
+    // Hardware power cap.
+    int max_dbm = self->is_sx1276 ? 20 : 22;
+    if (power_dbm > max_dbm) {
+        mp_raise_ValueError(MP_ERROR_TEXT("power_dbm exceeds hardware cap"));
+    }
+    if (power_dbm < 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("power_dbm must be >= 0"));
+    }
+    if (duration_s < 1 || duration_s > 30) {
+        mp_raise_ValueError(MP_ERROR_TEXT("duration_s must be 1..30"));
+    }
+
+    lorawan_cmd_data_t cmd = { .cmd = CMD_TX_CW };
+    cmd.tx_cw.freq_hz    = freq_hz;
+    cmd.tx_cw.power_dbm  = (int8_t)power_dbm;
+    cmd.tx_cw.duration_s = (uint16_t)duration_s;
+
+    EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
+    if (bits & EVT_TX_ERROR) {
+        lorawan_raise_last_error();
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_tx_cw_obj, 4, 4, lorawan_tx_cw);
+
+// compliance_enable()
+// Register the LmhpCompliance package (port 224) for LoRa Alliance certification
+// testing. Once enabled, the device responds to DUT commands from the
+// certification test tool via port-224 downlinks. Server-driven; no extra
+// Python calls are needed after enabling.
+static mp_obj_t lorawan_compliance_enable(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_COMPLIANCE_ENABLE };
+    EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
+    if (bits & EVT_TX_ERROR) {
+        lorawan_raise_last_error();
+    }
+    return mp_obj_new_bool(self->compliance_enabled);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_compliance_enable_obj, lorawan_compliance_enable);
+
+// derive_mc_keys(addr, mc_root_key, group=0) → (nwk_s_key, app_s_key)
+// Derive McNwkSKey and McAppSKey from McKey (the 16-byte multicast group key)
+// for the given multicast DevAddr and group slot (0..3).
+// Returns a 2-tuple of bytes objects: (McNwkSKey, McAppSKey).
+// The derived keys can be passed directly to multicast_add() if needed.
+// Note: 'mc_root_key' is McKey in LoRaWAN 1.1 terminology (the key from which
+// session keys are derived), not the McRootKey used in the server-side exchange.
+static mp_obj_t lorawan_derive_mc_keys(size_t n_args, const mp_obj_t *pos_args,
+                                       mp_map_t *kw_args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+
+    enum { ARG_addr, ARG_mc_root_key, ARG_group };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_addr,        MP_ARG_REQUIRED | MP_ARG_INT },
+        { MP_QSTR_mc_root_key, MP_ARG_REQUIRED | MP_ARG_OBJ },
+        { MP_QSTR_group,       MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = 0} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
+                     MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+
+    uint32_t addr  = (uint32_t)args[ARG_addr].u_int;
+    int      group = args[ARG_group].u_int;
+    if (group < 0 || group > 3) {
+        mp_raise_ValueError(MP_ERROR_TEXT("group must be 0..3"));
+    }
+
+    mp_buffer_info_t key_buf;
+    mp_get_buffer_raise(args[ARG_mc_root_key].u_obj, &key_buf, MP_BUFFER_READ);
+    if (key_buf.len != 16) {
+        mp_raise_ValueError(MP_ERROR_TEXT("mc_root_key must be 16 bytes"));
+    }
+
+    lorawan_cmd_data_t cmd = { .cmd = CMD_DERIVE_MC_KEYS };
+    cmd.derive_mc_keys.addr  = addr;
+    cmd.derive_mc_keys.group = (uint8_t)group;
+    memcpy(cmd.derive_mc_keys.mc_key, key_buf.buf, 16);
+
+    EventBits_t bits = send_cmd_wait_result(&cmd, EVT_COMPLETED | EVT_TX_ERROR);
+    if (bits & EVT_TX_ERROR) {
+        lorawan_raise_last_error();
+    }
+
+    // Return (McNwkSKey, McAppSKey) as a 2-tuple of bytes.
+    mp_obj_t tuple[2];
+    tuple[0] = mp_obj_new_bytes(s_derived_nwk_s_key, 16);
+    tuple[1] = mp_obj_new_bytes(s_derived_app_s_key, 16);
+    return mp_obj_new_tuple(2, tuple);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_derive_mc_keys_obj, 3, lorawan_derive_mc_keys);
+
 // last_error() → dict | None
 // Returns {"loramac_status", "event_status", "context", "epoch_us"} from the
 // most recent failure, or None if no failure has been recorded since boot or
@@ -3882,6 +4150,10 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
                                                  MP_ROM_PTR(&lorawan_remote_multicast_enable_obj) },
     { MP_ROM_QSTR(MP_QSTR_fragmentation_enable), MP_ROM_PTR(&lorawan_fragmentation_enable_obj) },
     { MP_ROM_QSTR(MP_QSTR_fragmentation_data),   MP_ROM_PTR(&lorawan_fragmentation_data_obj) },
+    // Session 24: TXCW, compliance, multicast key derivation
+    { MP_ROM_QSTR(MP_QSTR_tx_cw),               MP_ROM_PTR(&lorawan_tx_cw_obj) },
+    { MP_ROM_QSTR(MP_QSTR_compliance_enable),    MP_ROM_PTR(&lorawan_compliance_enable_obj) },
+    { MP_ROM_QSTR(MP_QSTR_derive_mc_keys),       MP_ROM_PTR(&lorawan_derive_mc_keys_obj) },
     // Diagnostics (Session 21)
     { MP_ROM_QSTR(MP_QSTR_last_error),           MP_ROM_PTR(&lorawan_last_error_obj) },
     // Lifecycle (Session 16). __del__ fires on GC sweep, including the
@@ -3904,7 +4176,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("1.1.0", 5);
+    return mp_obj_new_str("1.3.0", 5);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 

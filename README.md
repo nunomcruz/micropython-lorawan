@@ -60,6 +60,47 @@ USB-C (or micro-USB on v0.7) powers the MCU and charges the 18650 cell. For deep
 
 ABP is supported but discouraged on TTN: you lose replay protection across reboots unless you call `nvram_save()` after every uplink and `nvram_restore()` on every boot.
 
+### Bench testing — antenna SWR and pre-compliance (`tx_cw`)
+
+Before deploying a new board or after changing the antenna connector, verify the RF path with a continuous-wave transmission:
+
+```python
+import lorawan
+
+lw = lorawan.LoRaWAN(lorawan.EU868)
+
+# Transmit a CW carrier at 868.1 MHz, 14 dBm for 5 seconds.
+# Connect a spectrum analyser or RTL-SDR; you should see a clean spike
+# at 868.100 MHz. SWR > 3:1 shows up as frequency pulling or reduced
+# output power on a power-meter.
+lw.tx_cw(868_100_000, 14, 5)
+
+lw.deinit()
+```
+
+**API:**  `lw.tx_cw(freq_hz, power_dbm, duration_s)`
+- `freq_hz`: carrier frequency in Hz. Must be within the region band (EU868: 863–870 MHz, EU433: 433.05–434.79 MHz).
+- `power_dbm`: TX power in dBm. Capped at hardware limit (SX1276: 20 dBm via PA_BOOST; SX1262: 22 dBm).
+- `duration_s`: how long to transmit, 1–30 seconds. The MAC's internal timer fires `mlme_confirm(MLME_TXCW)` at the end; `tx_cw()` blocks until then.
+
+`tx_cw()` hijacks the radio for its entire duration. Call it only when the MAC is idle (non-joined, or Class A idle between TX/RX cycles). Do **not** call it while a join or uplink is in progress.
+
+For FCC/CE pre-compliance scans, step across the band in 200 kHz increments and note the peak power at each frequency:
+
+```python
+import lorawan, time
+
+lw = lorawan.LoRaWAN(lorawan.EU868)
+lw.duty_cycle(False)   # disable duty-cycle gating for bench use
+
+for freq in range(863_100_000, 870_000_000, 200_000):
+    print(f"CW at {freq/1e6:.1f} MHz")
+    lw.tx_cw(freq, 20, 2)
+    time.sleep_ms(200)
+
+lw.deinit()
+```
+
 ## Build
 
 ```bash
@@ -747,6 +788,36 @@ lw.multicast_list()
 
 Registers the `LmhpRemoteMcastSetup` package (port 200). After this, the network server can provision groups remotely via `McGroupSetupReq` / `McGroupClassCSessionReq` / `McGroupClassBSessionReq` — no further Python glue required. The package drives the class switch automatically when a session starts.
 
+#### Key derivation — `lw.derive_mc_keys(addr, mc_root_key, *, group=0)` → `(nwk_s_key, app_s_key)`
+
+Derives `McNwkSKey` and `McAppSKey` from `McKey` (the 16-byte multicast group key) for a given `DevAddr` and group slot. Returns a 2-tuple of `bytes` objects.
+
+This replaces the manual AES derivation that callers previously had to do before calling `multicast_add()`. The MAC performs the derivation using the same `LoRaMacCryptoDeriveMcSessionKeyPair` function used internally by the remote-setup flow, so the result is spec-compliant.
+
+```python
+mc_key = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
+mc_addr = 0x00000000
+
+nwk_s_key, app_s_key = lw.derive_mc_keys(mc_addr, mc_key, group=0)
+print("McNwkSKey:", nwk_s_key.hex())
+print("McAppSKey:", app_s_key.hex())
+
+# Pass the derived keys directly to multicast_add()
+lw.multicast_add(
+    group=0,
+    addr=mc_addr,
+    mc_nwk_s_key=nwk_s_key,
+    mc_app_s_key=app_s_key,
+)
+```
+
+**Parameters:**
+- `addr`: 32-bit multicast DevAddr.
+- `mc_root_key`: 16-byte `McKey` (the multicast group key from which session keys are derived).
+- `group` (keyword, default 0): group slot 0–3. Each slot has independent session keys; calling `derive_mc_keys` for a slot also stores the key material in the soft secure element for that group.
+
+> **Note:** In LoRaWAN 1.1.1 terminology `mc_root_key` corresponds to `McKey`, not `McRootKey`. `McRootKey` is the root used in the server-device key-exchange flow managed by `LmhpRemoteMcastSetup`. If you are using remote multicast setup, the server handles key derivation automatically and you do not need to call `derive_mc_keys()` at all.
+
 ---
 
 ### Fragmentation (FUOTA)
@@ -1103,8 +1174,26 @@ The v1.0.0 surface is stable, but a v1.0 review found a handful of consistency g
 - **Session 21 — Error handling and diagnostics (v1.1.0).** All `RuntimeError("<api> failed")` sites replaced with `OSError(EIO, "<api>: status=N")` carrying the underlying `LoRaMacStatus_t` or `LoRaMacEventInfoStatus_t`. `lw.last_error()` returns a full diagnostic dict for post-mortem. `join_otaa()` timeout now raises `OSError(ETIMEDOUT, "join: last_status=N")`. Constructor auto-deinit tightened to avoid UAF on the previous object.
 - **Session 22 — API consistency (done).** Dropped deprecated `request_class` alias. Removed `network_time()` (use `synced_time()` or capture snapshot in `on_time_sync` callback). `recv()` now raises `RuntimeError` when `on_rx` is registered. Renamed `stats()["tx_counter"]` → `stats()["last_tx_fcnt_up"]`. Exported `DR_6` (SF7/250 kHz) and `DR_7` (FSK 50 kbps). `link_check()` gained `port` and `confirmed` kwargs.
 - **Session 23 — Expanded MIB getters/setters.** `nb_trans()` (cheapest reliability knob — multi-TX of unconfirmed uplinks), `channel_mask()`, live `frame_counters()`, `public_network()`, `rx_window_timing()`, `rx_clock_drift()`, `rejoin_cycle()`, `net_id()`. Wraps existing MAC state with no new MAC code.
-- **Session 24 — New MAC primitives.** `tx_cw(freq, power, duration)` for continuous-wave bench tests and FCC/CE pre-compliance. LoRa Alliance Compliance package (LmhpCompliance) for certification testing. `derive_mc_keys(addr, mc_root_key)` so multicast keys can be derived in-MAC instead of supplied by the caller.
+- **Session 24 — New MAC primitives (v1.3.0).** `tx_cw(freq, power, duration)` wraps `MLME_TXCW` for CW bench tests and FCC/CE pre-compliance. `compliance_enable()` registers `LmhpCompliance` (port 224) for LoRa Alliance certification testing — the package responds to DUT commands from the certification tool autonomously. `derive_mc_keys(addr, mc_key)` performs in-MAC multicast session key derivation so callers no longer need to plumb AES manually before `multicast_add()`. See "Standards compliance" below for certification notes.
 - **Session 25 — Additional regions.** Build-time opt-in for US915 / AU915 / AS923 / KR920 / IN865 / RU864 / CN470 / CN779. Region-aware dBm ↔ TX-power index conversion (today the EU868 table is hardcoded, so the `tx_power()` getter returns wrong dBm on EU433).
+
+### Standards compliance
+
+The `LmhpCompliance` package (port 224) required by the LoRa Alliance certification test suite is included as of v1.3.0. To enable it:
+
+```python
+import lorawan
+
+lw = lorawan.LoRaWAN(lorawan.EU868)
+lw.join_otaa(...)          # device must be joined before certification runs
+lw.compliance_enable()     # register port-224 DUT command handler
+# The certification tool now drives the device via downlinks on port 224.
+# No further Python intervention is needed during the test sequence.
+```
+
+The package handles: `PKG_VERSION_ANS`, `DUT_RESET`, `DUT_JOIN`, `SWITCH_CLASS`, `ADR_BIT_CHANGE`, `DUTY_CYCLE_CTRL`, `TX_PERIODICITY_CHANGE`, `TX_FRAMES_CTRL`, `ECHO_PAYLOAD`, `RX_APP_CNT`, `LINK_CHECK`, `DEVICE_TIME`, `PING_SLOT_INFO`, `BEACON_RX_STATUS_IND`, `TX_CW`, `DUT_FPORT_224_DISABLE`, and `DUT_VERSION`.
+
+> For full LoRa Alliance end-device certification, the test harness needs a gateway, a network server running the certification profile, and the official certification test tool. The firmware itself provides all required DUT-side protocol support.
 
 ## Architecture
 

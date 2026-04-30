@@ -556,26 +556,35 @@ power-tuning sensor nodes.
       `frame_counters`, `public_network`, `rx_clock_drift`, `rejoin_cycle`,
       `net_id`. Keep concise — these are power-user knobs.
 
-### Session 24: New MAC primitives (TXCW, Compliance, multicast key derivation)
+### Session 24: New MAC primitives (TXCW, Compliance, multicast key derivation) ✓
 
-- [ ] `lw.tx_cw(freq_hz, power_dbm, duration_s)`. Wraps `MLME_TXCW`.
+- [x] `lw.tx_cw(freq_hz, power_dbm, duration_s)`. Wraps `MLME_TXCW`.
       Continuous wave transmission for radio bring-up, antenna SWR check,
-      FCC/CE pre-compliance scans. ~30 LoC: build `MlmeReq_t`, fire
-      `LoRaMacMlmeRequest`, block on `EVT_COMPLETED` (the MAC handles the
-      duration timer internally and returns to STDBY on completion). Raises
-      `OSError(EIO)` if the radio is mid-RX/TX.
-- [ ] Compliance package (`LmhpCompliance.c`). Add to `micropython.cmake`
-      target_sources, register in `lmhandler_shim.c` alongside the existing
-      ClockSync / RemoteMcastSetup / Fragmentation packages, expose
-      `lw.compliance_enable()`. Required for LoRa Alliance certification
-      testing. Mostly server-driven via port 224 — small Python surface.
-- [ ] `lw.derive_mc_keys(addr, mc_root_key)` → `(nwk_s_key, app_s_key)`.
-      Wraps `MLME_DERIVE_MC_KE_KEY` + `MLME_DERIVE_MC_KEY_PAIR`. Gives users
-      LoRaWAN 1.1 multicast key derivation without manually plumbing AES;
-      today `multicast_add` requires the user to supply derived keys.
-- [ ] README: new sub-section under "Multicast" for derived keys; new
-      sub-section under "Hardware setup" for `tx_cw` (bench testing,
-      antenna SWR validation).
+      FCC/CE pre-compliance scans. Validates freq against region bounds (EU868:
+      863-870 MHz, EU433: 433.05-434.79 MHz), power against hardware caps
+      (SX1276 <= 20 dBm, SX1262 <= 22 dBm), duration 1..30 s. Dispatches
+      CMD_TX_CW; blocks on EVT_COMPLETED (MAC handles duration timer). Raises
+      OSError(EIO) if the radio is mid-RX/TX.
+- [x] Compliance package (`LmhpCompliance.c`). Added to `micropython.cmake`
+      target_sources, registered in `lmhandler_shim.c` alongside the existing
+      ClockSync / RemoteMcastSetup / Fragmentation packages (PACKAGE_ID_COMPLIANCE=0).
+      Non-NULL OnMacMlmeRequest + OnJoinRequest stubs required to avoid crash on
+      COMPLIANCE_TX_CW_REQ. NvmDataMgmt.h stub added to config/ (included by
+      LmhpCompliance.c but no functions called). `lw.compliance_enable()` exposed.
+      MLME confirm/indication fanout added to lmhandler_shim for LmhpCompliance.
+      LmHandlerGetDutyCycleWaitTime() stub returns 0.
+- [x] `lw.derive_mc_keys(addr, mc_root_key, *, group=0)` → `(nwk_s_key, app_s_key)`.
+      Uses LoRaMacMcChannelSetup(IsRemotelySetup=true) internally (MLME_DERIVE_MC_KEY_PAIR
+      not implemented in LoRaMAC-node v4.7.0). Reads back keys via MIB_MC_APP_S_KEY_N
+      / MIB_MC_NWK_S_KEY_N. Validates 16-byte key and group 0..3.
+- [x] README: new "Bench testing" sub-section under Hardware setup for tx_cw;
+      new "Key derivation" sub-section under Multicast; "Standards compliance"
+      section under Project status.
+- [x] Version bumped 1.1.0 -> 1.3.0 (minor: additive new API surface).
+- [x] Test script: `examples/test_session24_primitives.py` (6 tests: version,
+      tx_cw validation offline, tx_cw over-air 5 s, compliance_enable idempotent,
+      derive_mc_keys validation, derive_mc_keys functional with ABP join).
+- [x] Build clean: firmware 0x193b50 bytes, zero errors, zero warnings.
 
 ### Session 25: Additional regions
 

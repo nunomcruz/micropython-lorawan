@@ -24,10 +24,12 @@
 extern "C" {
 #endif
 
-// Forward MCPS events from the existing MAC callbacks into any registered
-// packages (e.g. LmhpClockSync).  Safe to call with NULL pointers.
+// Forward MCPS/MLME events from the existing MAC callbacks into any registered
+// packages (e.g. LmhpClockSync, LmhpCompliance).  Safe to call with NULL.
 void lorawan_packages_on_mcps_confirm(McpsConfirm_t *c);
 void lorawan_packages_on_mcps_indication(McpsIndication_t *ind);
+void lorawan_packages_on_mlme_confirm(MlmeConfirm_t *c);
+void lorawan_packages_on_mlme_indication(MlmeIndication_t *ind);
 
 // Called by the shim's OnSysTimeUpdate hook whenever the Clock Sync package
 // has updated SysTime after an AppTimeAns.  Implemented in modlorawan.c so
@@ -43,6 +45,10 @@ bool lorawan_clock_sync_register(void);
 // task context so the MAC is only touched from a single thread.
 // Returns true if the request was queued.
 bool lorawan_clock_sync_app_time_req(void);
+
+// Register LmhpCompliance (port 224).  Required for LoRa Alliance certification.
+// The package responds to DUT commands from the certification test tool.
+bool lorawan_compliance_register(void);
 
 // Register LmhpRemoteMcastSetup (port 200).  After registration the server
 // can configure multicast groups remotely via McGroupSetupReq.
