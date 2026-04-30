@@ -1,13 +1,15 @@
 add_library(usermod_lorawan INTERFACE)
 
-# Compiler flags for LoRaMAC-node
+# Region selection — set LORAWAN_REGIONS to a semicolon-separated list.
+# EU868 is the default. Pass -DLORAWAN_REGIONS="EU868;US915;AU915;AS923" to
+# enable additional regions. Each region adds ~5–6 KB to the firmware image.
+set(LORAWAN_REGIONS "EU868" CACHE STRING
+    "Semicolon-separated list of LoRaWAN regions to compile in (e.g. EU868;EU433;US915;AU915)")
+
+# Compiler flags common to all builds
 target_compile_definitions(usermod_lorawan INTERFACE
-    REGION_EU868        # passes -DREGION_EU868 so Region.c includes RegionEU868.h
-    REGION_EU433        # 433 MHz band (amateur, ISM)
     SOFT_SE             # enables KeyList and NUM_OF_KEYS in secure-element-nvm.h
     LORAMAC_CLASSB_ENABLED  # compile the beacon + ping-slot state machine
-    # REGION_US915
-    # REGION_AU915
 )
 
 # MicroPython binding + LmHandler package hosting shim
@@ -54,12 +56,24 @@ target_sources(usermod_lorawan INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/mac/LoRaMacCrypto.c
     ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/mac/LoRaMacParser.c
     ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/mac/LoRaMacSerializer.c
-    # Regions
+    # Region dispatch core (always required)
     ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/mac/region/Region.c
     ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/mac/region/RegionCommon.c
-    ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/mac/region/RegionEU868.c
-    ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/mac/region/RegionEU433.c
 )
+
+# Per-region sources and -D flags, driven by LORAWAN_REGIONS cache variable
+foreach(region IN LISTS LORAWAN_REGIONS)
+    target_compile_definitions(usermod_lorawan INTERFACE REGION_${region})
+    target_sources(usermod_lorawan INTERFACE
+        ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/mac/region/Region${region}.c)
+    message(STATUS "LoRaWAN: region ${region} enabled")
+endforeach()
+
+# US915 and AU915 share a common 72-channel base layer
+if("US915" IN_LIST LORAWAN_REGIONS OR "AU915" IN_LIST LORAWAN_REGIONS)
+    target_sources(usermod_lorawan INTERFACE
+        ${CMAKE_CURRENT_LIST_DIR}/loramac-node/src/mac/region/RegionBaseUS.c)
+endif()
 
 # Radio core drivers — both included via namespace wrappers.
 # sx1276.c and sx126x/radio.c share global names (TxTimeoutTimer,

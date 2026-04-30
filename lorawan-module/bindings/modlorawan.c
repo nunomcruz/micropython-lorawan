@@ -456,24 +456,49 @@ static const char                       *s_last_error_context;
     s_last_error_context  = (ctx);                                    \
 } while (0)
 
-// ---- TX power dBm ↔ MAC index conversion ----
+// ---- TX power dBm ↔ MAC index conversion, region-aware ----
 //
-// EU868 EIRP table: index 0 = 16 dBm, each step down = -2 dBm, max index 7 = 2 dBm.
+// Each region defines a linear EIRP table: index 0 = max_dbm, each step = -step_db.
 // Conversion rounds down (never exceeds requested power, important for regulatory compliance).
-// Other regions may have different tables; this helper is EU868-accurate for now.
+// max_idx is the largest valid MAC index for the region (e.g. TX_POWER_7 = 7 for EU868).
+// Source: DEFAULT_MAX_EIRP and MIN_TX_POWER in each Region<X>.h.
 
-static int tx_power_to_dbm(int8_t index) {
-    int8_t i = (index < 0) ? 0 : (index > 7) ? 7 : index;
-    return 16 - 2 * (int)i;
+typedef struct { int max_dbm; int step_db; int max_idx; } eirp_row_t;
+
+static const eirp_row_t s_eirp_table[] = {
+    [LORAMAC_REGION_AS923] = { 16, 2,  7 },   // AS923_DEFAULT_MAX_EIRP  = 16.0 f
+    [LORAMAC_REGION_AU915] = { 30, 2, 14 },   // AU915_DEFAULT_MAX_EIRP  = 30.0 f
+    [LORAMAC_REGION_CN470] = { 19, 2,  7 },   // CN470_DEFAULT_MAX_EIRP  = 19.15f (rounded)
+    [LORAMAC_REGION_CN779] = { 12, 2,  5 },   // CN779_DEFAULT_MAX_EIRP  = 12.15f (rounded)
+    [LORAMAC_REGION_EU433] = { 12, 2,  5 },   // EU433_DEFAULT_MAX_EIRP  = 12.15f (rounded)
+    [LORAMAC_REGION_EU868] = { 16, 2,  7 },   // EU868_DEFAULT_MAX_EIRP  = 16.0 f
+    [LORAMAC_REGION_KR920] = { 14, 2,  7 },   // KR920_DEFAULT_MAX_EIRP_HIGH = 14.0 f
+    [LORAMAC_REGION_IN865] = { 30, 2, 10 },   // IN865_DEFAULT_MAX_EIRP  = 30.0 f
+    [LORAMAC_REGION_US915] = { 30, 2, 14 },   // US915_DEFAULT_MAX_ERP   = 30.0 f
+    [LORAMAC_REGION_RU864] = { 16, 2,  7 },   // RU864_DEFAULT_MAX_EIRP  = 16.0 f
+};
+#define EIRP_TABLE_LEN ((int)(sizeof(s_eirp_table) / sizeof(s_eirp_table[0])))
+
+static const eirp_row_t *eirp_row(LoRaMacRegion_t region) {
+    int r = (int)region;
+    return (r >= 0 && r < EIRP_TABLE_LEN) ? &s_eirp_table[r]
+                                           : &s_eirp_table[LORAMAC_REGION_EU868];
 }
 
-static int8_t dbm_to_tx_power(int dbm) {
-    // eirp(i) = 16 - 2i  =>  i = ceil((16 - dbm) / 2.0)
-    // Integer: (16 - dbm + 1) / 2, then clamp to [0, 7]
-    if (dbm >= 16) return 0;
-    if (dbm <= 2)  return 7;
-    int8_t i = (int8_t)((16 - dbm + 1) / 2);
-    return (i > 7) ? 7 : i;
+static int tx_power_to_dbm(LoRaMacRegion_t region, int8_t index) {
+    const eirp_row_t *r = eirp_row(region);
+    int i = (index < 0) ? 0 : ((int)index > r->max_idx) ? r->max_idx : (int)index;
+    return r->max_dbm - i * r->step_db;
+}
+
+static int8_t dbm_to_tx_power(LoRaMacRegion_t region, int dbm) {
+    const eirp_row_t *r = eirp_row(region);
+    int min_dbm = r->max_dbm - r->max_idx * r->step_db;
+    if (dbm >= r->max_dbm) return 0;
+    if (dbm <= min_dbm)    return (int8_t)r->max_idx;
+    // Round up index so we never exceed requested EIRP
+    int8_t i = (int8_t)((r->max_dbm - dbm + r->step_db - 1) / r->step_db);
+    return (i > r->max_idx) ? (int8_t)r->max_idx : i;
 }
 
 // Raise OSError(EIO, "<context>: event_status=N") or "status=N" from the
@@ -2477,12 +2502,12 @@ static mp_obj_t lorawan_make_new(const mp_obj_type_t *type,
     self->duty_cycle_enabled = true;
     self->last_dc_wait_ms    = 0;
     self->last_dc_query_us   = 0;
-    // tx_power kwarg: None = use region max (index 0 = 16 dBm EU868); int = dBm.
+    // tx_power kwarg: None = use region max (index 0); int = dBm.
     // If dBm exceeds the region table max, activate hardware override (user's responsibility).
     if (args[ARG_tx_power].u_obj != mp_const_none) {
         int dbm = (int)mp_obj_get_int(args[ARG_tx_power].u_obj);
-        int8_t idx      = dbm_to_tx_power(dbm);
-        int    mac_max  = tx_power_to_dbm(0); // region table max (16 dBm EU868)
+        int8_t idx      = dbm_to_tx_power(self->region, dbm);
+        int    mac_max  = tx_power_to_dbm(self->region, 0); // region table max
         if (dbm > mac_max) {
             g_tx_power_hw_override = (int8_t)dbm; // bypass MAC validation
             self->channels_tx_power = 0;           // MAC sees region max
@@ -2843,7 +2868,7 @@ static mp_obj_t lorawan_stats(mp_obj_t self_in) {
     // before the first TX maps to region max, which is acceptable since
     // tx_counter==0 already tells the caller no uplink has happened yet.
     mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_last_tx_power),
-                      mp_obj_new_int(tx_power_to_dbm(self->last_tx_power)));
+                      mp_obj_new_int(tx_power_to_dbm(self->region, self->last_tx_power)));
     return d;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_stats_obj, lorawan_stats);
@@ -3007,12 +3032,12 @@ static mp_obj_t lorawan_tx_power(size_t n_args, const mp_obj_t *args) {
         if (g_tx_power_hw_override != LORAWAN_TX_POWER_NO_OVERRIDE) {
             return mp_obj_new_int((int)g_tx_power_hw_override);
         }
-        return mp_obj_new_int(tx_power_to_dbm(self->channels_tx_power));
+        return mp_obj_new_int(tx_power_to_dbm(self->region, self->channels_tx_power));
     }
 
     int    dbm     = (int)mp_obj_get_int(args[1]);
-    int8_t idx     = dbm_to_tx_power(dbm);
-    int    mac_max = tx_power_to_dbm(0); // region table max (EU868: 16 dBm)
+    int8_t idx     = dbm_to_tx_power(self->region, dbm);
+    int    mac_max = tx_power_to_dbm(self->region, 0); // region table max
 
     if (dbm > mac_max) {
         // Beyond region regulatory limit: activate hardware override.
@@ -4190,7 +4215,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("1.3.1", 5);
+    return mp_obj_new_str("1.4.0", 5);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 
@@ -4243,9 +4268,23 @@ static const mp_rom_map_elem_t lorawan_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_version),   MP_ROM_PTR(&lorawan_version_obj) },
     { MP_ROM_QSTR(MP_QSTR_test_hal),  MP_ROM_PTR(&lorawan_test_hal_obj) },
     { MP_ROM_QSTR(MP_QSTR_LoRaWAN),   MP_ROM_PTR(&lorawan_type) },
-    // Region constants
+    // Region constants — all exported unconditionally as integer enum values.
+    // The LORAMAC_REGION_* enum is always defined (LoRaMac.h). Passing a region
+    // that was not compiled in will fail at LoRaMacInitialization() with
+    // LORAMAC_STATUS_REGION_NOT_SUPPORTED, which is surfaced as OSError(EIO).
+    // Note: MicroPython's QSTR scanner does not propagate target_compile_definitions
+    // from user modules, so #ifdef guards here would make QSTRs disappear from the
+    // generated header regardless of the build flags — unconditional export is correct.
     { MP_ROM_QSTR(MP_QSTR_EU868),     MP_ROM_INT(LORAMAC_REGION_EU868) },
     { MP_ROM_QSTR(MP_QSTR_EU433),     MP_ROM_INT(LORAMAC_REGION_EU433) },
+    { MP_ROM_QSTR(MP_QSTR_US915),     MP_ROM_INT(LORAMAC_REGION_US915) },
+    { MP_ROM_QSTR(MP_QSTR_AU915),     MP_ROM_INT(LORAMAC_REGION_AU915) },
+    { MP_ROM_QSTR(MP_QSTR_AS923),     MP_ROM_INT(LORAMAC_REGION_AS923) },
+    { MP_ROM_QSTR(MP_QSTR_KR920),     MP_ROM_INT(LORAMAC_REGION_KR920) },
+    { MP_ROM_QSTR(MP_QSTR_IN865),     MP_ROM_INT(LORAMAC_REGION_IN865) },
+    { MP_ROM_QSTR(MP_QSTR_RU864),     MP_ROM_INT(LORAMAC_REGION_RU864) },
+    { MP_ROM_QSTR(MP_QSTR_CN470),     MP_ROM_INT(LORAMAC_REGION_CN470) },
+    { MP_ROM_QSTR(MP_QSTR_CN779),     MP_ROM_INT(LORAMAC_REGION_CN779) },
     // Device class constants
     { MP_ROM_QSTR(MP_QSTR_CLASS_A),   MP_ROM_INT(CLASS_A) },
     { MP_ROM_QSTR(MP_QSTR_CLASS_B),   MP_ROM_INT(CLASS_B) },

@@ -21,7 +21,7 @@ All exposed via a single `import lorawan` module.
 
 Single firmware image for all T-Beam variants (v0.7–v1.2, SX1276 and SX1262 radios). Hardware is auto-detected at boot; no separate builds required.
 
-Primary region: EU868 (TTN). EU433 supported.
+Default region: EU868 (TTN). All LoRaWAN regions supported as opt-in build flags.
 
 ## Supported hardware
 
@@ -116,6 +116,39 @@ make BOARD=LILYGO_TTGO_TBEAM \
 ```
 
 Flash with `make deploy PORT=/dev/ttyUSB0` or `esptool.py` directly.
+
+### Regions
+
+By default only EU868 is compiled in. To enable additional regions, pass `-DLORAWAN_REGIONS=` during cmake configuration (before `make`):
+
+```bash
+# Example: EU868 + EU433 + US915 + AS923 in one firmware
+cmake -B ports/esp32/build-LILYGO_TTGO_TBEAM \
+      -DLORAWAN_REGIONS="EU868;EU433;US915;AS923" \
+      -DBOARD=LILYGO_TTGO_TBEAM \
+      -DUSER_C_MODULES=$(pwd)/lorawan-module/micropython.cmake
+make -C ports/esp32 BOARD=LILYGO_TTGO_TBEAM \
+     USER_C_MODULES=$(pwd)/lorawan-module/micropython.cmake
+```
+
+All region constants (`lorawan.EU868`, `lorawan.US915`, etc.) are always exported regardless of which regions are compiled in. Passing a region that was not compiled in raises `OSError` during `LoRaWAN()` construction.
+
+| Constant  | Band          | Typical LNS         | Extra firmware |
+|-----------|---------------|---------------------|----------------|
+| `EU868`   | 863–870 MHz   | TTN, Helium         | (default)      |
+| `EU433`   | 433–434 MHz   | private gateways    | +2 KB          |
+| `US915`   | 902–928 MHz   | TTN, Helium, AWS    | +5 KB          |
+| `AU915`   | 915–928 MHz   | TTN AU              | +5 KB          |
+| `AS923`   | 920–925 MHz   | TTN AS, KPN         | +2 KB          |
+| `KR920`   | 920–923 MHz   | private KR          | +2 KB          |
+| `IN865`   | 865–867 MHz   | private IN          | +2 KB          |
+| `RU864`   | 864–870 MHz   | private RU          | +2 KB          |
+| `CN470`   | 470–510 MHz   | private CN          | +2 KB          |
+| `CN779`   | 779–787 MHz   | private CN          | +2 KB          |
+
+US915 and AU915 share a common 72-channel base layer (`RegionBaseUS.c`); enabling either one adds it automatically.
+
+Note: `tx_power()` and `tx_power_to_dbm` semantics now depend on region — the dBm ↔ MAC index conversion uses the region's actual `DEFAULT_MAX_EIRP` (see table in `tx_power()` below).
 
 ---
 
@@ -379,22 +412,31 @@ lw.tx_power(22)  # hardware maximum for SX1262
 lw.tx_power(20)  # hardware maximum for SX1276
 ```
 
-EU868 table (for reference):
+The setter rounds down to the nearest available step (never exceeds the requested value). The table is region-aware:
 
-| dBm EIRP | MAC index |
-|----------|-----------|
-| 16 | 0 (max) |
-| 14 | 1 |
-| 12 | 2 |
-| 10 | 3 |
-|  8 | 4 |
-|  6 | 5 |
-|  4 | 6 |
-|  2 | 7 (min) |
+| Region | Max dBm (index 0) | Step | Min dBm |
+|--------|-------------------|------|---------|
+| EU868  | 16                | 2    | 2       |
+| EU433  | 12                | 2    | 2       |
+| US915  | 30                | 2    | 2       |
+| AU915  | 30                | 2    | 2       |
+| AS923  | 16                | 2    | 2       |
+| KR920  | 14                | 2    | 2       |
+| IN865  | 30                | 2    | 10      |
+| RU864  | 16                | 2    | 2       |
+| CN470  | 19                | 2    | 5       |
+| CN779  | 12                | 2    | 2       |
 
-The setter rounds down to the nearest available step (never exceeds the requested value).
+```python
+lw = lorawan.LoRaWAN(region=lorawan.EU868)
+lw.tx_power()    # → 16  (EU868 max)
 
-> Note: the dBm↔index table is hardcoded to EU868 (max 16 dBm, step 2). On EU433, `tx_power()` still accepts and returns EU868 dBm values; the MAC indices are correct but the dBm annotations will be off by a few dB. Region-accurate mapping is a future refactor.
+lw = lorawan.LoRaWAN(region=lorawan.EU433)
+lw.tx_power()    # → 12  (EU433 max, not 16)
+
+lw = lorawan.LoRaWAN(region=lorawan.US915)
+lw.tx_power()    # → 30  (US915 max)
+```
 
 #### `lw.antenna_gain([gain])` → `float | None`
 
@@ -950,9 +992,17 @@ Low-level HAL smoke test (SPI reg 0x42 probe + 200 ms timer). Useful for bring-u
 ### Constants
 
 ```python
-# Regions
-lorawan.EU868   # 868 MHz band (Europe)
-lorawan.EU433   # 433 MHz band (Europe)
+# Regions — all always exported; passing an uncompiled region raises OSError at init
+lorawan.EU868   # 863–870 MHz (Europe, default)
+lorawan.EU433   # 433–434 MHz (Europe, opt-in)
+lorawan.US915   # 902–928 MHz (Americas, opt-in)
+lorawan.AU915   # 915–928 MHz (Australia, opt-in)
+lorawan.AS923   # 920–925 MHz (Asia, opt-in)
+lorawan.KR920   # 920–923 MHz (Korea, opt-in)
+lorawan.IN865   # 865–867 MHz (India, opt-in)
+lorawan.RU864   # 864–870 MHz (Russia, opt-in)
+lorawan.CN470   # 470–510 MHz (China, opt-in)
+lorawan.CN779   # 779–787 MHz (China, opt-in)
 
 # LoRaWAN protocol versions
 lorawan.V1_0_4  # LoRaWAN 1.0.4 — single root key, single-key MIC (default)

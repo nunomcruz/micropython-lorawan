@@ -586,29 +586,36 @@ power-tuning sensor nodes.
       derive_mc_keys validation, derive_mc_keys functional with ABP join).
 - [x] Build clean: firmware 0x193b50 bytes, zero errors, zero warnings.
 
-### Session 25: Additional regions
+### Session 25: Additional regions ✓
 
-- [ ] Make region selection a build-time opt-in. `micropython.cmake` already
-      has `REGION_US915` / `REGION_AU915` commented out — turn the region list
-      into a CMake variable so users can build with a custom subset. Add
-      `REGION_AS923`, `REGION_KR920`, `REGION_IN865`, `REGION_RU864`,
-      `REGION_CN470`, `REGION_CN779` as opt-in flags; each adds the matching
-      `RegionXxx.c` to the source list (~5 KB firmware per region).
-- [ ] Region-specific tx_power table fix. Today `tx_power_to_dbm()` and
-      `dbm_to_tx_power()` (pin_config.c) hardcode the EU868 table (16 dBm max,
-      step 2 dB). On other regions this gives wrong dBm readouts — flagged in
-      Session 11 as a known limitation for EU433. Add a region-dispatching
-      helper that picks the right table per `g_lorawan_region`.
-- [ ] Export region constants for whichever regions are compiled in:
-      `lorawan.US915`, `lorawan.AU915`, `lorawan.AS923`, `lorawan.KR920`,
-      `lorawan.IN865`, `lorawan.RU864`, `lorawan.CN470`, `lorawan.CN779`.
-      Guard each `MP_REGISTER_QSTR` with the corresponding `#ifdef REGION_*`.
-- [ ] Verify `tbeam.detect()` pin map across regions — pins are unchanged but
-      flag the FCC vs ETSI hardware variants of the SX127x family in the
-      README hardware table.
-- [ ] README: add a region table mapping constant → frequency band → typical
-      LNS support (TTN, Helium, ChirpStack). Note the firmware-size cost for
-      multi-region builds.
+- [x] Make region selection a build-time opt-in. `micropython.cmake` now uses
+      `set(LORAWAN_REGIONS "EU868" CACHE STRING ...)` + `foreach` loop; each
+      region adds its `RegionXxx.c` and `-DREGION_X` compile definition.
+      Pass `-DLORAWAN_REGIONS="EU868;EU433;US915;AS923"` to cmake to opt in.
+      US915/AU915 automatically add `RegionBaseUS.c` (shared 72-channel layer).
+- [x] Region-specific tx_power table fix. `tx_power_to_dbm` and `dbm_to_tx_power`
+      now accept a `LoRaMacRegion_t region` parameter and dispatch through
+      `s_eirp_table[]` (designated-initialiser struct array). Values sourced from
+      `DEFAULT_MAX_EIRP` and `MIN_TX_POWER` in each region header. All 6 call
+      sites updated to pass `self->region`.
+- [x] Export region constants — all 10 regions (`EU868`, `EU433`, `US915`,
+      `AU915`, `AS923`, `KR920`, `IN865`, `RU864`, `CN470`, `CN779`) exported
+      unconditionally. MicroPython's QSTR scanner does not propagate
+      `target_compile_definitions` from user modules, so `#ifdef` guards would
+      silently remove QSTRs. Passing an uncompiled region raises `OSError` at
+      `LoRaMacInitialization()`.
+- [x] Verified `tbeam.detect()` — pins unchanged across all regions; T-Beam
+      hardware is ETSI-band (SX1276 PA_BOOST wired for ≤14 dBm ETSI). FCC
+      variants using higher PA_BOOST are not a T-Beam concern. Documented
+      in README hardware table note.
+- [x] README: region table with frequency band, typical LNS, firmware cost.
+      Build invocation example with `-DLORAWAN_REGIONS=`. tx_power() region
+      table added. Region constants section expanded to all 10 regions.
+- [x] Version bumped 1.3.1 → 1.4.0 (additive; tx_power dBm semantics changed
+      for EU433 users: old code returned EU868 values, now returns 12 dBm max).
+- [x] Build verified: EU868-only 0x192ff0 bytes (clean, zero warnings).
+      Multi-region EU868+EU433+US915+AS923: 0x1959f0 bytes (+~9.7 KB for 3
+      regions, ~3.2 KB per region on average).
 
 ## Notes
 
