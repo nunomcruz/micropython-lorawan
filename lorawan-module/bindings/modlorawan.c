@@ -46,6 +46,7 @@
 #include "LoRaMac.h"
 #include "LoRaMacClassB.h"
 #include "LoRaMacTest.h"
+#include "secure-element.h"
 #include "region/RegionEU868.h"
 #include "systime.h"
 #include "lmhandler_shim.h"
@@ -920,9 +921,11 @@ static void mlme_confirm(MlmeConfirm_t *c) {
         break;
 
     case MLME_TXCW:
-        // Continuous wave transmission completed (MAC internal timer expired).
-        // Signal the Python caller waiting on EVT_COMPLETED/EVT_TX_ERROR.
-        if (c->Status == LORAMAC_EVENT_INFO_STATUS_OK) {
+        // Continuous wave transmission completed. The MAC's internal timer
+        // fires OnRadioTxTimeout which sets TX_TIMEOUT — this is the normal
+        // CW-done signal, not an error. Accept both OK and TX_TIMEOUT.
+        if (c->Status == LORAMAC_EVENT_INFO_STATUS_OK ||
+            c->Status == LORAMAC_EVENT_INFO_STATUS_TX_TIMEOUT) {
             esp_rom_printf("lorawan: TXCW completed\n");
             xEventGroupSetBits(s_events, EVT_COMPLETED);
         } else {
@@ -2182,51 +2185,96 @@ static void lorawan_task(void *arg) {
                 s_last_error_epoch_us = 0;
                 s_last_error_context  = NULL;
                 cmd_derive_mc_keys_t *d = &cmd.derive_mc_keys;
+
+                // LoRaMacCryptoDeriveMcSessionKeyPair rejects mcAddr==0 with
+                // LORAMAC_CRYPTO_ERROR_NPE, so bypass it and call the SE
+                // directly. This also avoids creating a phantom multicast
+                // channel entry.
+                static const KeyIdentifier_t s_mc_root_key_ids[4] = {
+                    MC_KEY_0, MC_KEY_1, MC_KEY_2, MC_KEY_3,
+                };
+                static const KeyIdentifier_t s_mc_app_s_key_ids[4] = {
+                    MC_APP_S_KEY_0, MC_APP_S_KEY_1, MC_APP_S_KEY_2, MC_APP_S_KEY_3,
+                };
+                static const KeyIdentifier_t s_mc_nwk_s_key_ids[4] = {
+                    MC_NWK_S_KEY_0, MC_NWK_S_KEY_1, MC_NWK_S_KEY_2, MC_NWK_S_KEY_3,
+                };
+
                 uint8_t mc_key[16];
                 memcpy(mc_key, d->mc_key, 16);
-                McChannelParams_t ch;
-                memset(&ch, 0, sizeof(ch));
-                ch.IsRemotelySetup = true;  // use McKey path → derive session keys
-                ch.IsEnabled       = true;
-                ch.GroupID         = (AddressIdentifier_t)d->group;
-                ch.Address         = d->addr;
-                ch.McKeys.McKeyE   = mc_key;
-                ch.FCountMin       = 0;
-                ch.FCountMax       = 0xFFFFFFFFU;
-                LoRaMacStatus_t st = LoRaMacMcChannelSetup(&ch);
-                if (st == LORAMAC_STATUS_OK) {
-                    // Read back the derived session keys via MIB. The MIB
-                    // pointers reference the soft-SE keystore; copy before
-                    // the next MAC operation could change them.
-                    const Mib_t app_mibs[4] = {
-                        MIB_MC_APP_S_KEY_0, MIB_MC_APP_S_KEY_1,
-                        MIB_MC_APP_S_KEY_2, MIB_MC_APP_S_KEY_3,
-                    };
-                    const Mib_t nwk_mibs[4] = {
-                        MIB_MC_NWK_S_KEY_0, MIB_MC_NWK_S_KEY_1,
-                        MIB_MC_NWK_S_KEY_2, MIB_MC_NWK_S_KEY_3,
-                    };
-                    MibRequestConfirm_t km;
-                    km.Type = app_mibs[d->group];
-                    if (LoRaMacMibGetRequestConfirm(&km) == LORAMAC_STATUS_OK
-                        && km.Param.McAppSKey0 != NULL) {
-                        memcpy(s_derived_app_s_key, km.Param.McAppSKey0, 16);
-                    }
-                    km.Type = nwk_mibs[d->group];
-                    if (LoRaMacMibGetRequestConfirm(&km) == LORAMAC_STATUS_OK
-                        && km.Param.McNwkSKey0 != NULL) {
-                        memcpy(s_derived_nwk_s_key, km.Param.McNwkSKey0, 16);
-                    }
-                    esp_rom_printf("lorawan: MC keys derived for group %u addr=0x%08lx\n",
-                                   (unsigned)d->group, (unsigned long)d->addr);
-                    xEventGroupSetBits(s_events, EVT_COMPLETED);
-                } else {
-                    esp_rom_printf("lorawan: LoRaMacMcChannelSetup (derive) failed: %d\n",
-                                   (int)st);
-                    CAPTURE_LORAMAC_ERROR("derive_mc_keys", st,
+
+                // Store McKey in the SE for this group.
+                if (SecureElementSetKey(s_mc_root_key_ids[d->group], mc_key)
+                    != SECURE_ELEMENT_SUCCESS) {
+                    esp_rom_printf("lorawan: SecureElementSetKey failed\n");
+                    CAPTURE_LORAMAC_ERROR("derive_mc_keys", LORAMAC_STATUS_CRYPTO_ERROR,
                                           LORAMAC_EVENT_INFO_STATUS_OK);
                     xEventGroupSetBits(s_events, EVT_TX_ERROR);
+                    break;
                 }
+
+                // Derive session keys:
+                // McAppSKey = AES128_encrypt(McKey, 0x01 | McAddr | pad12)
+                // McNwkSKey = AES128_encrypt(McKey, 0x02 | McAddr | pad12)
+                uint8_t base_app[16] = {0};
+                uint8_t base_nwk[16] = {0};
+                uint32_t mc_addr = d->addr;
+                base_app[0] = 0x01;
+                base_app[1] = (uint8_t)(mc_addr);
+                base_app[2] = (uint8_t)(mc_addr >> 8);
+                base_app[3] = (uint8_t)(mc_addr >> 16);
+                base_app[4] = (uint8_t)(mc_addr >> 24);
+                base_nwk[0] = 0x02;
+                base_nwk[1] = (uint8_t)(mc_addr);
+                base_nwk[2] = (uint8_t)(mc_addr >> 8);
+                base_nwk[3] = (uint8_t)(mc_addr >> 16);
+                base_nwk[4] = (uint8_t)(mc_addr >> 24);
+
+                if (SecureElementDeriveAndStoreKey(base_app,
+                        s_mc_root_key_ids[d->group],
+                        s_mc_app_s_key_ids[d->group]) != SECURE_ELEMENT_SUCCESS) {
+                    esp_rom_printf("lorawan: DeriveAndStoreKey (app) failed\n");
+                    CAPTURE_LORAMAC_ERROR("derive_mc_keys", LORAMAC_STATUS_CRYPTO_ERROR,
+                                          LORAMAC_EVENT_INFO_STATUS_OK);
+                    xEventGroupSetBits(s_events, EVT_TX_ERROR);
+                    break;
+                }
+
+                if (SecureElementDeriveAndStoreKey(base_nwk,
+                        s_mc_root_key_ids[d->group],
+                        s_mc_nwk_s_key_ids[d->group]) != SECURE_ELEMENT_SUCCESS) {
+                    esp_rom_printf("lorawan: DeriveAndStoreKey (nwk) failed\n");
+                    CAPTURE_LORAMAC_ERROR("derive_mc_keys", LORAMAC_STATUS_CRYPTO_ERROR,
+                                          LORAMAC_EVENT_INFO_STATUS_OK);
+                    xEventGroupSetBits(s_events, EVT_TX_ERROR);
+                    break;
+                }
+
+                // Read back the derived session keys via MIB. The MIB
+                // pointers reference the soft-SE keystore; copy before
+                // the next MAC operation could change them.
+                const Mib_t app_mibs[4] = {
+                    MIB_MC_APP_S_KEY_0, MIB_MC_APP_S_KEY_1,
+                    MIB_MC_APP_S_KEY_2, MIB_MC_APP_S_KEY_3,
+                };
+                const Mib_t nwk_mibs[4] = {
+                    MIB_MC_NWK_S_KEY_0, MIB_MC_NWK_S_KEY_1,
+                    MIB_MC_NWK_S_KEY_2, MIB_MC_NWK_S_KEY_3,
+                };
+                MibRequestConfirm_t km;
+                km.Type = app_mibs[d->group];
+                if (LoRaMacMibGetRequestConfirm(&km) == LORAMAC_STATUS_OK
+                    && km.Param.McAppSKey0 != NULL) {
+                    memcpy(s_derived_app_s_key, km.Param.McAppSKey0, 16);
+                }
+                km.Type = nwk_mibs[d->group];
+                if (LoRaMacMibGetRequestConfirm(&km) == LORAMAC_STATUS_OK
+                    && km.Param.McNwkSKey0 != NULL) {
+                    memcpy(s_derived_nwk_s_key, km.Param.McNwkSKey0, 16);
+                }
+                esp_rom_printf("lorawan: MC keys derived for group %u addr=0x%08lx\n",
+                               (unsigned)d->group, (unsigned long)d->addr);
+                xEventGroupSetBits(s_events, EVT_COMPLETED);
                 break;
             }
 
