@@ -24,9 +24,9 @@ import lorawan
 
 # Credentials for the MAC-init tests (tests 3-6). ABP is used so no network
 # round-trip is needed; replace the keys for tests involving a live LNS.
-ABP_DEV_ADDR = 0x260B9E51                              # replace with your DevAddr
-ABP_NWK_S_KEY = bytes.fromhex("24E6F2A652D5466E994F56930DB92322")               # replace with your NwkSKey
-ABP_APP_S_KEY = bytes.fromhex("ED910C0E241BE2150AB52458B9E6EE23")               # replace with your AppSKey
+ABP_DEV_ADDR = 0x00000000                              # replace with your DevAddr
+ABP_NWK_S_KEY = bytes.fromhex("00" * 16)               # replace with your NwkSKey
+ABP_APP_S_KEY = bytes.fromhex("00" * 16)               # replace with your AppSKey
 
 # LoRaWAN 1.1.1 spec Annex A.6 multicast session key derivation test vectors.
 # McKey  = 0x000102030405060708090a0b0c0d0e0f
