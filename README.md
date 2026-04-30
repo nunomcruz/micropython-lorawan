@@ -19,7 +19,7 @@ A `USER_C_MODULE` that wraps [Semtech LoRaMAC-node v4.7.0](https://github.com/Lo
 
 All exposed via a single `import lorawan` module.
 
-Single firmware image for all T-Beam variants (v0.7–v1.2, SX1276 and SX1262 radios). Hardware is auto-detected at boot; no separate builds required.
+Single firmware image for all T-Beam variants (v0.7–v1.2 including the 433 MHz edition). Hardware is auto-detected at boot; no separate builds required. The 433 MHz edition requires a firmware compiled with EU433 support — see [Regions](#regions).
 
 Default region: EU868 (TTN). All LoRaWAN regions supported as opt-in build flags.
 
@@ -31,6 +31,7 @@ Default region: EU868 (TTN). All LoRaWAN regions supported as opt-in build flags
 | v1.0 | SX1276 | AXP192 | 34/12 |
 | v1.1 | SX1276 or SX1262 | AXP192 | 34/12 |
 | v1.2 | SX1276 or SX1262 | AXP2101 | 34/12 |
+| v1.2 (433 MHz) | SX1278 or SX1262 | AXP2101 | 34/12 |
 
 ## Hardware setup
 
@@ -147,6 +148,8 @@ All region constants (`lorawan.EU868`, `lorawan.US915`, etc.) are always exporte
 | `CN779`   | 779–787 MHz   | private CN          | +2 KB          |
 
 US915 and AU915 share a common 72-channel base layer (`RegionBaseUS.c`); enabling either one adds it automatically.
+
+The T-Beam v1.2 433 MHz edition ships with either an SX1278 or an SX1262. Both are fully supported: the SX1262 variant auto-detects normally; the SX1278 is register-compatible with the SX1276 driver and auto-detects the same way. In both cases, compile with `EU433` — no other changes are needed.
 
 Note: `tx_power()` and `tx_power_to_dbm` semantics now depend on region — the dBm ↔ MAC index conversion uses the region's actual `DEFAULT_MAX_EIRP` (see table in `tx_power()` below).
 
