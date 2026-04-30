@@ -347,7 +347,7 @@ void SX126xAntSwOff(void)
 
 bool SX126xCheckRfFrequency(uint32_t frequency)
 {
-    // EU868 band: 863–870 MHz; accept full ISM range 150 MHz–960 MHz
+    // Accept full ISM range supported by SX1262 (covers EU433: 433–435 MHz, EU868: 863–870 MHz, US915, AS923, etc.)
     return (frequency >= 150000000UL && frequency <= 960000000UL);
 }
 
