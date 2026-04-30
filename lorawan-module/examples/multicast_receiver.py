@@ -54,7 +54,7 @@ def main():
     print("tbeam:", hw)
 
     lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_datarate=lorawan.DR_3)
-    lw.on_rx(on_downlink)
+    lw.on_recv(on_downlink)
 
     try:
         lw.nvram_restore()

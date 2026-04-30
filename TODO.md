@@ -93,13 +93,13 @@ Development roadmap based on MIGRATION_PLAN.md. Each phase maps to one or more C
 
 - [x] Implement recv(timeout=10) — blocks on s_rx_queue; returns (data, port, rssi, snr) or None; timeout=0 polls without blocking
 - [x] Confirmed uplink already wired (MCPS_CONFIRMED in CMD_TX); added last_tx_ack field to lorawan_obj_t, captured from McpsConfirm.AckReceived; reported in stats()
-- [x] Implement on_rx(callback) — mcps_indication schedules lorawan_rx_trampoline via mp_sched_schedule; trampoline pops from s_rx_queue and calls callback(data, port, rssi, snr) in Python context
-- [x] Implement on_tx_done(callback) — mcps_confirm schedules lorawan_tx_trampoline; arg is True (confirmed: ACK received; unconfirmed: frame sent) or False (failure)
+- [x] Implement on_recv(callback) — mcps_indication schedules lorawan_rx_trampoline via mp_sched_schedule; trampoline pops from s_rx_queue and calls callback(data, port, rssi, snr) in Python context
+- [x] Implement on_send_done(callback) — mcps_confirm schedules lorawan_tx_trampoline; arg is True (confirmed: ACK received; unconfirmed: frame sent) or False (failure)
 - [x] Compile clean — zero errors, zero warnings; firmware 1614 KB
 - [x] Test: receive scheduled downlink from TTN ✓ — recv(timeout=10) returned (b'\x02\x03\x04\x05', 1, -105, 8)
-- [x] Test: confirmed uplink with ACK ✓ — stats()["last_tx_ack"] = True; on_tx_done callback fired with True
-- [x] Test: on_rx callback ✓ — lambda fired with (b'\x10\x11\x12\x13\x14\x15', 1, -104, 8)
-- [x] Test: on_tx_done callback ✓ — "tx_done: True" printed after unconfirmed send
+- [x] Test: confirmed uplink with ACK ✓ — stats()["last_tx_ack"] = True; on_send_done callback fired with True
+- [x] Test: on_recv callback ✓ — lambda fired with (b'\x10\x11\x12\x13\x14\x15', 1, -104, 8)
+- [x] Test: on_send_done callback ✓ — "tx_done: True" printed after unconfirmed send
 - Note: dev_nonce_too_small on TTN without NVS persistence — fixed in Session 10 (auto-save on join + nvram_restore() at boot)
 
 ### Session 10: Persistence + ADR ✓
@@ -287,8 +287,8 @@ Prerequisites: DeviceTimeReq must work (Session 12), timer HAL accuracy verified
       - `CMD_MC_REMOVE` → `LoRaMacMcChannelDelete()` and clears the local mirror.
 - [x] Implement `multicast_list()` — returns active groups with metadata
       - Returns a list of dicts `{group, addr, is_remote, f_count_min, f_count_max, device_class?, frequency?, datarate?, periodicity?}`. RX-param keys only appear after `multicast_rx_params()` has been called for the group.
-- [x] Ensure `on_rx(callback)` receives multicast downlinks with group info in metadata
-      - `lorawan_rx_pkt_t` gained a `multicast` flag fed from `McpsIndication.Multicast`. The Python tuple is now `(data, port, rssi, snr, multicast)` — 5-tuple is a breaking change from the 4-tuple in Sessions 9–13 but the multicast flag has to live somewhere and the dict option adds per-packet allocation overhead. `recv()` still returns the 4-tuple (keeping backwards compatibility for the polling path); only `on_rx` callbacks see the new shape.
+- [x] Ensure `on_recv(callback)` receives multicast downlinks with group info in metadata
+      - `lorawan_rx_pkt_t` gained a `multicast` flag fed from `McpsIndication.Multicast`. The Python tuple is now `(data, port, rssi, snr, multicast)` — 5-tuple is a breaking change from the 4-tuple in Sessions 9–13 but the multicast flag has to live somewhere and the dict option adds per-packet allocation overhead. `recv()` still returns the 4-tuple (keeping backwards compatibility for the polling path); only `on_recv` callbacks see the new shape.
 - [x] Register Remote Multicast Setup package (LmhpRemoteMcastSetup) for server-driven configuration
       - Extended `lmhandler_shim.c`: new `LmHandlerPackageRegister(PACKAGE_ID_REMOTE_MCAST_SETUP)` branch plus a shim implementation of `LmHandlerRequestClass()` (direct `MIB_DEVICE_CLASS` set, safe to call from package `Process()` which runs in LoRaWAN task context).
       - Added `lorawan_packages_process()` — called from the task main loop each iteration so Remote Mcast Setup can run its session-start / session-stop state transitions.
@@ -309,10 +309,10 @@ Prerequisites: DeviceTimeReq must work (Session 12), timer HAL accuracy verified
 
 ### Session 15: Documentation and examples ✓
 
-- [x] API reference documentation — `README.md` rewritten with full Phase 5 coverage: Class A/B/C, time sync (DeviceTimeReq + Clock Sync package), LinkCheckReq, ReJoin, multicast (local + remote), fragmentation/FUOTA, beacon state, ping-slot periodicity. Fixed two pre-existing errors from Phase 4 docs: `joined()` is a method not an attribute, and the `on_rx` callback now receives a 5-tuple `(data, port, rssi, snr, multicast)` (multicast flag added in Session 14).
+- [x] API reference documentation — `README.md` rewritten with full Phase 5 coverage: Class A/B/C, time sync (DeviceTimeReq + Clock Sync package), LinkCheckReq, ReJoin, multicast (local + remote), fragmentation/FUOTA, beacon state, ping-slot periodicity. Fixed two pre-existing errors from Phase 4 docs: `joined()` is a method not an attribute, and the `on_recv` callback now receives a 5-tuple `(data, port, rssi, snr, multicast)` (multicast flag added in Session 14).
 - [x] Hardware setup guide — new section covering LoRa antenna (damage risk without), GPS antenna, power, and TTN registration walkthrough (frequency plan "Europe 863–870 MHz (SF9 for RX2)" maps to the default `rx2_dr=DR_3`).
 - [x] Example scripts: `lorawan-module/examples/basic_otaa.py`, `basic_abp.py`, `sensor_node.py` — all gated by `tbeam.detect()`, print diagnostic info (RSSI/SNR/counters), handle OSError on join timeout and RuntimeError on send failure. `sensor_node.py` uses `machine.deepsleep()` with pre-sleep `nvram_save()` and reads AXP192 battery voltage inline when available.
-- [x] Example scripts: `time_sync.py`, `class_b_beacon.py`, `multicast_receiver.py` — all demonstrate the relevant callback (`on_time_sync`, `on_beacon`, `on_rx`-with-multicast-flag). `class_b_beacon.py` walks the full flow: join → DeviceTimeReq → set ping-slot periodicity → request CLASS_B → wait for `BEACON_LOCKED` state. `multicast_receiver.py` uses local group provisioning (keys in-script) and Class C continuous listen.
+- [x] Example scripts: `time_sync.py`, `class_b_beacon.py`, `multicast_receiver.py` — all demonstrate the relevant callback (`on_time_sync`, `on_beacon`, `on_recv`-with-multicast-flag). `class_b_beacon.py` walks the full flow: join → DeviceTimeReq → set ping-slot periodicity → request CLASS_B → wait for `BEACON_LOCKED` state. `multicast_receiver.py` uses local group provisioning (keys in-script) and Class C continuous listen.
 - [x] `lorawan-module/examples/README.md` index with a pointer to each script and notes on LNS prerequisites (Class B beacon support, multicast API availability).
 
 ### Session 16: API polish (deinit, soft-reset safety, missing getters)
@@ -420,8 +420,8 @@ Review of the full Python API surface identified several inconsistencies to fix 
 
 #### Callbacks
 
-- [x] Unify callback argument passing — currently `on_rx` receives 5 separate args, `on_beacon` receives a 2-tuple, fragmentation callbacks receive tuples. Pick one convention. Recommendation: all callbacks receive separate named-position args (not tuples), matching `on_rx(data, port, rssi, snr, multicast)` pattern. Update `on_beacon(state, info)` to two separate args (currently a single 2-tuple). Update fragmentation `on_progress(counter, nb, size, lost)` and `on_done(status, size)` to separate args.
-- [x] `recv()` returns 5-tuple `(data, port, rssi, snr, multicast)` — verify this matches `on_rx` shape. The Session 14 notes say `recv()` still returns 4-tuple for backwards compat — if so, update to 5-tuple for consistency.
+- [x] Unify callback argument passing — currently `on_recv` receives 5 separate args, `on_beacon` receives a 2-tuple, fragmentation callbacks receive tuples. Pick one convention. Recommendation: all callbacks receive separate named-position args (not tuples), matching `on_recv(data, port, rssi, snr, multicast)` pattern. Update `on_beacon(state, info)` to two separate args (currently a single 2-tuple). Update fragmentation `on_progress(counter, nb, size, lost)` and `on_done(status, size)` to separate args.
+- [x] `recv()` returns 5-tuple `(data, port, rssi, snr, multicast)` — verify this matches `on_recv` shape. The Session 14 notes say `recv()` still returns 4-tuple for backwards compat — if so, update to 5-tuple for consistency.
 
 #### Error handling
 
@@ -436,7 +436,7 @@ Review of the full Python API surface identified several inconsistencies to fix 
 
 #### Documentation
 
-- [x] Document recv() vs on_rx() interaction: recv() has priority (pops queue while VM is blocked); on_rx silenced during recv() call. Class C guidance added to README.
+- [x] Document recv() vs on_recv() interaction: recv() has priority (pops queue while VM is blocked); on_recv silenced during recv() call. Class C guidance added to README.
 - [ ] Add `__doc__` strings to all Python-facing methods in modlorawan.c (MP_DEFINE_CONST_FUN_OBJ accepts a doc string via the MP_ROM_xxx macros — check if MicroPython v1.29 supports this, otherwise skip)
 - [x] Verify README API reference matches the actual implementation after all renames
 
@@ -489,9 +489,9 @@ v1.0.0 review.
       `device_class(cls)` is the sole setter; v1.0.0 was the grace window.
 - [x] Removed `network_time()`. Snapshot available via `on_time_sync(cb)` arg;
       live time via `synced_time()`. README + time_sync.py updated.
-- [x] `recv()` and `on_rx()` now mutually exclusive: `recv()` raises
-      `RuntimeError("on_rx is registered; recv() disabled")` when a callback
-      is registered. README "recv() vs on_rx" updated.
+- [x] `recv()` and `on_recv()` now mutually exclusive: `recv()` raises
+      `RuntimeError("on_recv is registered; recv() disabled")` when a callback
+      is registered. README "recv() vs on_recv" updated.
 - [x] Renamed `stats()["tx_counter"]` → `stats()["last_tx_fcnt_up"]`. Internal
       C field (`tx_counter`) unchanged; only the Python dict key changed.
       examples/basic_otaa.py, basic_abp.py, sensor_node.py updated.
@@ -503,7 +503,7 @@ v1.0.0 review.
 - [x] Hardware tests (25/25 passed on T-Beam SX1276 — test_session22_api.py):
       - request_class(CLASS_C) raises AttributeError ✓
       - network_time() raises AttributeError ✓
-      - recv() with on_rx registered raises RuntimeError ✓
+      - recv() with on_recv registered raises RuntimeError ✓
       - stats()["last_tx_fcnt_up"] populated after send ✓ (value=1, no tx_counter key)
       - link_check(send_now=True, port=2, confirmed=True, datarate=DR_0) ✓
         returned margin=20 dB, gw_count=1

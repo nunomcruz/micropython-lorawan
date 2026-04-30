@@ -20,7 +20,7 @@ Test flow:
   4. Request Class B — beacon acquisition runs asynchronously. Watch the
      on_beacon callback for state transitions.
   5. Once locked, queue a downlink from the LNS console and wait for it
-     to arrive on a ping slot (on_rx fires with the frame).
+     to arrive on a ping slot (on_recv fires with the frame).
 """
 
 import tbeam
@@ -75,7 +75,7 @@ def main():
     lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_datarate=lorawan.DR_3)
     lw.on_beacon(on_beacon)
     lw.on_class_change(on_class_change)
-    lw.on_rx(on_downlink)
+    lw.on_recv(on_downlink)
 
     try:
         lw.nvram_restore()

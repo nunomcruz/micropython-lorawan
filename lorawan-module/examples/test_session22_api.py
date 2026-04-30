@@ -3,7 +3,7 @@ test_session22_api.py — Session 22 API consistency regression tests.
 
 Verifies:
   1. request_class() and network_time() raise AttributeError (removed).
-  2. recv() raises RuntimeError when on_rx callback is registered.
+  2. recv() raises RuntimeError when on_recv callback is registered.
   3. stats()["last_tx_fcnt_up"] is present after a send; old "tx_counter" is gone.
   4. lorawan.DR_6 and lorawan.DR_7 are exported integer constants.
   5. link_check() arg validation: ValueError on bad port / out-of-range DR.
@@ -81,36 +81,36 @@ except AttributeError:
 except Exception as e:
     fail("network_time() wrong exception type", f"{type(e).__name__}: {e}")
 
-# ------------------------------------------------------------------ 2. recv() / on_rx() mutual exclusion
-section("2. recv() raises RuntimeError when on_rx callback is registered")
+# ------------------------------------------------------------------ 2. recv() / on_recv() mutual exclusion
+section("2. recv() raises RuntimeError when on_recv callback is registered")
 
 
 def _dummy_rx(data, port, rssi, snr, multicast):
     pass
 
 
-lw.on_rx(_dummy_rx)
+lw.on_recv(_dummy_rx)
 try:
     lw.recv(timeout=0)
-    fail("recv() with on_rx registered should raise", "no exception raised")
+    fail("recv() with on_recv registered should raise", "no exception raised")
 except RuntimeError as e:
     msg = str(e)
-    if "on_rx is registered" in msg:
+    if "on_recv is registered" in msg:
         ok("recv() raises RuntimeError", repr(msg))
     else:
         fail("recv() RuntimeError message wrong", repr(msg))
 except Exception as e:
     fail("recv() wrong exception type", f"{type(e).__name__}: {e}")
 finally:
-    lw.on_rx(None)
+    lw.on_recv(None)
 
 # Confirm recv() works again once deregistered
 try:
     result = lw.recv(timeout=0)
     if result is None:
-        ok("recv() works after on_rx(None) deregister (no packet, returned None)")
+        ok("recv() works after on_recv(None) deregister (no packet, returned None)")
     else:
-        ok("recv() works after on_rx(None) deregister (got packet)")
+        ok("recv() works after on_recv(None) deregister (got packet)")
 except Exception as e:
     fail("recv() after deregister", f"{type(e).__name__}: {e}")
 

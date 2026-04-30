@@ -1,6 +1,6 @@
 // modlorawan.c — LoRaWAN Python bindings
 // Phase 4, Sessions 7-10: lorawan_obj_t, __init__, join_abp, join_otaa, send, stats,
-//                         recv, on_rx, on_tx_done, confirmed uplink ACK tracking,
+//                         recv, on_recv, on_send_done, confirmed uplink ACK tracking,
 //                         nvram_save/restore (ESP32 NVS via MIB_NVM_CTXS),
 //                         datarate/adr/tx_power getters+setters.
 // Phase 5, Session 11:   runtime pin config; lorawan_version (1.0.4/1.1), rx2_datarate/freq,
@@ -528,7 +528,7 @@ static void lorawan_raise_last_error(void) {
 // allocate MicroPython objects and call Python functions here.
 
 // Called when a downlink packet has been pushed to s_rx_queue.
-// Pops one packet and invokes the stored on_rx callback.
+// Pops one packet and invokes the stored on_recv callback.
 static mp_obj_t lorawan_rx_trampoline(mp_obj_t arg) {
     (void)arg;
     if (!s_lora_obj || s_lora_obj->rx_callback == mp_const_none || !s_rx_queue) {
@@ -762,7 +762,7 @@ static void mcps_confirm(McpsConfirm_t *c) {
         xEventGroupSetBits(s_events, EVT_TX_ERROR);
     }
 
-    // Schedule Python on_tx_done callback if registered.
+    // Schedule Python on_send_done callback if registered.
     // For confirmed uplinks success = ACK received; for unconfirmed = frame sent.
     if (s_lora_obj && s_lora_obj->tx_callback != mp_const_none) {
         bool success = (c->McpsRequest == MCPS_CONFIRMED)
@@ -799,7 +799,7 @@ static void mcps_indication(McpsIndication_t *ind) {
     memcpy(pkt.data, ind->Buffer, pkt.len);
     xQueueSend(s_rx_queue, &pkt, 0);
 
-    // Schedule Python on_rx callback if registered.
+    // Schedule Python on_recv callback if registered.
     // The trampoline pops from s_rx_queue and calls the callback in Python context.
     if (s_lora_obj && s_lora_obj->rx_callback != mp_const_none) {
         mp_sched_schedule(MP_OBJ_FROM_PTR(&lorawan_rx_trampoline_obj), mp_const_none);
@@ -2893,7 +2893,7 @@ static mp_obj_t lorawan_recv(size_t n_args, const mp_obj_t *pos_args,
 
     if (s_lora_obj && s_lora_obj->rx_callback != mp_const_none) {
         mp_raise_msg(&mp_type_RuntimeError,
-                     MP_ERROR_TEXT("on_rx is registered; recv() disabled"));
+                     MP_ERROR_TEXT("on_recv is registered; recv() disabled"));
     }
 
     lorawan_rx_pkt_t pkt;
@@ -2911,31 +2911,31 @@ static mp_obj_t lorawan_recv(size_t n_args, const mp_obj_t *pos_args,
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_recv_obj, 1, lorawan_recv);
 
-// on_rx(callback) — register callback(data, port, rssi, snr, multicast) for incoming downlinks.
+// on_recv(callback) — register callback(data, port, rssi, snr, multicast) for incoming downlinks.
 // Pass None to deregister. Do not use together with recv() on the same object.
-static mp_obj_t lorawan_on_rx(mp_obj_t self_in, mp_obj_t cb) {
+static mp_obj_t lorawan_on_recv(mp_obj_t self_in, mp_obj_t cb) {
     lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
     if (cb != mp_const_none && !mp_obj_is_callable(cb)) {
-        mp_raise_TypeError(MP_ERROR_TEXT("on_rx: callback must be callable or None"));
+        mp_raise_TypeError(MP_ERROR_TEXT("on_recv: callback must be callable or None"));
     }
     self->rx_callback = cb;
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_on_rx_obj, lorawan_on_rx);
+static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_on_recv_obj, lorawan_on_recv);
 
-// on_tx_done(callback) — register callback(success) for uplink completion.
+// on_send_done(callback) — register callback(success) for uplink completion.
 // For confirmed uplinks: success=True means ACK received from network.
 // For unconfirmed uplinks: success=True means frame was transmitted.
 // Pass None to deregister.
-static mp_obj_t lorawan_on_tx_done(mp_obj_t self_in, mp_obj_t cb) {
+static mp_obj_t lorawan_on_send_done(mp_obj_t self_in, mp_obj_t cb) {
     lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
     if (cb != mp_const_none && !mp_obj_is_callable(cb)) {
-        mp_raise_TypeError(MP_ERROR_TEXT("on_tx_done: callback must be callable or None"));
+        mp_raise_TypeError(MP_ERROR_TEXT("on_send_done: callback must be callable or None"));
     }
     self->tx_callback = cb;
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_on_tx_done_obj, lorawan_on_tx_done);
+static MP_DEFINE_CONST_FUN_OBJ_2(lorawan_on_send_done_obj, lorawan_on_send_done);
 
 // nvram_save() — persist MAC session to ESP32 NVS.
 // Saves the full LoRaMacNvmData_t blob (DevAddr, session keys, FCnt, region
@@ -4149,8 +4149,8 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_recv),           MP_ROM_PTR(&lorawan_recv_obj) },
     { MP_ROM_QSTR(MP_QSTR_joined),         MP_ROM_PTR(&lorawan_joined_obj) },
     { MP_ROM_QSTR(MP_QSTR_stats),          MP_ROM_PTR(&lorawan_stats_obj) },
-    { MP_ROM_QSTR(MP_QSTR_on_rx),          MP_ROM_PTR(&lorawan_on_rx_obj) },
-    { MP_ROM_QSTR(MP_QSTR_on_tx_done),     MP_ROM_PTR(&lorawan_on_tx_done_obj) },
+    { MP_ROM_QSTR(MP_QSTR_on_recv),        MP_ROM_PTR(&lorawan_on_recv_obj) },
+    { MP_ROM_QSTR(MP_QSTR_on_send_done),   MP_ROM_PTR(&lorawan_on_send_done_obj) },
     { MP_ROM_QSTR(MP_QSTR_nvram_save),     MP_ROM_PTR(&lorawan_nvram_save_obj) },
     { MP_ROM_QSTR(MP_QSTR_nvram_restore),  MP_ROM_PTR(&lorawan_nvram_restore_obj) },
     { MP_ROM_QSTR(MP_QSTR_datarate),       MP_ROM_PTR(&lorawan_datarate_obj) },

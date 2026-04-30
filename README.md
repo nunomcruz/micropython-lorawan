@@ -315,13 +315,13 @@ except OSError as e:
         raise
 ```
 
-#### `lw.on_tx_done(callback)` / `lw.on_tx_done(None)`
+#### `lw.on_send_done(callback)` / `lw.on_send_done(None)`
 
 Registers a callback fired after each uplink cycle. For confirmed uplinks, `success=True` means the network ACKed. For unconfirmed, `success=True` means the frame was transmitted.
 
 ```python
-lw.on_tx_done(lambda ok: print("tx done, ack:", ok))
-lw.on_tx_done(None)  # deregister
+lw.on_send_done(lambda ok: print("tx done, ack:", ok))
+lw.on_send_done(None)  # deregister
 ```
 
 ---
@@ -339,7 +339,7 @@ if pkt:
     print(f"rx port={port} rssi={rssi} snr={snr}: {data}")
 ```
 
-#### `lw.on_rx(callback)` / `lw.on_rx(None)`
+#### `lw.on_recv(callback)` / `lw.on_recv(None)`
 
 Registers a callback fired on each downlink. Callback receives five separate positional args: `data`, `port`, `rssi`, `snr`, `multicast`. `multicast` is `True` when the frame was received on a multicast address.
 
@@ -348,26 +348,26 @@ def on_downlink(data, port, rssi, snr, multicast):
     kind = "mcast" if multicast else "ucast"
     print(f"{kind} port={port} rssi={rssi} snr={snr}: {data}")
 
-lw.on_rx(on_downlink)
-lw.on_rx(None)  # deregister
+lw.on_recv(on_downlink)
+lw.on_recv(None)  # deregister
 ```
 
-#### `recv()` vs `on_rx` — pick one, enforced
+#### `recv()` vs `on_recv` — pick one, enforced
 
-`recv()` and `on_rx` are mutually exclusive. Calling `recv()` while an `on_rx` callback is registered raises `RuntimeError("on_rx is registered; recv() disabled")`. Deregister first with `lw.on_rx(None)` if you need to switch modes.
+`recv()` and `on_recv` are mutually exclusive. Calling `recv()` while an `on_recv` callback is registered raises `RuntimeError("on_recv is registered; recv() disabled")`. Deregister first with `lw.on_recv(None)` if you need to switch modes.
 
 | Pattern | Right for |
 |---------|-----------|
 | `recv(timeout=N)` | Request/response flows: send an uplink, then block waiting for the reply. |
-| `on_rx(callback)` | Event-driven flows: Class C continuous listen, sensor node sleeping between uplinks. |
+| `on_recv(callback)` | Event-driven flows: Class C continuous listen, sensor node sleeping between uplinks. |
 
-For Class C in particular, downlinks can arrive at any time; `on_rx` is the right choice:
+For Class C in particular, downlinks can arrive at any time; `on_recv` is the right choice:
 
 ```python
-# Class C — correct pattern: on_rx only
-lw.on_rx(on_downlink)
+# Class C — correct pattern: on_recv only
+lw.on_recv(on_downlink)
 lw.device_class(lorawan.CLASS_C)
-# recv() must not be called while on_rx is registered
+# recv() must not be called while on_recv is registered
 ```
 
 ---
@@ -1112,8 +1112,8 @@ lw = lorawan.LoRaWAN(region=lorawan.EU868, rx2_datarate=lorawan.DR_3)
 def on_downlink(data, port, rssi, snr, mc):
     print(f"rx port={port} rssi={rssi} snr={snr} mcast={mc}: {data}")
 
-lw.on_rx(on_downlink)
-lw.on_tx_done(lambda ok: print("tx ack:", ok))
+lw.on_recv(on_downlink)
+lw.on_send_done(lambda ok: print("tx ack:", ok))
 
 lw.send(b"ping", confirmed=True)
 ```
@@ -1225,7 +1225,7 @@ See [TODO.md](TODO.md) for the development roadmap and per-session notes. See [C
 The v1.0.0 surface is stable, but a v1.0 review found a handful of consistency gaps and exposed Semtech features. Sessions 21–25 are tracked in [TODO.md](TODO.md):
 
 - **Session 21 — Error handling and diagnostics (v1.1.0).** All `RuntimeError("<api> failed")` sites replaced with `OSError(EIO, "<api>: status=N")` carrying the underlying `LoRaMacStatus_t` or `LoRaMacEventInfoStatus_t`. `lw.last_error()` returns a full diagnostic dict for post-mortem. `join_otaa()` timeout now raises `OSError(ETIMEDOUT, "join: last_status=N")`. Constructor auto-deinit tightened to avoid UAF on the previous object.
-- **Session 22 — API consistency (done).** Dropped deprecated `request_class` alias. Removed `network_time()` (use `synced_time()` or capture snapshot in `on_time_sync` callback). `recv()` now raises `RuntimeError` when `on_rx` is registered. Renamed `stats()["tx_counter"]` → `stats()["last_tx_fcnt_up"]`. Exported `DR_6` (SF7/250 kHz) and `DR_7` (FSK 50 kbps). `link_check()` gained `port` and `confirmed` kwargs.
+- **Session 22 — API consistency (done).** Dropped deprecated `request_class` alias. Removed `network_time()` (use `synced_time()` or capture snapshot in `on_time_sync` callback). `recv()` now raises `RuntimeError` when `on_recv` is registered. Renamed `stats()["tx_counter"]` → `stats()["last_tx_fcnt_up"]`. Exported `DR_6` (SF7/250 kHz) and `DR_7` (FSK 50 kbps). `link_check()` gained `port` and `confirmed` kwargs.
 - **Session 23 — Expanded MIB getters/setters.** `nb_trans()` (cheapest reliability knob — multi-TX of unconfirmed uplinks), `channel_mask()`, live `frame_counters()`, `public_network()`, `rx_window_timing()`, `rx_clock_drift()`, `rejoin_cycle()`, `net_id()`. Wraps existing MAC state with no new MAC code.
 - **Session 24 — New MAC primitives (v1.3.0).** `tx_cw(freq, power, duration)` wraps `MLME_TXCW` for CW bench tests and FCC/CE pre-compliance. `compliance_enable()` registers `LmhpCompliance` (port 224) for LoRa Alliance certification testing — the package responds to DUT commands from the certification tool autonomously. `derive_mc_keys(addr, mc_key)` performs in-MAC multicast session key derivation so callers no longer need to plumb AES manually before `multicast_add()`. See "Standards compliance" below for certification notes.
 - **Session 25 — Additional regions.** Build-time opt-in for US915 / AU915 / AS923 / KR920 / IN865 / RU864 / CN470 / CN779. Region-aware dBm ↔ TX-power index conversion (today the EU868 table is hardcoded, so the `tx_power()` getter returns wrong dBm on EU433).
