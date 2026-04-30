@@ -43,7 +43,7 @@ static void compliance_on_tx_frame_ctrl_changed(LmHandlerMsgTypes_t t) { (void)t
 static void compliance_on_ping_slot_periodicity_changed(uint8_t p) { (void)p; }
 
 static LmhpComplianceParams_t s_compliance_params = {
-    .FwVersion = { .Fields = { .Major = 1, .Minor = 3, .Patch = 0, .Revision = 0 } },
+    .FwVersion = { .Fields = { .Major = 1, .Minor = 3, .Patch = 1, .Revision = 0 } },
     .OnTxPeriodicityChanged      = compliance_on_tx_periodicity_changed,
     .OnTxFrameCtrlChanged        = compliance_on_tx_frame_ctrl_changed,
     .OnPingSlotPeriodicityChanged = compliance_on_ping_slot_periodicity_changed,
