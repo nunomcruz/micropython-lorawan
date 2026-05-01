@@ -142,7 +142,7 @@ Foundation for `deinit()` / soft-reset safety / context manager. Subsequent vers
 
 ### SX1262 sleep/wakeup bug
 
-End-to-end SX1262 testing surfaced the sleep/wakeup race (Session 12 detail in CLAUDE.md). After RX1/RX2 windows, `RadioSleep(WarmStart=1)` put the radio to sleep with BUSY held LOW; the next command's `WaitOnBusy()` returned immediately and clocked data into a half-awake radio.
+End-to-end SX1262 testing surfaced the sleep/wakeup race. After RX1/RX2 windows, `RadioSleep(WarmStart=1)` put the radio to sleep with BUSY held LOW; the next command's `WaitOnBusy()` returned immediately and clocked data into a half-awake radio.
 
 Fix: `SX126xWakeup()` now sets `operating_mode = MODE_STDBY_RC` after waking the radio, so wakeup only triggers once per sleep cycle. `ensure_awake()` is called inside `spi_lock()` before `WaitOnBusy()` in all six SPI HAL functions. The SPI mutex was changed from `xSemaphoreCreateMutex` to `xSemaphoreCreateRecursiveMutex` so that `SX126xWakeup()` (which itself does SPI) can run while holding the lock.
 
@@ -150,7 +150,7 @@ Fix: `SX126xWakeup()` now sets `operating_mode = MODE_STDBY_RC` after waking the
 
 The full Python binding surface taking shape across Sessions 7–10:
 
-- ABP join + first uplink — `lorawan_obj_t`, `LoRaWAN.__init__`, dedicated FreeRTOS task on CPU1 (priority 6, 8 KB stack), command queue + event group, EU868 RX2 = 869.525 MHz / DR_3 for TTN, LoRaWAN 1.0.4 single-key MIC for ABP. Three FreeRTOS pitfalls fixed during this work (see CLAUDE.md): GIL deadlock from `mp_printf` in non-Python tasks, ESP-IDF v5 stack depth in bytes (not words), `pdMS_TO_TICKS(2) = 0` busy-spin starving `xKernelLock`.
+- ABP join + first uplink — `lorawan_obj_t`, `LoRaWAN.__init__`, dedicated FreeRTOS task on CPU1 (priority 6, 8 KB stack), command queue + event group, EU868 RX2 = 869.525 MHz / DR_3 for TTN, LoRaWAN 1.0.4 single-key MIC for ABP. Three FreeRTOS pitfalls fixed during this work: GIL deadlock from `mp_printf` in non-Python tasks, ESP-IDF v5 stack depth in bytes (not words), `pdMS_TO_TICKS(2) = 0` busy-spin starving `xKernelLock`.
 - OTAA join — full procedure with retry loop, `joined()`, `stats()`.
 - Receive + confirmed messages — `recv(timeout=...)`, `on_recv(callback)`, `on_send_done(callback)`, `last_tx_ack`.
 - Persistence + ADR — `nvram_save()`, `nvram_restore()`, `datarate()`, `adr()`, `tx_power()` (MAC index). DevNonce auto-save after `MLME_JOIN OK`. Explicit CRC recomputation in `nvram_save` to avoid `RestoreNvmData` silently skipping the Crypto group.

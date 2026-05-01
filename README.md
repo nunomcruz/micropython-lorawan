@@ -1241,7 +1241,7 @@ The package handles: `PKG_VERSION_ANS`, `DUT_RESET`, `DUT_JOIN`, `SWITCH_CLASS`,
 - Continuous-wave transmission (`tx_cw`) for SWR checks and FCC/CE pre-compliance scans.
 - Typed exceptions throughout; `last_error()` accessor for post-mortem diagnostics.
 
-For the full development history and version-by-version changes, see [CHANGELOG.md](CHANGELOG.md). For project context, hardware constants and FreeRTOS pitfalls encountered during the port, see [CLAUDE.md](../CLAUDE.md).
+For the full development history and version-by-version changes, see [CHANGELOG.md](CHANGELOG.md).
 
 ## Architecture
 
