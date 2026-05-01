@@ -1194,13 +1194,17 @@ pins = tbeam.lora_pins(hw)         # (cs, irq, rst) or (cs, irq, rst, busy)
 
 ## Hardware notes (confirmed on device)
 
-**SX1262 TCXO (DIO3, 1.8V).** The T-Beam SX1262 uses an internal TCXO via DIO3. The HAL calls `SX126xSetDio3AsTcxoCtrl(TCXO_CTRL_1_8V)` as the first operation in `SX126xIoInit()`. Without it: `XOSC_START_ERR (0x20)`.
+**SX1262 TCXO (DIO3, 1.8V).** The T-Beam SX1262 uses an internal TCXO via DIO3. The HAL calls `SX126xSetDio3AsTcxoCtrl(TCXO_CTRL_1_8V, 640)` (timeout 640 ticks ≈ 10 ms) as the first operation in `SX126xIoInit()`. Without it: `XOSC_START_ERR (0x20)`. Lazy image calibration on the first `SetRfFrequency` is sufficient — no need for a full `SX126xCalibrate(0x7F)` at boot.
+
+**Harmless `XOSC_START_ERR (0x0020)`.** The first TCXO startup briefly trips this bit in the device error register. The bit is sticky (cleared only by `ClearDeviceErrors` or a power-on reset), so it's still set on subsequent commands, but it has no effect on operation. Don't use the device error register as a health check on its own.
 
 **SX1262 DIO2 as RF switch.** DIO2 controls the TX/RX antenna switch. Enabled via `SX126xSetDio2AsRfSwitchCtrl(true)`.
 
+**SX1262 BUSY pin polled before every SPI transaction.** All `SX126xWriteCommand` / `SX126xReadCommand` paths call `SX126xWaitOnBusy()` first. After a sleep cycle (`RadioSleep(WarmStart=1)` after RX1/RX2), BUSY drops LOW prematurely, so the HAL also calls an `ensure_awake()` helper (which issues `GetStatus` and updates `operating_mode = MODE_STDBY_RC`) before each `WaitOnBusy` — otherwise a dropped wakeup race can clock garbage into the radio. The SPI mutex is recursive so the wakeup SPI does not deadlock when invoked while the lock is already held.
+
 **SX1276 uses a crystal, not TCXO.** `REG_LR_TCXO = 0x09`. Setting 0x19 (TCXO mode) silences the radio.
 
-**SPI bus exclusivity.** The HAL owns the SPI bus exclusively. Do not create a `machine.SPI` instance on the same bus while the LoRaWAN stack is running.
+**SPI bus exclusivity.** The HAL owns the SPI bus exclusively. Do not create a `machine.SPI` instance on the same bus while the LoRaWAN stack is running. Mixing them on the SX1262 causes RC13M + ADC calibration failures (`OpError 0xa00`).
 
 **TX power hardware maximums.** The SX1262 outputs up to +22 dBm; the SX1276 (PA_BOOST) up to +20 dBm. Both are well above the EU868 regulatory EIRP limit of 16 dBm. Going above 16 dBm requires a hardware TX-power override (see `tx_power()` above) and is the user's responsibility. Reaching +30 dBm requires an external PA (e.g. Ebyte E22-900M30S module); the software hook point is `SX126xAntSwOn()` / `SX126xAntSwOff()` in `sx126x_board.c`.
 
@@ -1274,6 +1278,38 @@ lorawan-module/
 ```
 
 The LoRaWAN MAC runs in a dedicated FreeRTOS task on CPU1 (priority 6, 8 KB stack). Python communicates via a command queue and event group. All `mp_printf` / MicroPython object allocation is confined to `mp_sched_schedule` trampolines running on the Python thread.
+
+## Implementation notes
+
+Quirks that bit hard during the port and are worth knowing if you contribute or fork.
+
+**ESP-IDF v5+ stack depth is in BYTES, not words.** `xTaskCreatePinnedToCore` and `xTaskCreate` in ESP-IDF v5 take a byte count (vanilla FreeRTOS uses words). `STACK_SIZE / sizeof(StackType_t)` gives 2 048 instead of 8 192 — the LoRaWAN task needs ≥ 8 192 bytes; `LoRaMacInitialization()` → `SX1276Init()` → `RxChainCalibration()` is a deep call chain.
+
+**`pdMS_TO_TICKS(n)` can evaluate to 0.** With `CONFIG_FREERTOS_HZ=100` (10 ms tick), `pdMS_TO_TICKS(2) = 0`. Passing 0 to `ulTaskNotifyTake` makes it non-blocking, which produces a tight loop that acquires/releases `xKernelLock` at MHz rate, starving the other CPU's `xQueueSend` of the same lock. Use `pdMS_TO_TICKS(10)` (= 1 tick) as the minimum meaningful sleep.
+
+**Silent stack overflow on a busy-spinning task.** `CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=1` only checks the canary at context switch. A task that never blocks (e.g. busy-spin with 0-timeout `ulTaskNotifyTake`) never gets context-switched, so stack corruption is silent — symptom is "task starts, prints first line, then never prints again" while it actually executes garbage from a corrupted stack.
+
+**`mp_printf` from a non-Python FreeRTOS task deadlocks.** `mp_hal_stdout_tx_strn` calls `MP_THREAD_GIL_ENTER()` for strings above `MICROPY_PY_STRING_TX_GIL_THRESHOLD`. If the LoRaWAN task doesn't own the GIL (and the Python thread holds it while sleeping in `xEventGroupWaitBits`), the C task blocks forever. Use `esp_rom_printf` (ROM UART, no locking, ISR-safe) for diagnostics from the LoRaWAN task.
+
+**MicroPython QSTR scanner doesn't see user-module compile definitions.** The QSTR scanner generates `genhdr/qstrdefs.generated.h` with a fixed set of preprocessor flags that does **not** include `target_compile_definitions` set on `usermod_lorawan` (e.g. `-DREGION_EU868`). Any `MP_QSTR_*` constant inside an `#ifdef REGION_X` block is silently missing from the header, producing an "undeclared" compile error the moment it appears in a ROM table outside a function. Rule: never guard QSTR-bearing constants with `#ifdef`. Region constants (`EU868`, `US915`, …) are exported unconditionally; passing an uncompiled region fails cleanly at `LoRaMacInitialization()`.
+
+**Stale per-file `.qstr` after adding new QSTRs.** If you see `MP_QSTR_XXX undeclared`, delete `genhdr/qstr/<path-mangled>.modlorawan.c.qstr`, `genhdr/qstrdefs.collected.h{,.hash}`, `genhdr/qstrdefs.generated.h` and `frozen_content.c` inside `ports/esp32/build-LILYGO_TTGO_TBEAM/`, then rebuild.
+
+**Changing `LORAWAN_REGIONS` after first configure.** It's a CMake `CACHE STRING`, so passing `-DLORAWAN_REGIONS=...` to `make` does not override the cache. Re-run `cmake -S ports/esp32 -B ports/esp32/build-LILYGO_TTGO_TBEAM -DLORAWAN_REGIONS="..." -DBOARD=... -DUSER_C_MODULES=...` first, then `make`.
+
+## Releasing
+
+The embedded firmware version comes from `git describe`. Without a `*-lorawan` tag, `git describe` falls back to upstream's `v1.29.0-preview` and the build is indistinguishable from stock MicroPython. So tag **before** the build:
+
+```bash
+git tag -a v1.0.X-lorawan -m "Release v1.0.X-lorawan"
+git push origin v1.0.X-lorawan
+# now run the canonical build — the embedded version becomes v1.0.X-lorawan
+# (or v1.0.X-lorawan-N-gHASH if there are commits after the tag, which is intentional)
+bash scripts/release.sh v1.0.X-lorawan
+```
+
+`scripts/release.sh` verifies the build output, copies the three `.bin` files to the `gh-pages` branch, updates `manifest.json` (web flasher), and creates a GitHub Release with the binaries attached. Version scheme: `v<major>.<minor>.<patch>-lorawan` — patch for bug fixes, minor for additive features.
 
 ## Related repositories
 
