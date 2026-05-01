@@ -15,7 +15,6 @@ the top of the script with the values from your LNS console.
 | [time_sync.py](time_sync.py) | Sync to network time via MAC DeviceTimeReq and the Clock Sync package. |
 | [class_b_beacon.py](class_b_beacon.py) | Switch to Class B, monitor beacons, receive on ping slots. |
 | [multicast_receiver.py](multicast_receiver.py) | Provision a local multicast group and listen in Class C. |
-| [test_session24_primitives.py](test_session24_primitives.py) | Regression tests for v1.3.0 primitives: `tx_cw()`, `compliance_enable()`, `derive_mc_keys()`. |
 
 ## Credentials
 

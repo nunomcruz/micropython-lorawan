@@ -490,7 +490,7 @@ lw.stats()
 
 `last_tx_dr`, `last_tx_freq`, and `last_tx_power` all default to 0 before the first uplink (`last_tx_fcnt_up == 0`). `last_tx_power` is in dBm EIRP, consistent with `tx_power()`.
 
-`last_tx_fcnt_up` mirrors the MAC FCntUp captured from the most recent **successful** `mcps_confirm`. It does not advance on failed uplinks, so after a string of failures the value can lag the live counter inside the MAC. A live `frame_counters()` getter (returning `(fcnt_up, fcnt_down)` from the live `MIB_NVM_CTXS` snapshot) is planned for Session 23.
+`last_tx_fcnt_up` mirrors the MAC FCntUp captured from the most recent **successful** `mcps_confirm`. It does not advance on failed uplinks, so after a string of failures the value can lag the live counter inside the MAC.
 
 ---
 
@@ -1208,31 +1208,9 @@ pins = tbeam.lora_pins(hw)         # (cs, irq, rst) or (cs, irq, rst, busy)
 
 ---
 
-## Project status
+## Standards compliance
 
-**v1.0.0.** Phase 1–5 of the roadmap are complete end-to-end on hardware:
-
-- Phase 1: T-Beam board definition (all variants, runtime auto-detect).
-- Phase 2: USER_C_MODULE skeleton.
-- Phase 3: ESP32 HAL (GPIO, SPI, timers, board).
-- Phase 4: OTAA/ABP, uplink/downlink, confirmed messages, ADR, NVS persistence.
-- Phase 5: runtime pin config, LoRaWAN 1.1, RX2 / TX-power / antenna-gain control, Class C, EU433, DeviceTimeReq, LinkCheckReq, ReJoin, Clock Sync package, Class B (beacon + ping slots), multicast (local and remote), fragmentation (FUOTA).
-
-See [TODO.md](TODO.md) for the development roadmap and per-session notes. See [CLAUDE.md](../CLAUDE.md) for project context including hardware constants and FreeRTOS pitfalls.
-
-## Roadmap (post-1.0)
-
-The v1.0.0 surface is stable, but a v1.0 review found a handful of consistency gaps and exposed Semtech features. Sessions 21–25 are tracked in [TODO.md](TODO.md):
-
-- **Session 21 — Error handling and diagnostics (v1.1.0).** All `RuntimeError("<api> failed")` sites replaced with `OSError(EIO, "<api>: status=N")` carrying the underlying `LoRaMacStatus_t` or `LoRaMacEventInfoStatus_t`. `lw.last_error()` returns a full diagnostic dict for post-mortem. `join_otaa()` timeout now raises `OSError(ETIMEDOUT, "join: last_status=N")`. Constructor auto-deinit tightened to avoid UAF on the previous object.
-- **Session 22 — API consistency (done).** Dropped deprecated `request_class` alias. Removed `network_time()` (use `synced_time()` or capture snapshot in `on_time_sync` callback). `recv()` now raises `RuntimeError` when `on_recv` is registered. Renamed `stats()["tx_counter"]` → `stats()["last_tx_fcnt_up"]`. Exported `DR_6` (SF7/250 kHz) and `DR_7` (FSK 50 kbps). `link_check()` gained `port` and `confirmed` kwargs.
-- **Session 23 — Expanded MIB getters/setters.** `nb_trans()` (cheapest reliability knob — multi-TX of unconfirmed uplinks), `channel_mask()`, live `frame_counters()`, `public_network()`, `rx_window_timing()`, `rx_clock_drift()`, `rejoin_cycle()`, `net_id()`. Wraps existing MAC state with no new MAC code.
-- **Session 24 — New MAC primitives (v1.3.0).** `tx_cw(freq, power, duration)` wraps `MLME_TXCW` for CW bench tests and FCC/CE pre-compliance. `compliance_enable()` registers `LmhpCompliance` (port 224) for LoRa Alliance certification testing — the package responds to DUT commands from the certification tool autonomously. `derive_mc_keys(addr, mc_key)` performs in-MAC multicast session key derivation so callers no longer need to plumb AES manually before `multicast_add()`. See "Standards compliance" below for certification notes.
-- **Session 25 — Additional regions.** Build-time opt-in for US915 / AU915 / AS923 / KR920 / IN865 / RU864 / CN470 / CN779. Region-aware dBm ↔ TX-power index conversion (today the EU868 table is hardcoded, so the `tx_power()` getter returns wrong dBm on EU433).
-
-### Standards compliance
-
-The `LmhpCompliance` package (port 224) required by the LoRa Alliance certification test suite is included as of v1.3.0. To enable it:
+The `LmhpCompliance` package (port 224) required by the LoRa Alliance certification test suite is registered on demand:
 
 ```python
 import lorawan
@@ -1246,7 +1224,24 @@ lw.compliance_enable()     # register port-224 DUT command handler
 
 The package handles: `PKG_VERSION_ANS`, `DUT_RESET`, `DUT_JOIN`, `SWITCH_CLASS`, `ADR_BIT_CHANGE`, `DUTY_CYCLE_CTRL`, `TX_PERIODICITY_CHANGE`, `TX_FRAMES_CTRL`, `ECHO_PAYLOAD`, `RX_APP_CNT`, `LINK_CHECK`, `DEVICE_TIME`, `PING_SLOT_INFO`, `BEACON_RX_STATUS_IND`, `TX_CW`, `DUT_FPORT_224_DISABLE`, and `DUT_VERSION`.
 
-> For full LoRa Alliance end-device certification, the test harness needs a gateway, a network server running the certification profile, and the official certification test tool. The firmware itself provides all required DUT-side protocol support.
+> Full LoRa Alliance end-device certification additionally needs a gateway, a network server running the certification profile, and the official certification test tool. The firmware itself provides all required DUT-side protocol support.
+
+## Project status
+
+**Stable — v1.4.0.** The Python API is frozen since v1.0.0; minor versions since have been additive. All major functionality is implemented and tested on hardware:
+
+- All T-Beam variants (v0.7 through v1.2 and the 433 MHz edition) auto-detected at boot — single firmware image.
+- OTAA and ABP join (LoRaWAN 1.0.4 and 1.1).
+- Class A, Class B (beacons + ping slots) and Class C.
+- Confirmed and unconfirmed uplinks/downlinks, ADR, NVS session persistence, lifecycle (`deinit`, soft-reset safe, context manager).
+- MAC commands: DeviceTimeReq, LinkCheckReq, ReJoin, TXCW, DevStatusAns (with `battery_level`).
+- Application packages: Clock Sync (port 202), Remote Multicast Setup (port 200), Fragmentation / FUOTA (port 201), Compliance (port 224).
+- Multicast — local and remote provisioning, up to 4 groups, Class B and Class C reception.
+- All 10 LoRaWAN regions (build-time opt-in beyond the EU868 default).
+- Continuous-wave transmission (`tx_cw`) for SWR checks and FCC/CE pre-compliance scans.
+- Typed exceptions throughout; `last_error()` accessor for post-mortem diagnostics.
+
+For the full development history and version-by-version changes, see [CHANGELOG.md](CHANGELOG.md). For project context, hardware constants and FreeRTOS pitfalls encountered during the port, see [CLAUDE.md](../CLAUDE.md).
 
 ## Architecture
 

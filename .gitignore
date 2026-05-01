@@ -38,3 +38,6 @@ CLAUDE.md
 # Flasher binaries (live on gh-pages branch only)
 flasher/*.bin
 .mpy-workbench/tree-paths.json
+
+# LoRaWAN regression tests — kept locally, not published
+lorawan-module/tests/
