@@ -66,7 +66,7 @@ Most T-Beams come with a passive patch antenna connected via U.FL. If you are us
 
 ### Power
 
-USB-C (or micro-USB on v0.7) powers the MCU and charges the 18650 cell. For deep-sleep sensor nodes, insert a charged 18650 and rely on the PMU to maintain the radio between wakeups.
+Micro-USB powers the MCU and charges the 18650 cell. For deep-sleep sensor nodes, insert a charged 18650 and rely on the PMU to maintain the radio between wakeups.
 
 ### Registering the device on The Things Network
 
