@@ -5,6 +5,25 @@ MicroPython + LoRaWAN (T-Beam)
 
 Fork of [MicroPython](https://micropython.org/) v1.29.0-preview with a full LoRaWAN MAC stack for LILYGO TTGO T-Beam boards.
 
+## Contents
+
+- [What this fork adds](#what-this-fork-adds)
+- [Supported hardware](#supported-hardware)
+- [Hardware setup](#hardware-setup)
+- [Build](#build)
+- [Quick start](#quick-start)
+- [API reference](#api-reference) — see the [Method index](#method-index) for every `LoRaWAN` method
+- [Usage patterns](#usage-patterns)
+- [Raw LoRa — `tbeam` module](#raw-lora--tbeam-module) — see the [Function index](#function-index)
+- [Hardware notes (confirmed on device)](#hardware-notes-confirmed-on-device)
+- [Standards compliance](#standards-compliance)
+- [Project status](#project-status)
+- [Architecture](#architecture)
+- [Implementation notes](#implementation-notes)
+- [Releasing](#releasing)
+- [Related repositories](#related-repositories)
+- [License](#license)
+
 ## What this fork adds
 
 A `USER_C_MODULE` that wraps [Semtech LoRaMAC-node v4.7.0](https://github.com/Lora-net/LoRaMac-node/tree/v4.7.0), providing:
