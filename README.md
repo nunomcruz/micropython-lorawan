@@ -186,6 +186,84 @@ Ready-made scripts live in [`lorawan-module/examples/`](lorawan-module/examples/
 
 ## API reference
 
+### Method index
+
+Quick reference — every method on the `LoRaWAN` instance plus the module-level functions of `lorawan`, with full signatures. Click the section name for details and examples.
+
+| Method | Description |
+|---|---|
+| **[Join](#join)** | |
+| `lw.join_otaa(dev_eui, join_eui, app_key, *, timeout=30, nwk_key=None)` | OTAA join (LoRaWAN 1.0.x or 1.1) |
+| `lw.join_abp(dev_addr, nwk_s_key, app_s_key)` | ABP activation with pre-provisioned session |
+| `lw.joined()` → `bool` | Whether the device is currently joined |
+| **[Uplink](#uplink)** | |
+| `lw.send(data, *, port=1, confirmed=False, datarate=lorawan.DR_0, timeout=120)` | Send an uplink frame |
+| `lw.on_send_done(callback)` / `lw.on_send_done(None)` | Register / clear async TX-done callback |
+| **[Downlink](#downlink)** | |
+| `lw.recv(*, timeout=10)` → `(bytes, int, int, int, bool) \| None` | Block waiting for a downlink |
+| `lw.on_recv(callback)` / `lw.on_recv(None)` | Register / clear async RX callback |
+| **[Configuration](#configuration)** | |
+| `lw.datarate([dr])` → `int \| None` | Get/set default DR for uplinks |
+| `lw.adr([enabled])` → `bool \| None` | Get/set ADR (Adaptive Data Rate) |
+| `lw.tx_power([dbm])` → `int \| None` | Get/set TX power in dBm EIRP |
+| `lw.antenna_gain([gain])` → `float \| None` | Get/set antenna gain in dBi |
+| `lw.battery_level([level])` → `int \| None` | Get/set DevStatus battery level (0–255) |
+| `lw.stats()` → `dict` | Snapshot of last RX/TX RSSI, SNR, counters, ToA |
+| **[Duty cycle](#duty-cycle)** | |
+| `lw.duty_cycle([enabled])` → `bool \| None` | Get/set MAC duty-cycle enforcement |
+| `lw.time_until_tx()` → `int` | ms until the next allowed TX |
+| **[Persistence](#persistence)** | |
+| `lw.nvram_save()` | Persist DevNonce, FCntUp and session keys to NVS |
+| `lw.nvram_restore()` | Restore session from NVS (call before `join_*` on every boot) |
+| **[Device class](#device-class-a--b--c)** | |
+| `lw.device_class([cls])` → `int \| None` | Get/set LoRaWAN device class A/B/C |
+| `lw.on_class_change(callback)` / `lw.on_class_change(None)` | Register / clear class-switch callback |
+| **[Class B](#class-b-beacon-tracking)** | |
+| `lw.ping_slot_periodicity([n])` → `int \| None` | Get/set ping slot periodicity (0=128 s … 7=1 s) |
+| `lw.on_beacon(callback)` / `lw.on_beacon(None)` | Register / clear beacon-event callback |
+| `lw.beacon_state()` → `dict \| None` | Last beacon RX info (state, time, freq, RSSI, SNR) |
+| **[Time synchronisation](#time-synchronisation)** | |
+| `lw.request_device_time()` | Request server time via MLME DeviceTimeReq |
+| `lw.synced_time()` → `int \| None` | GPS epoch seconds from the last time sync |
+| `lw.on_time_sync(callback)` / `lw.on_time_sync(None)` | Register / clear time-sync callback |
+| `lw.clock_sync_enable()` → `bool` | Enable Clock Sync application package (port 202) |
+| `lw.clock_sync_request(*, datarate=None)` | Send AppTimeReq via Clock Sync package |
+| **[Link quality](#link-quality)** | |
+| `lw.link_check(*, send_now=False, datarate=None, port=1, confirmed=False)` → `dict \| None` | Send LinkCheckReq, return margin / gateway count |
+| **[LoRaWAN 1.1 rejoin](#lorawan-11-rejoin)** | |
+| `lw.rejoin(type=0)` | Send a Rejoin frame (type 0/1/2) |
+| **[Channel management](#channel-management)** | |
+| `lw.add_channel(index, frequency, dr_min, dr_max)` | Add a custom channel |
+| `lw.remove_channel(index)` | Remove a custom channel |
+| `lw.channels()` → `list[dict]` | List active channels |
+| **[Multicast](#multicast)** | |
+| `lw.multicast_add(group, addr, mc_nwk_s_key, mc_app_s_key, *, f_count_min=0, f_count_max=0xFFFFFFFF)` → `int` | Provision a multicast group |
+| `lw.multicast_rx_params(group, device_class, frequency, datarate, *, periodicity=0)` | Configure multicast RX parameters (Class B / C) |
+| `lw.multicast_remove(group)` | Remove a multicast group |
+| `lw.multicast_list()` → `list[dict]` | List provisioned multicast groups |
+| `lw.remote_multicast_enable()` → `bool` | Enable Remote Multicast Setup package (port 200) |
+| `lw.derive_mc_keys(addr, mc_root_key, *, group=0)` → `(nwk_s_key, app_s_key)` | Derive McNwkSKey / McAppSKey from McRootKey |
+| **[Fragmentation (FUOTA)](#fragmentation-fuota)** | |
+| `lw.fragmentation_enable(buffer_size, *, on_progress=None, on_done=None)` | Enable Fragmented Data Block transport (port 201) |
+| `lw.fragmentation_data()` → `bytes \| None` | Reassembled buffer once transfer completes |
+| **[Advanced MIB parameters](#advanced-mib-parameters)** | |
+| `lw.nb_trans([n])` → `int \| None` | Get/set unconfirmed-uplink retransmission count |
+| `lw.public_network([enabled])` → `bool \| None` | Get/set public-network sync word |
+| `lw.net_id([value])` → `int \| None` | Get/set NetID |
+| `lw.channel_mask([mask], *, default=False)` → `int \| tuple[int, int] \| None` | Get/set channels mask |
+| `lw.rx_clock_drift(*, max_rx_error_ms=None, min_rx_symbols=None)` → `dict \| None` | Tune RX-window timing tolerance |
+| `lw.rx_window_timing(*, rx1_delay_ms=None, rx2_delay_ms=None, join_accept_delay_1_ms=None, join_accept_delay_2_ms=None, max_rx_window_duration_ms=None)` → `dict \| None` | Tune RX1 / RX2 / Join-accept delays |
+| `lw.rejoin_cycle(type, [cycle_seconds])` → `int \| None` | Get/set periodic Rejoin interval (LoRaWAN 1.1) |
+| **[Diagnostics](#diagnostics)** | |
+| `lw.frame_counters()` → `dict` | Current FCntUp / FCntDown values |
+| `lw.last_error()` → `dict \| None` | Last MAC / radio error info |
+| **[Lifecycle](#lifecycle)** | |
+| `lw.deinit()` | Tear down the LoRaWAN task and release SPI / NVS |
+| **[Module-level](#module-level)** | |
+| `lorawan.LoRaWAN(region, **kwargs)` | Create and initialise the LoRaWAN stack |
+| `lorawan.version()` → `str` | Module version string |
+| `lorawan.test_hal()` → `dict` | Run a HAL self-test (radio, SPI, IRQ, BUSY) |
+
 ### `lorawan.LoRaWAN(region, **kwargs)`
 
 Creates and initialises the LoRaWAN stack. Only one instance may exist at a time; reset the board to create a new one.
@@ -1220,6 +1298,20 @@ lw = lorawan.LoRaWAN(
 The frozen `tbeam` module provides hardware auto-detection and access to the raw LoRa physical layer (MicroPython's `lora-sx127x` / `lora-sx126x` drivers). This is **completely separate** from the LoRaWAN MAC stack — no join, no frame counters, just raw RF packets.
 
 > **Important:** `tbeam.lora_modem()` and `lorawan.LoRaWAN()` both own the SPI bus and the radio hardware. They are mutually exclusive — do not use both at the same time. Reset the board to switch between them.
+
+### Function index
+
+| Function | Description |
+|---|---|
+| **[Hardware detection](#hardware-detection)** | |
+| `tbeam.detect()` → `HardwareInfo` | Probe SPI / I2C / UART, return detected hardware |
+| **[Raw LoRa TX/RX](#raw-lora-txrx)** | |
+| `tbeam.lora_modem(hw)` → `SyncModem` | Create raw `lora-sx127x` / `lora-sx126x` modem |
+| **[Other helpers](#other-tbeam-helpers)** | |
+| `tbeam.gps_uart(hw)` → `machine.UART` | UART pre-configured for the on-board GPS |
+| `tbeam.i2c_bus()` → `machine.I2C` | Hardware I2C at 400 kHz on SDA=21, SCL=22 |
+| `tbeam.lora_spi(baudrate=10_000_000)` → `machine.SPI` | SPI bus configured for the LoRa radio |
+| `tbeam.lora_pins(hw)` → `tuple` | `(cs, irq, rst)` for SX1276 or `(cs, irq, rst, busy)` for SX1262 |
 
 ### Hardware detection
 
