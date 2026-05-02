@@ -14,7 +14,7 @@ Fork of [MicroPython](https://micropython.org/) v1.29.0-preview with a full LoRa
 - [Quick start](#quick-start)
 - [API reference](#api-reference) — see the [Method index](#method-index) for every `LoRaWAN` method
 - [Usage patterns](#usage-patterns)
-- [Raw LoRa — `tbeam` module](#raw-lora--tbeam-module) — see the [Function index](#function-index)
+- [Raw LoRa (`tbeam` module)](#raw-lora-tbeam-module) — see the [Function index](#function-index)
 - [Hardware notes (confirmed on device)](#hardware-notes-confirmed-on-device)
 - [Standards compliance](#standards-compliance)
 - [Project status](#project-status)
@@ -234,7 +234,7 @@ Quick reference — every method on the `LoRaWAN` instance plus the module-level
 | **[Persistence](#persistence)** | |
 | `lw.nvram_save()` | Persist DevNonce, FCntUp and session keys to NVS |
 | `lw.nvram_restore()` | Restore session from NVS (call before `join_*` on every boot) |
-| **[Device class](#device-class-a--b--c)** | |
+| **[Device class](#device-class)** | |
 | `lw.device_class([cls])` → `int \| None` | Get/set LoRaWAN device class A/B/C |
 | `lw.on_class_change(callback)` / `lw.on_class_change(None)` | Register / clear class-switch callback |
 | **[Class B](#class-b-beacon-tracking)** | |
@@ -658,7 +658,7 @@ Restores a previously saved session from NVS. Raises `OSError(ENOENT)` if no ses
 
 ---
 
-### Device class (A / B / C)
+### Device class
 
 #### `lw.device_class([cls])` → `int | None`
 
@@ -1312,7 +1312,7 @@ lw = lorawan.LoRaWAN(
 
 ---
 
-## Raw LoRa — `tbeam` module
+## Raw LoRa (`tbeam` module)
 
 The frozen `tbeam` module provides hardware auto-detection and access to the raw LoRa physical layer (MicroPython's `lora-sx127x` / `lora-sx126x` drivers). This is **completely separate** from the LoRaWAN MAC stack — no join, no frame counters, just raw RF packets.
 
