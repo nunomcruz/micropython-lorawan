@@ -74,7 +74,7 @@ Micro-USB powers the MCU and charges the 18650 cell. For deep-sleep sensor nodes
 2. Add an **end device** → "Enter end device specifics manually".
    - Frequency plan: `Europe 863–870 MHz (SF9 for RX2 — recommended)` — this is what the default `rx2_datarate=DR_3` corresponds to.
    - LoRaWAN version: `MAC V1.0.4` (or `MAC V1.1` if you passed `lorawan_version=lorawan.V1_1`).
-   - Regional Parameters version: `RP002 Regional Parameters 1.0.3 revision A` (or whichever the console recommends for your MAC version).
+   - Regional Parameters version: `RP002 Regional Parameters 1.0.4` (or whichever the console recommends for your MAC version).
 3. Activation mode: **OTAA** (recommended). TTN will generate the JoinEUI, DevEUI and AppKey — copy these into your script.
 4. After your first successful uplink the device status on TTN switches from *Never seen* to *Connected*. Send a downlink from the **Messaging → Downlink** tab to verify the RX path.
 
