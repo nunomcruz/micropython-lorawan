@@ -898,7 +898,85 @@ Returns the reassembled buffer (full size — slice down to the `size` reported 
 
 ---
 
+### Advanced MIB parameters
+
+Thin wrappers over LoRaMAC-node's MIB. Most users won't need these — the defaults match the LoRaWAN spec and TTN. Useful for tuning reliability (`nb_trans`), running on private networks (`public_network`), recovering from RTC drift after deepsleep (`rx_clock_drift`), and diagnostics.
+
+#### `lw.nb_trans([n])` → `int | None`
+
+Per-uplink retransmission count (1..15) for unconfirmed frames. The MAC default is 1; ADR may also raise this via `LinkADRReq`. Higher values trade airtime for reliability when ADR cannot raise output power (e.g. already at region max). Wraps `MIB_CHANNELS_NB_TRANS`.
+
+```python
+lw.nb_trans()       # → 1
+lw.nb_trans(3)      # send each unconfirmed uplink up to 3×
+```
+
+#### `lw.public_network([enabled])` → `bool | None`
+
+Selects the LoRa sync word: `True` (default) for public networks (TTN, ChirpStack, Helium), `False` (sync word `0x12`) for private deployments. Toggling re-arms the radio so the new sync word applies to the next RX/TX cycle. Wraps `MIB_PUBLIC_NETWORK`.
+
+```python
+lw.public_network()        # → True
+lw.public_network(False)   # private LoRaWAN (sync word 0x12)
+```
+
+#### `lw.net_id([value])` → `int | None`
+
+24-bit network identifier (`0..0xFFFFFF`). After OTAA this reflects the JoinAccept's NetID. The setter is meant for ABP, where the value is otherwise zero; setting it on an OTAA session has no effect once the network has assigned its own. Wraps `MIB_NET_ID`.
+
+#### `lw.channel_mask([mask], *, default=False)` → `int | tuple[int, int] | None`
+
+16-bit bitmask of enabled channels (bit `i` = channel `i`). EU868 default is `0x0007` (channels 0..2). Pass `default=True` to also update `MIB_CHANNELS_DEFAULT_MASK` so a subsequent `ResetMacParameters` does not reinstate the region default. Getter with `default=True` returns `(current, default)`.
+
+```python
+lw.channel_mask()              # → 0x0007
+lw.channel_mask(default=True)  # → (0x0007, 0x0007)
+lw.channel_mask(0x00FF)        # enable channels 0..7
+```
+
+#### `lw.rx_clock_drift(*, max_rx_error_ms=None, min_rx_symbols=None)` → `dict | None`
+
+Tolerances for RX1/RX2 window timing. Useful after long deepsleep when the RTC has drifted relative to the gateway. Getter (no kwargs) returns `{max_rx_error_ms, min_rx_symbols}`; setter applies only the kwargs that were passed.
+
+| Field | Description |
+|-------|-------------|
+| `max_rx_error_ms` | wall-clock drift the MAC tolerates when timing the RX windows (the window opens earlier and stays longer to compensate). Wraps `MIB_SYSTEM_MAX_RX_ERROR`. |
+| `min_rx_symbols` | radio's preamble-detect symbol count (1..255). Higher = more tolerant of slow gateways at the cost of receiver power. Wraps `MIB_MIN_RX_SYMBOLS`. |
+
+```python
+# After waking from a 30-minute deepsleep with no RTC sync:
+lw.rx_clock_drift(max_rx_error_ms=200)
+```
+
+#### `lw.rx_window_timing(*, rx1_delay_ms=None, rx2_delay_ms=None, join_accept_delay_1_ms=None, join_accept_delay_2_ms=None, max_rx_window_duration_ms=None)` → `dict | None`
+
+RX/Join-accept delay timings, all in milliseconds. LoRaWAN-spec defaults are RX1 1000 ms, RX2 2000 ms, JA1 5000 ms, JA2 6000 ms. The network overrides RX1/RX2 via the JoinAccept; setting them is mainly useful for ABP or for matching a private-network gateway with non-standard timing. Wraps `MIB_RECEIVE_DELAY_1/2`, `MIB_JOIN_ACCEPT_DELAY_1/2`, `MIB_MAX_RX_WINDOW_DURATION`. Getter returns a dict with all five fields.
+
+#### `lw.rejoin_cycle(type, [cycle_seconds])` → `int | None`
+
+LoRaWAN 1.1 periodic rejoin cycles. `type` is `0` (Type 0 rejoin — roaming/keep-alive context) or `1` (Type 1 — full re-keying with new JoinNonce). Cycle in seconds. Wraps `MIB_REJOIN_0_CYCLE` and `MIB_REJOIN_1_CYCLE`.
+
+> **Note:** LoRaMAC-node v4.7.0 documents a `MIB_REJOIN_2_CYCLE` but does not include it in the actual `MibParamType` enum. `type=2` is rejected with `ValueError`.
+
+```python
+lw.rejoin_cycle(0)              # → current Type 0 cycle in seconds
+lw.rejoin_cycle(0, 86400)       # rejoin every 24 h
+```
+
 ### Diagnostics
+
+#### `lw.frame_counters()` → `dict`
+
+Live snapshot of the frame counters from the Crypto NVM context. Returns `{fcnt_up, fcnt_down, n_fcnt_down, a_fcnt_down}`. LoRaMAC-node v4.7.0 exposes no direct MIB getter for these — this reads `MIB_NVM_CTXS` and copies the relevant fields out.
+
+| Field | Description |
+|-------|-------------|
+| `fcnt_up` | uplink counter to be sent in the next frame |
+| `fcnt_down` | single downlink counter (1.0.x) |
+| `n_fcnt_down` | network-frame downlink counter (LoRaWAN 1.1) |
+| `a_fcnt_down` | application-frame downlink counter (LoRaWAN 1.1) |
+
+Useful for diagnosing dessynchronisation with the network. `stats()["last_tx_fcnt_up"]` is cached at TX time; `frame_counters()["fcnt_up"]` is the live MAC value.
 
 #### `lw.last_error()` → `dict | None`
 
@@ -1232,7 +1310,7 @@ The package handles: `PKG_VERSION_ANS`, `DUT_RESET`, `DUT_JOIN`, `SWITCH_CLASS`,
 
 ## Project status
 
-**Stable — v1.4.0.** The Python API is frozen since v1.0.0; minor versions since have been additive. All major functionality is implemented and tested on hardware:
+**Stable — v1.5.0.** The Python API is frozen since v1.0.0; minor versions since have been additive. All major functionality is implemented and tested on hardware:
 
 - All T-Beam variants (v0.7 through v1.2 and the 433 MHz edition) auto-detected at boot — single firmware image.
 - OTAA and ABP join (LoRaWAN 1.0.4 and 1.1).
@@ -1244,6 +1322,7 @@ The package handles: `PKG_VERSION_ANS`, `DUT_RESET`, `DUT_JOIN`, `SWITCH_CLASS`,
 - All 10 LoRaWAN regions (build-time opt-in beyond the EU868 default).
 - Continuous-wave transmission (`tx_cw`) for SWR checks and FCC/CE pre-compliance scans.
 - Typed exceptions throughout; `last_error()` accessor for post-mortem diagnostics.
+- Advanced MIB tuning: `nb_trans`, `public_network`, `net_id`, `channel_mask`, `rx_clock_drift`, `rx_window_timing`, `rejoin_cycle`, `frame_counters`.
 
 For the full development history and version-by-version changes, see [CHANGELOG.md](CHANGELOG.md).
 

@@ -164,6 +164,15 @@ typedef enum {
 #define LW_QUERY_DEV_ADDR        0
 #define LW_QUERY_MAX_PAYLOAD_LEN 1
 #define LW_QUERY_CHANNELS        2
+#define LW_QUERY_NB_TRANS         3
+#define LW_QUERY_PUBLIC_NETWORK   4
+#define LW_QUERY_NET_ID           5
+#define LW_QUERY_CHANNEL_MASK     6
+#define LW_QUERY_RX_CLOCK_DRIFT   7
+#define LW_QUERY_RX_WINDOW_TIMING 8
+#define LW_QUERY_REJOIN_CYCLE_0   9
+#define LW_QUERY_REJOIN_CYCLE_1   10
+#define LW_QUERY_FRAME_COUNTERS   11
 
 // EU868 / EU433 have at most 16 channels (one mask word). Other dynamic-channel
 // regions also fit in 16. Fixed-plan regions (US915, AU915) do not use these APIs.
@@ -230,17 +239,69 @@ typedef struct {
     bool     confirmed;
 } cmd_tx_t;
 
-// set_params.type: 0=ADR, 1=DR, 2=TX_POWER, 3=ANTENNA_GAIN, 4=DUTY_CYCLE
+// Multi-field setter payloads (used by cmd_set_params_t variants 8..11).
+// `which_set` is a bitmask: only the marked fields are pushed to the MAC,
+// the rest are left at their current MIB value. Lets Python callers update
+// one field of a multi-field MIB without first reading-then-writing.
+typedef struct {
+    uint16_t mask;
+    bool     set_default;     // also update MIB_CHANNELS_DEFAULT_MASK
+} cmd_channel_mask_t;
+
+typedef struct {
+    uint32_t max_rx_error_ms;
+    uint8_t  min_rx_symbols;
+    uint8_t  which_set;       // bit0=err, bit1=sym
+} cmd_rx_clock_drift_t;
+
+typedef struct {
+    uint32_t rx1_delay_ms;
+    uint32_t rx2_delay_ms;
+    uint32_t join_accept_delay_1_ms;
+    uint32_t join_accept_delay_2_ms;
+    uint32_t max_rx_window_duration_ms;
+    uint8_t  which_set;       // bit0..bit4 in field order above
+} cmd_rx_window_timing_t;
+
+typedef struct {
+    uint8_t  rejoin_type;     // 0, 1 or 2
+    uint32_t cycle_seconds;
+} cmd_rejoin_cycle_t;
+
+// set_params.type:
+//   0=ADR, 1=DR, 2=TX_POWER, 3=ANTENNA_GAIN, 4=DUTY_CYCLE,
+//   5=NB_TRANS, 6=PUBLIC_NETWORK, 7=NET_ID,
+//   8=CHANNEL_MASK, 9=RX_CLOCK_DRIFT, 10=RX_WINDOW_TIMING, 11=REJOIN_CYCLE
 typedef struct {
     uint8_t type;
     union {
-        bool   adr;
-        int8_t dr;
-        int8_t tx_power;
-        float  antenna_gain;
-        bool   duty_cycle;
+        bool     adr;
+        int8_t   dr;
+        int8_t   tx_power;
+        float    antenna_gain;
+        bool     duty_cycle;
+        uint8_t  nb_trans;
+        bool     public_network;
+        uint32_t net_id;
+        cmd_channel_mask_t      channel_mask;
+        cmd_rx_clock_drift_t    rx_clock_drift;
+        cmd_rx_window_timing_t  rx_window_timing;
+        cmd_rejoin_cycle_t      rejoin_cycle;
     };
 } cmd_set_params_t;
+
+#define SET_PARAMS_ADR              0
+#define SET_PARAMS_DR               1
+#define SET_PARAMS_TX_POWER         2
+#define SET_PARAMS_ANTENNA_GAIN     3
+#define SET_PARAMS_DUTY_CYCLE       4
+#define SET_PARAMS_NB_TRANS         5
+#define SET_PARAMS_PUBLIC_NETWORK   6
+#define SET_PARAMS_NET_ID           7
+#define SET_PARAMS_CHANNEL_MASK     8
+#define SET_PARAMS_RX_CLOCK_DRIFT   9
+#define SET_PARAMS_RX_WINDOW_TIMING 10
+#define SET_PARAMS_REJOIN_CYCLE     11
 
 typedef struct {
     lorawan_cmd_t cmd;
@@ -432,6 +493,23 @@ static uint32_t        s_query_dev_addr;
 static uint8_t         s_query_max_payload_len;
 static ChannelParams_t s_query_channels[LW_MAX_CHANNELS];
 static uint16_t        s_query_channels_mask;
+static uint8_t         s_query_nb_trans;
+static bool            s_query_public_network;
+static uint32_t        s_query_net_id;
+static uint16_t        s_query_channel_mask_current;
+static uint16_t        s_query_channel_mask_default;
+static uint32_t        s_query_max_rx_error_ms;
+static uint8_t         s_query_min_rx_symbols;
+static uint32_t        s_query_rx1_delay_ms;
+static uint32_t        s_query_rx2_delay_ms;
+static uint32_t        s_query_join_accept_delay_1_ms;
+static uint32_t        s_query_join_accept_delay_2_ms;
+static uint32_t        s_query_max_rx_window_duration_ms;
+static uint32_t        s_query_rejoin_cycle_seconds;
+static uint32_t        s_query_fcnt_up;
+static uint32_t        s_query_fcnt_down;
+static uint32_t        s_query_n_fcnt_down;
+static uint32_t        s_query_a_fcnt_down;
 
 // CMD_DERIVE_MC_KEYS result statics. Same lifecycle as s_query_*: written by
 // the LoRaWAN task before EVT_COMPLETED, read by Python after send_cmd_wait.
@@ -1549,26 +1627,27 @@ static void lorawan_task(void *arg) {
 
             case CMD_SET_PARAMS: {
                 switch (cmd.set_params.type) {
-                case 0: // ADR
+                case SET_PARAMS_ADR:
                     mib.Type = MIB_ADR;
                     mib.Param.AdrEnable = cmd.set_params.adr;
                     LoRaMacMibSetRequestConfirm(&mib);
                     if (s_lora_obj) s_lora_obj->adr_enabled = cmd.set_params.adr;
                     break;
-                case 1: // Datarate
+                case SET_PARAMS_DR:
                     mib.Type = MIB_CHANNELS_DATARATE;
                     mib.Param.ChannelsDatarate = cmd.set_params.dr;
                     LoRaMacMibSetRequestConfirm(&mib);
                     if (s_lora_obj) s_lora_obj->channels_datarate = cmd.set_params.dr;
                     break;
-                case 2: // TX power
+                case SET_PARAMS_TX_POWER:
                     mib.Type = MIB_CHANNELS_TX_POWER;
                     mib.Param.ChannelsTxPower = cmd.set_params.tx_power;
                     LoRaMacMibSetRequestConfirm(&mib);
                     if (s_lora_obj) s_lora_obj->channels_tx_power = cmd.set_params.tx_power;
                     break;
-                case 3: // Antenna gain (current + default, so a subsequent
-                        // ResetMacParameters doesn't restore the region default)
+                case SET_PARAMS_ANTENNA_GAIN:
+                    // Antenna gain (current + default, so a subsequent
+                    // ResetMacParameters doesn't restore the region default).
                     mib.Type = MIB_ANTENNA_GAIN;
                     mib.Param.AntennaGain = cmd.set_params.antenna_gain;
                     LoRaMacMibSetRequestConfirm(&mib);
@@ -1577,14 +1656,111 @@ static void lorawan_task(void *arg) {
                     LoRaMacMibSetRequestConfirm(&mib);
                     if (s_lora_obj) s_lora_obj->antenna_gain = cmd.set_params.antenna_gain;
                     break;
-                case 4: // Duty cycle on/off. LoRaMAC-node v4.7.0 has no MIB for
-                        // this; the only public entry point is the test API,
-                        // named "Test" because disabling duty cycle is non-
-                        // conformant on public ISM bands. Exposed here for
-                        // bench testing on private gateways.
+                case SET_PARAMS_DUTY_CYCLE:
+                    // Duty cycle on/off. LoRaMAC-node v4.7.0 has no MIB for
+                    // this; the only public entry point is the test API,
+                    // named "Test" because disabling duty cycle is non-
+                    // conformant on public ISM bands. Exposed here for
+                    // bench testing on private gateways.
                     LoRaMacTestSetDutyCycleOn(cmd.set_params.duty_cycle);
                     if (s_lora_obj) s_lora_obj->duty_cycle_enabled = cmd.set_params.duty_cycle;
                     break;
+                case SET_PARAMS_NB_TRANS:
+                    // Per-uplink retransmission count (1..15). Cheapest
+                    // reliability knob: ADR may also bump this via LinkADRReq.
+                    mib.Type = MIB_CHANNELS_NB_TRANS;
+                    mib.Param.ChannelsNbTrans = cmd.set_params.nb_trans;
+                    LoRaMacMibSetRequestConfirm(&mib);
+                    break;
+                case SET_PARAMS_PUBLIC_NETWORK:
+                    // Sync word: public networks (TTN etc.) use 0x34, private
+                    // 0x12. Toggling re-arms the radio with the new sync word
+                    // so the change applies to the next RX/TX.
+                    mib.Type = MIB_PUBLIC_NETWORK;
+                    mib.Param.EnablePublicNetwork = cmd.set_params.public_network;
+                    LoRaMacMibSetRequestConfirm(&mib);
+                    break;
+                case SET_PARAMS_NET_ID:
+                    // 24-bit NetID. ABP-only setting in LoRaMAC-node; OTAA
+                    // overrides it from the JoinAccept. The MIB silently
+                    // accepts the full uint32; only bits 0..23 are meaningful.
+                    mib.Type = MIB_NET_ID;
+                    mib.Param.NetID = cmd.set_params.net_id;
+                    LoRaMacMibSetRequestConfirm(&mib);
+                    break;
+                case SET_PARAMS_CHANNEL_MASK: {
+                    uint16_t mask = cmd.set_params.channel_mask.mask;
+                    mib.Type = MIB_CHANNELS_MASK;
+                    mib.Param.ChannelsMask = &mask;
+                    LoRaMacMibSetRequestConfirm(&mib);
+                    if (cmd.set_params.channel_mask.set_default) {
+                        mib.Type = MIB_CHANNELS_DEFAULT_MASK;
+                        mib.Param.ChannelsDefaultMask = &mask;
+                        LoRaMacMibSetRequestConfirm(&mib);
+                    }
+                    break;
+                }
+                case SET_PARAMS_RX_CLOCK_DRIFT: {
+                    cmd_rx_clock_drift_t *p = &cmd.set_params.rx_clock_drift;
+                    if (p->which_set & 0x01) {
+                        mib.Type = MIB_SYSTEM_MAX_RX_ERROR;
+                        mib.Param.SystemMaxRxError = p->max_rx_error_ms;
+                        LoRaMacMibSetRequestConfirm(&mib);
+                    }
+                    if (p->which_set & 0x02) {
+                        mib.Type = MIB_MIN_RX_SYMBOLS;
+                        mib.Param.MinRxSymbols = p->min_rx_symbols;
+                        LoRaMacMibSetRequestConfirm(&mib);
+                    }
+                    break;
+                }
+                case SET_PARAMS_RX_WINDOW_TIMING: {
+                    cmd_rx_window_timing_t *p = &cmd.set_params.rx_window_timing;
+                    if (p->which_set & 0x01) {
+                        mib.Type = MIB_RECEIVE_DELAY_1;
+                        mib.Param.ReceiveDelay1 = p->rx1_delay_ms;
+                        LoRaMacMibSetRequestConfirm(&mib);
+                    }
+                    if (p->which_set & 0x02) {
+                        mib.Type = MIB_RECEIVE_DELAY_2;
+                        mib.Param.ReceiveDelay2 = p->rx2_delay_ms;
+                        LoRaMacMibSetRequestConfirm(&mib);
+                    }
+                    if (p->which_set & 0x04) {
+                        mib.Type = MIB_JOIN_ACCEPT_DELAY_1;
+                        mib.Param.JoinAcceptDelay1 = p->join_accept_delay_1_ms;
+                        LoRaMacMibSetRequestConfirm(&mib);
+                    }
+                    if (p->which_set & 0x08) {
+                        mib.Type = MIB_JOIN_ACCEPT_DELAY_2;
+                        mib.Param.JoinAcceptDelay2 = p->join_accept_delay_2_ms;
+                        LoRaMacMibSetRequestConfirm(&mib);
+                    }
+                    if (p->which_set & 0x10) {
+                        mib.Type = MIB_MAX_RX_WINDOW_DURATION;
+                        mib.Param.MaxRxWindow = p->max_rx_window_duration_ms;
+                        LoRaMacMibSetRequestConfirm(&mib);
+                    }
+                    break;
+                }
+                case SET_PARAMS_REJOIN_CYCLE: {
+                    cmd_rejoin_cycle_t *p = &cmd.set_params.rejoin_cycle;
+                    // LoRaMAC-node v4.7.0 defines only MIB_REJOIN_0_CYCLE and
+                    // MIB_REJOIN_1_CYCLE in MibParamType (LoRaMac.h:1831/1835).
+                    // The header documentation also lists MIB_REJOIN_2_CYCLE
+                    // but it is not in the enum — type=2 is rejected at the
+                    // Python wrapper level.
+                    if (p->rejoin_type == 0) {
+                        mib.Type = MIB_REJOIN_0_CYCLE;
+                        mib.Param.Rejoin0CycleInSec = p->cycle_seconds;
+                        LoRaMacMibSetRequestConfirm(&mib);
+                    } else if (p->rejoin_type == 1) {
+                        mib.Type = MIB_REJOIN_1_CYCLE;
+                        mib.Param.Rejoin1CycleInSec = p->cycle_seconds;
+                        LoRaMacMibSetRequestConfirm(&mib);
+                    }
+                    break;
+                }
                 default:
                     break;
                 }
@@ -2108,6 +2284,125 @@ static void lorawan_task(void *arg) {
                     if (LoRaMacMibGetRequestConfirm(&ch_mib) == LORAMAC_STATUS_OK
                         && ch_mib.Param.ChannelsMask != NULL) {
                         s_query_channels_mask = ch_mib.Param.ChannelsMask[0];
+                    }
+                    break;
+                }
+                case LW_QUERY_NB_TRANS: {
+                    s_query_nb_trans = 0;
+                    mib.Type = MIB_CHANNELS_NB_TRANS;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK) {
+                        s_query_nb_trans = mib.Param.ChannelsNbTrans;
+                    }
+                    break;
+                }
+                case LW_QUERY_PUBLIC_NETWORK: {
+                    s_query_public_network = false;
+                    mib.Type = MIB_PUBLIC_NETWORK;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK) {
+                        s_query_public_network = mib.Param.EnablePublicNetwork;
+                    }
+                    break;
+                }
+                case LW_QUERY_NET_ID: {
+                    s_query_net_id = 0;
+                    mib.Type = MIB_NET_ID;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK) {
+                        s_query_net_id = mib.Param.NetID;
+                    }
+                    break;
+                }
+                case LW_QUERY_CHANNEL_MASK: {
+                    s_query_channel_mask_current = 0;
+                    s_query_channel_mask_default = 0;
+                    mib.Type = MIB_CHANNELS_MASK;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK
+                        && mib.Param.ChannelsMask != NULL) {
+                        s_query_channel_mask_current = mib.Param.ChannelsMask[0];
+                    }
+                    mib.Type = MIB_CHANNELS_DEFAULT_MASK;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK
+                        && mib.Param.ChannelsDefaultMask != NULL) {
+                        s_query_channel_mask_default = mib.Param.ChannelsDefaultMask[0];
+                    }
+                    break;
+                }
+                case LW_QUERY_RX_CLOCK_DRIFT: {
+                    s_query_max_rx_error_ms = 0;
+                    s_query_min_rx_symbols  = 0;
+                    mib.Type = MIB_SYSTEM_MAX_RX_ERROR;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK) {
+                        s_query_max_rx_error_ms = mib.Param.SystemMaxRxError;
+                    }
+                    mib.Type = MIB_MIN_RX_SYMBOLS;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK) {
+                        s_query_min_rx_symbols = mib.Param.MinRxSymbols;
+                    }
+                    break;
+                }
+                case LW_QUERY_RX_WINDOW_TIMING: {
+                    s_query_rx1_delay_ms              = 0;
+                    s_query_rx2_delay_ms              = 0;
+                    s_query_join_accept_delay_1_ms    = 0;
+                    s_query_join_accept_delay_2_ms    = 0;
+                    s_query_max_rx_window_duration_ms = 0;
+                    mib.Type = MIB_RECEIVE_DELAY_1;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK) {
+                        s_query_rx1_delay_ms = mib.Param.ReceiveDelay1;
+                    }
+                    mib.Type = MIB_RECEIVE_DELAY_2;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK) {
+                        s_query_rx2_delay_ms = mib.Param.ReceiveDelay2;
+                    }
+                    mib.Type = MIB_JOIN_ACCEPT_DELAY_1;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK) {
+                        s_query_join_accept_delay_1_ms = mib.Param.JoinAcceptDelay1;
+                    }
+                    mib.Type = MIB_JOIN_ACCEPT_DELAY_2;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK) {
+                        s_query_join_accept_delay_2_ms = mib.Param.JoinAcceptDelay2;
+                    }
+                    mib.Type = MIB_MAX_RX_WINDOW_DURATION;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK) {
+                        s_query_max_rx_window_duration_ms = mib.Param.MaxRxWindow;
+                    }
+                    break;
+                }
+                case LW_QUERY_REJOIN_CYCLE_0: {
+                    s_query_rejoin_cycle_seconds = 0;
+                    mib.Type = MIB_REJOIN_0_CYCLE;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK) {
+                        s_query_rejoin_cycle_seconds = mib.Param.Rejoin0CycleInSec;
+                    }
+                    break;
+                }
+                case LW_QUERY_REJOIN_CYCLE_1: {
+                    s_query_rejoin_cycle_seconds = 0;
+                    mib.Type = MIB_REJOIN_1_CYCLE;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK) {
+                        s_query_rejoin_cycle_seconds = mib.Param.Rejoin1CycleInSec;
+                    }
+                    break;
+                }
+                // LW_QUERY_REJOIN_CYCLE_2: not implemented — MIB_REJOIN_2_CYCLE
+                // is documented in LoRaMac.h:1463 but absent from the actual
+                // MibParamType enum. The Python wrapper rejects type=2 before
+                // dispatching, so this case is unreachable.
+                case LW_QUERY_FRAME_COUNTERS: {
+                    // No direct MIB getter for FCntUp/FCntDown in v4.7.0;
+                    // reach into the Crypto NVM context via MIB_NVM_CTXS.
+                    // The pointer returned is owned by the MAC and only valid
+                    // until the next MAC API call — copy fields out immediately.
+                    s_query_fcnt_up     = 0;
+                    s_query_fcnt_down   = 0;
+                    s_query_n_fcnt_down = 0;
+                    s_query_a_fcnt_down = 0;
+                    mib.Type = MIB_NVM_CTXS;
+                    if (LoRaMacMibGetRequestConfirm(&mib) == LORAMAC_STATUS_OK
+                        && mib.Param.Contexts != NULL) {
+                        s_query_fcnt_up     = mib.Param.Contexts->Crypto.FCntList.FCntUp;
+                        s_query_fcnt_down   = mib.Param.Contexts->Crypto.FCntList.FCntDown;
+                        s_query_n_fcnt_down = mib.Param.Contexts->Crypto.FCntList.NFCntDown;
+                        s_query_a_fcnt_down = mib.Param.Contexts->Crypto.FCntList.AFCntDown;
                     }
                     break;
                 }
@@ -2984,7 +3279,7 @@ static mp_obj_t lorawan_datarate(size_t n_args, const mp_obj_t *args) {
     }
     lorawan_cmd_data_t cmd;
     cmd.cmd = CMD_SET_PARAMS;
-    cmd.set_params.type = 1;
+    cmd.set_params.type = SET_PARAMS_DR;
     cmd.set_params.dr = (int8_t)mp_obj_get_int(args[1]);
     send_cmd_wait(&cmd, EVT_COMPLETED);
     return mp_const_none;
@@ -3010,7 +3305,7 @@ static mp_obj_t lorawan_adr(size_t n_args, const mp_obj_t *args) {
         g_tx_power_hw_override = LORAWAN_TX_POWER_NO_OVERRIDE;
     }
     lorawan_cmd_data_t cmd = { .cmd = CMD_SET_PARAMS };
-    cmd.set_params.type = 0;
+    cmd.set_params.type = SET_PARAMS_ADR;
     cmd.set_params.adr  = enable;
     send_cmd_wait(&cmd, EVT_COMPLETED);
     return mp_const_none;
@@ -3050,7 +3345,7 @@ static mp_obj_t lorawan_tx_power(size_t n_args, const mp_obj_t *args) {
             mp_printf(&mp_plat_print,
                       "lorawan: ADR disabled (incompatible with tx_power override)\n");
             lorawan_cmd_data_t adr_cmd = { .cmd = CMD_SET_PARAMS };
-            adr_cmd.set_params.type = 0;
+            adr_cmd.set_params.type = SET_PARAMS_ADR;
             adr_cmd.set_params.adr  = false;
             send_cmd_wait(&adr_cmd, EVT_COMPLETED);
         }
@@ -3061,7 +3356,7 @@ static mp_obj_t lorawan_tx_power(size_t n_args, const mp_obj_t *args) {
     }
 
     lorawan_cmd_data_t cmd = { .cmd = CMD_SET_PARAMS };
-    cmd.set_params.type     = 2;
+    cmd.set_params.type     = SET_PARAMS_TX_POWER;
     cmd.set_params.tx_power = idx;
     send_cmd_wait(&cmd, EVT_COMPLETED);
     return mp_const_none;
@@ -3100,7 +3395,7 @@ static mp_obj_t lorawan_antenna_gain(size_t n_args, const mp_obj_t *args) {
         return mp_obj_new_float(self->antenna_gain);
     }
     lorawan_cmd_data_t cmd = { .cmd = CMD_SET_PARAMS };
-    cmd.set_params.type         = 3;
+    cmd.set_params.type         = SET_PARAMS_ANTENNA_GAIN;
     cmd.set_params.antenna_gain = mp_obj_get_float(args[1]);
     send_cmd_wait(&cmd, EVT_COMPLETED);
     return mp_const_none;
@@ -3125,7 +3420,7 @@ static mp_obj_t lorawan_duty_cycle(size_t n_args, const mp_obj_t *args) {
                   "lorawan: duty cycle disabled — non-conformant on public ISM bands\n");
     }
     lorawan_cmd_data_t cmd = { .cmd = CMD_SET_PARAMS };
-    cmd.set_params.type       = 4;
+    cmd.set_params.type       = SET_PARAMS_DUTY_CYCLE;
     cmd.set_params.duty_cycle = enable;
     send_cmd_wait(&cmd, EVT_COMPLETED);
     return mp_const_none;
@@ -4047,6 +4342,350 @@ static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_derive_mc_keys_obj, 3, lorawan_derive_
 // most recent failure, or None if no failure has been recorded since boot or
 // since the last successful operation cleared the context. Users can call this
 // immediately after an OSError(EIO, ...) to get the numeric codes for branching.
+// ---- MIB getters / setters (Session 26) ----
+//
+// Thin wrappers over the LoRaMAC-node MIB. All getters dispatch a CMD_QUERY
+// to the LoRaWAN task (so MIB reads are serialised with the MAC's own
+// processing loop) and read the result from s_query_* statics. Setters use
+// CMD_SET_PARAMS with a sub-type that picks the MIB to update.
+
+// nb_trans(n=None) — getter/setter for MIB_CHANNELS_NB_TRANS.
+// Per-uplink retransmission count for unconfirmed frames (1..15). Higher
+// values trade airtime for reliability when ADR cannot raise output power.
+// The MAC default is 1; ADR may also raise this value via LinkADRReq.
+static mp_obj_t lorawan_nb_trans(size_t n_args, const mp_obj_t *args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    if (n_args == 1) {
+        lorawan_cmd_data_t cmd = { .cmd = CMD_QUERY };
+        cmd.query_type = LW_QUERY_NB_TRANS;
+        send_cmd_wait(&cmd, EVT_COMPLETED);
+        return mp_obj_new_int(s_query_nb_trans);
+    }
+    mp_int_t n = mp_obj_get_int(args[1]);
+    if (n < 1 || n > 15) {
+        mp_raise_ValueError(MP_ERROR_TEXT("nb_trans must be 1..15"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_SET_PARAMS };
+    cmd.set_params.type     = SET_PARAMS_NB_TRANS;
+    cmd.set_params.nb_trans = (uint8_t)n;
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_nb_trans_obj, 1, 2, lorawan_nb_trans);
+
+// public_network(enabled=None) — getter/setter for MIB_PUBLIC_NETWORK.
+// Selects the LoRa sync word: 0x34 for public networks (TTN, ChirpStack,
+// Helium etc.) and 0x12 for private deployments. Default is True (public);
+// changing the value re-arms the radio so the new sync word applies to the
+// next RX/TX cycle.
+static mp_obj_t lorawan_public_network(size_t n_args, const mp_obj_t *args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    if (n_args == 1) {
+        lorawan_cmd_data_t cmd = { .cmd = CMD_QUERY };
+        cmd.query_type = LW_QUERY_PUBLIC_NETWORK;
+        send_cmd_wait(&cmd, EVT_COMPLETED);
+        return mp_obj_new_bool(s_query_public_network);
+    }
+    bool enable = mp_obj_is_true(args[1]);
+    lorawan_cmd_data_t cmd = { .cmd = CMD_SET_PARAMS };
+    cmd.set_params.type           = SET_PARAMS_PUBLIC_NETWORK;
+    cmd.set_params.public_network = enable;
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_public_network_obj, 1, 2, lorawan_public_network);
+
+// net_id(value=None) — getter/setter for MIB_NET_ID.
+// 24-bit network identifier (only bits 0..23 are meaningful). After OTAA
+// this reflects the JoinAccept's NetID. The setter is meant for ABP, where
+// the value is otherwise zero; setting it on an OTAA session has no effect
+// once the network has assigned its own.
+static mp_obj_t lorawan_net_id(size_t n_args, const mp_obj_t *args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    if (n_args == 1) {
+        lorawan_cmd_data_t cmd = { .cmd = CMD_QUERY };
+        cmd.query_type = LW_QUERY_NET_ID;
+        send_cmd_wait(&cmd, EVT_COMPLETED);
+        return mp_obj_new_int_from_uint(s_query_net_id);
+    }
+    mp_uint_t v = (mp_uint_t)mp_obj_get_int_truncated(args[1]);
+    if (v > 0xFFFFFFu) {
+        mp_raise_ValueError(MP_ERROR_TEXT("net_id is 24-bit (0..0xFFFFFF)"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_SET_PARAMS };
+    cmd.set_params.type   = SET_PARAMS_NET_ID;
+    cmd.set_params.net_id = (uint32_t)v;
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_net_id_obj, 1, 2, lorawan_net_id);
+
+// channel_mask(mask=None, default=False) — getter/setter for MIB_CHANNELS_MASK.
+// 16-bit bitmask of enabled channels (bit i = channel i). EU868 default is
+// 0x0007 (channels 0..2). Passing default=True also updates
+// MIB_CHANNELS_DEFAULT_MASK so a subsequent ResetMacParameters does not
+// reinstate the region default. Returns the current mask as int when called
+// with no positional arg; with default=True and no positional arg, returns
+// (current, default) as a tuple.
+static mp_obj_t lorawan_channel_mask(size_t n_args, const mp_obj_t *pos_args,
+                                      mp_map_t *kw_args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    enum { ARG_mask, ARG_default };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_mask,    MP_ARG_OBJ,                 {.u_obj  = mp_const_none} },
+        { MP_QSTR_default, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
+                     MP_ARRAY_SIZE(allowed), allowed, args);
+
+    if (args[ARG_mask].u_obj == mp_const_none) {
+        // Getter
+        lorawan_cmd_data_t cmd = { .cmd = CMD_QUERY };
+        cmd.query_type = LW_QUERY_CHANNEL_MASK;
+        send_cmd_wait(&cmd, EVT_COMPLETED);
+        if (args[ARG_default].u_bool) {
+            mp_obj_t tup[2] = {
+                mp_obj_new_int_from_uint(s_query_channel_mask_current),
+                mp_obj_new_int_from_uint(s_query_channel_mask_default),
+            };
+            return mp_obj_new_tuple(2, tup);
+        }
+        return mp_obj_new_int_from_uint(s_query_channel_mask_current);
+    }
+    // Setter
+    mp_uint_t mask = (mp_uint_t)mp_obj_get_int_truncated(args[ARG_mask].u_obj);
+    if (mask > 0xFFFFu) {
+        mp_raise_ValueError(MP_ERROR_TEXT("mask must be 16-bit (0..0xFFFF)"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_SET_PARAMS };
+    cmd.set_params.type                       = SET_PARAMS_CHANNEL_MASK;
+    cmd.set_params.channel_mask.mask          = (uint16_t)mask;
+    cmd.set_params.channel_mask.set_default   = args[ARG_default].u_bool;
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_channel_mask_obj, 1, lorawan_channel_mask);
+
+// rx_clock_drift(*, max_rx_error_ms=None, min_rx_symbols=None) — getter/setter
+// for MIB_SYSTEM_MAX_RX_ERROR + MIB_MIN_RX_SYMBOLS.
+//
+// max_rx_error_ms: how much wall-clock drift the MAC tolerates when timing
+// the RX1/RX2 windows (the window is opened earlier and held longer to
+// compensate). Useful after long deepsleep when the RTC has drifted.
+// min_rx_symbols: the radio's preamble-detect symbol count; raising it
+// makes the receiver more tolerant of slow gateways at the cost of power.
+//
+// Getter (no kwargs) returns a dict {max_rx_error_ms, min_rx_symbols}.
+// Setter applies only the kwargs that were passed; the others are left at
+// their current MIB value.
+static mp_obj_t lorawan_rx_clock_drift(size_t n_args, const mp_obj_t *pos_args,
+                                        mp_map_t *kw_args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    enum { ARG_max_rx_error_ms, ARG_min_rx_symbols };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_max_rx_error_ms, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        { MP_QSTR_min_rx_symbols,  MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
+                     MP_ARRAY_SIZE(allowed), allowed, args);
+
+    uint8_t which = 0;
+    if (args[ARG_max_rx_error_ms].u_obj != mp_const_none) which |= 0x01;
+    if (args[ARG_min_rx_symbols].u_obj  != mp_const_none) which |= 0x02;
+
+    if (which == 0) {
+        // Getter
+        lorawan_cmd_data_t cmd = { .cmd = CMD_QUERY };
+        cmd.query_type = LW_QUERY_RX_CLOCK_DRIFT;
+        send_cmd_wait(&cmd, EVT_COMPLETED);
+        mp_obj_t d = mp_obj_new_dict(2);
+        mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_max_rx_error_ms),
+                          mp_obj_new_int_from_uint(s_query_max_rx_error_ms));
+        mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_min_rx_symbols),
+                          mp_obj_new_int(s_query_min_rx_symbols));
+        return d;
+    }
+    // Setter
+    lorawan_cmd_data_t cmd = { .cmd = CMD_SET_PARAMS };
+    cmd.set_params.type = SET_PARAMS_RX_CLOCK_DRIFT;
+    cmd.set_params.rx_clock_drift.which_set = which;
+    if (which & 0x01) {
+        cmd.set_params.rx_clock_drift.max_rx_error_ms =
+            (uint32_t)mp_obj_get_int(args[ARG_max_rx_error_ms].u_obj);
+    }
+    if (which & 0x02) {
+        mp_int_t v = mp_obj_get_int(args[ARG_min_rx_symbols].u_obj);
+        if (v < 1 || v > 255) {
+            mp_raise_ValueError(MP_ERROR_TEXT("min_rx_symbols must be 1..255"));
+        }
+        cmd.set_params.rx_clock_drift.min_rx_symbols = (uint8_t)v;
+    }
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_rx_clock_drift_obj, 1, lorawan_rx_clock_drift);
+
+// rx_window_timing(*, rx1_delay_ms=None, rx2_delay_ms=None,
+//                  join_accept_delay_1_ms=None, join_accept_delay_2_ms=None,
+//                  max_rx_window_duration_ms=None) — getter/setter for
+// MIB_RECEIVE_DELAY_1/2, MIB_JOIN_ACCEPT_DELAY_1/2, MIB_MAX_RX_WINDOW_DURATION.
+//
+// LoRaWAN-spec defaults: RX1 1 s, RX2 2 s, JA1 5 s, JA2 6 s. The network
+// will overwrite these via the JoinAccept; setting them is mainly useful
+// for ABP or for matching a private-network gateway with non-standard
+// timing. Returns dict / accepts kwargs in the same shape as the dict.
+static mp_obj_t lorawan_rx_window_timing(size_t n_args, const mp_obj_t *pos_args,
+                                          mp_map_t *kw_args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    enum { ARG_rx1, ARG_rx2, ARG_ja1, ARG_ja2, ARG_max_rx };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_rx1_delay_ms,              MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        { MP_QSTR_rx2_delay_ms,              MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        { MP_QSTR_join_accept_delay_1_ms,    MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        { MP_QSTR_join_accept_delay_2_ms,    MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        { MP_QSTR_max_rx_window_duration_ms, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
+                     MP_ARRAY_SIZE(allowed), allowed, args);
+
+    uint8_t which = 0;
+    if (args[ARG_rx1].u_obj    != mp_const_none) which |= 0x01;
+    if (args[ARG_rx2].u_obj    != mp_const_none) which |= 0x02;
+    if (args[ARG_ja1].u_obj    != mp_const_none) which |= 0x04;
+    if (args[ARG_ja2].u_obj    != mp_const_none) which |= 0x08;
+    if (args[ARG_max_rx].u_obj != mp_const_none) which |= 0x10;
+
+    if (which == 0) {
+        // Getter
+        lorawan_cmd_data_t cmd = { .cmd = CMD_QUERY };
+        cmd.query_type = LW_QUERY_RX_WINDOW_TIMING;
+        send_cmd_wait(&cmd, EVT_COMPLETED);
+        mp_obj_t d = mp_obj_new_dict(5);
+        mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_rx1_delay_ms),
+                          mp_obj_new_int_from_uint(s_query_rx1_delay_ms));
+        mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_rx2_delay_ms),
+                          mp_obj_new_int_from_uint(s_query_rx2_delay_ms));
+        mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_join_accept_delay_1_ms),
+                          mp_obj_new_int_from_uint(s_query_join_accept_delay_1_ms));
+        mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_join_accept_delay_2_ms),
+                          mp_obj_new_int_from_uint(s_query_join_accept_delay_2_ms));
+        mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_max_rx_window_duration_ms),
+                          mp_obj_new_int_from_uint(s_query_max_rx_window_duration_ms));
+        return d;
+    }
+    // Setter
+    lorawan_cmd_data_t cmd = { .cmd = CMD_SET_PARAMS };
+    cmd.set_params.type = SET_PARAMS_RX_WINDOW_TIMING;
+    cmd.set_params.rx_window_timing.which_set = which;
+    if (which & 0x01)
+        cmd.set_params.rx_window_timing.rx1_delay_ms =
+            (uint32_t)mp_obj_get_int(args[ARG_rx1].u_obj);
+    if (which & 0x02)
+        cmd.set_params.rx_window_timing.rx2_delay_ms =
+            (uint32_t)mp_obj_get_int(args[ARG_rx2].u_obj);
+    if (which & 0x04)
+        cmd.set_params.rx_window_timing.join_accept_delay_1_ms =
+            (uint32_t)mp_obj_get_int(args[ARG_ja1].u_obj);
+    if (which & 0x08)
+        cmd.set_params.rx_window_timing.join_accept_delay_2_ms =
+            (uint32_t)mp_obj_get_int(args[ARG_ja2].u_obj);
+    if (which & 0x10)
+        cmd.set_params.rx_window_timing.max_rx_window_duration_ms =
+            (uint32_t)mp_obj_get_int(args[ARG_max_rx].u_obj);
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(lorawan_rx_window_timing_obj, 1, lorawan_rx_window_timing);
+
+// rejoin_cycle(type, cycle_seconds=None) — getter/setter for
+// MIB_REJOIN_0_CYCLE / MIB_REJOIN_1_CYCLE.
+//
+// type=0: periodic Type 0 rejoin (carries roaming/keep-alive context)
+// type=1: periodic Type 1 rejoin (full re-keying with new JoinNonce)
+//
+// LoRaWAN 1.1 also defines a Type 2 cycle, but LoRaMAC-node v4.7.0 does
+// not expose it through the MibParamType enum (the header docs at
+// LoRaMac.h:1463 list it; the enum at LoRaMac.h:1820+ omits it). type=2
+// is rejected at this wrapper to surface the upstream limitation early.
+static mp_obj_t lorawan_rejoin_cycle(size_t n_args, const mp_obj_t *args) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    mp_int_t type_ = mp_obj_get_int(args[1]);
+    if (type_ < 0 || type_ > 1) {
+        mp_raise_ValueError(MP_ERROR_TEXT("rejoin_cycle type must be 0 or 1"));
+    }
+    if (n_args == 2) {
+        lorawan_cmd_data_t cmd = { .cmd = CMD_QUERY };
+        cmd.query_type = (type_ == 0) ? LW_QUERY_REJOIN_CYCLE_0
+                                       : LW_QUERY_REJOIN_CYCLE_1;
+        send_cmd_wait(&cmd, EVT_COMPLETED);
+        return mp_obj_new_int_from_uint(s_query_rejoin_cycle_seconds);
+    }
+    mp_uint_t cycle = (mp_uint_t)mp_obj_get_int_truncated(args[2]);
+    lorawan_cmd_data_t cmd = { .cmd = CMD_SET_PARAMS };
+    cmd.set_params.type                       = SET_PARAMS_REJOIN_CYCLE;
+    cmd.set_params.rejoin_cycle.rejoin_type   = (uint8_t)type_;
+    cmd.set_params.rejoin_cycle.cycle_seconds = (uint32_t)cycle;
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lorawan_rejoin_cycle_obj, 2, 3, lorawan_rejoin_cycle);
+
+// frame_counters() — read-only live snapshot of FCntUp/FCntDown.
+// LoRaMAC-node v4.7.0 exposes no direct MIB getter for these counters; this
+// reaches into the Crypto NVM context via MIB_NVM_CTXS. Returns dict
+// {fcnt_up, fcnt_down, n_fcnt_down, a_fcnt_down}.
+//   fcnt_up:     uplink counter sent in the next frame (1.0.x scheme)
+//   fcnt_down:   single downlink counter (1.0.x); with 1.1 use n_/a_*
+//   n_fcnt_down: network-frame downlink counter (LoRaWAN 1.1)
+//   a_fcnt_down: application-frame downlink counter (LoRaWAN 1.1)
+// Compare with stats()["last_tx_fcnt_up"] (last value transmitted) to spot
+// a stale local view after roaming or clock drift; both fields update from
+// the same Crypto context but stats() is cached at TX time.
+static mp_obj_t lorawan_frame_counters(mp_obj_t self_in) {
+    lorawan_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("not initialized"));
+    }
+    lorawan_cmd_data_t cmd = { .cmd = CMD_QUERY };
+    cmd.query_type = LW_QUERY_FRAME_COUNTERS;
+    send_cmd_wait(&cmd, EVT_COMPLETED);
+    mp_obj_t d = mp_obj_new_dict(4);
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_fcnt_up),
+                      mp_obj_new_int_from_uint(s_query_fcnt_up));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_fcnt_down),
+                      mp_obj_new_int_from_uint(s_query_fcnt_down));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_n_fcnt_down),
+                      mp_obj_new_int_from_uint(s_query_n_fcnt_down));
+    mp_obj_dict_store(d, MP_OBJ_NEW_QSTR(MP_QSTR_a_fcnt_down),
+                      mp_obj_new_int_from_uint(s_query_a_fcnt_down));
+    return d;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lorawan_frame_counters_obj, lorawan_frame_counters);
+
 static mp_obj_t lorawan_last_error(mp_obj_t self_in) {
     (void)self_in;
     if (!s_last_error_context) {
@@ -4193,6 +4832,15 @@ static const mp_rom_map_elem_t lorawan_locals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_tx_cw),               MP_ROM_PTR(&lorawan_tx_cw_obj) },
     { MP_ROM_QSTR(MP_QSTR_compliance_enable),    MP_ROM_PTR(&lorawan_compliance_enable_obj) },
     { MP_ROM_QSTR(MP_QSTR_derive_mc_keys),       MP_ROM_PTR(&lorawan_derive_mc_keys_obj) },
+    // MIB getters/setters (Session 26)
+    { MP_ROM_QSTR(MP_QSTR_nb_trans),             MP_ROM_PTR(&lorawan_nb_trans_obj) },
+    { MP_ROM_QSTR(MP_QSTR_public_network),       MP_ROM_PTR(&lorawan_public_network_obj) },
+    { MP_ROM_QSTR(MP_QSTR_net_id),               MP_ROM_PTR(&lorawan_net_id_obj) },
+    { MP_ROM_QSTR(MP_QSTR_channel_mask),         MP_ROM_PTR(&lorawan_channel_mask_obj) },
+    { MP_ROM_QSTR(MP_QSTR_rx_clock_drift),       MP_ROM_PTR(&lorawan_rx_clock_drift_obj) },
+    { MP_ROM_QSTR(MP_QSTR_rx_window_timing),     MP_ROM_PTR(&lorawan_rx_window_timing_obj) },
+    { MP_ROM_QSTR(MP_QSTR_rejoin_cycle),         MP_ROM_PTR(&lorawan_rejoin_cycle_obj) },
+    { MP_ROM_QSTR(MP_QSTR_frame_counters),       MP_ROM_PTR(&lorawan_frame_counters_obj) },
     // Diagnostics (Session 21)
     { MP_ROM_QSTR(MP_QSTR_last_error),           MP_ROM_PTR(&lorawan_last_error_obj) },
     // Lifecycle (Session 16). __del__ fires on GC sweep, including the
@@ -4215,7 +4863,7 @@ MP_DEFINE_CONST_OBJ_TYPE(
 // ---- Module-level functions ----
 
 static mp_obj_t lorawan_version(void) {
-    return mp_obj_new_str("1.4.0", 5);
+    return mp_obj_new_str("1.5.0", 5);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(lorawan_version_obj, lorawan_version);
 

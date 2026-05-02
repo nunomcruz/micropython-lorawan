@@ -2,6 +2,21 @@
 
 Development history of the LoRaWAN MAC stack on top of MicroPython v1.29.0-preview, targeting LILYGO TTGO T-Beam variants. Entries are listed newest-first. The Python API has been stable since **v1.0.0**; only additive minor-version changes have been made since.
 
+## v1.5.0 — Advanced MIB tuning
+
+Eight additive MIB wrappers exposing the LoRaMAC-node MIB surface that previously had no Python entry point. Pure additions; no behavioural changes to existing methods.
+
+- `lw.nb_trans([n])` — per-uplink retransmission count (1..15). Wraps `MIB_CHANNELS_NB_TRANS`. Cheapest reliability knob when ADR has already pushed power to the region maximum.
+- `lw.public_network([enabled])` — sync word selection. `True` (default) = `0x34` for public networks (TTN, ChirpStack, Helium); `False` = `0x12` for private deployments. Wraps `MIB_PUBLIC_NETWORK`.
+- `lw.net_id([value])` — 24-bit `MIB_NET_ID`. Mainly relevant for ABP; OTAA overrides from JoinAccept.
+- `lw.channel_mask([mask], *, default=False)` — `MIB_CHANNELS_MASK` (and optionally `MIB_CHANNELS_DEFAULT_MASK`). Getter with `default=True` returns `(current, default)`.
+- `lw.rx_clock_drift(*, max_rx_error_ms=None, min_rx_symbols=None)` — RX1/RX2 timing tolerances, useful after long deepsleep with RTC drift. Wraps `MIB_SYSTEM_MAX_RX_ERROR` + `MIB_MIN_RX_SYMBOLS`. Getter returns dict; setter applies only kwargs that were passed.
+- `lw.rx_window_timing(*, rx1_delay_ms=None, rx2_delay_ms=None, join_accept_delay_1_ms=None, join_accept_delay_2_ms=None, max_rx_window_duration_ms=None)` — wraps `MIB_RECEIVE_DELAY_1/2`, `MIB_JOIN_ACCEPT_DELAY_1/2`, `MIB_MAX_RX_WINDOW_DURATION`.
+- `lw.rejoin_cycle(type, [cycle_seconds])` — LoRaWAN 1.1 periodic rejoin cycles. `type=0` or `1`. **Note:** `MIB_REJOIN_2_CYCLE` is documented in `LoRaMac.h:1463` but absent from the actual `MibParamType` enum at line 1820+; `type=2` is rejected with `ValueError` at the wrapper.
+- `lw.frame_counters()` — live snapshot of `{fcnt_up, fcnt_down, n_fcnt_down, a_fcnt_down}`. LoRaMAC-node v4.7.0 has no direct MIB getter for these; reads `MIB_NVM_CTXS` and copies fields out of the `Crypto` context. Complements `stats()["last_tx_fcnt_up"]` (cached at TX time) with the live MAC value.
+
+Internal: `cmd_set_params_t.type` formerly used numeric literals `0..4`. Replaced with named `SET_PARAMS_*` constants and extended through `SET_PARAMS_REJOIN_CYCLE = 11`. New `LW_QUERY_*` sub-types added for the read-only MIB queries.
+
 ## v1.4.0 — Additional regions
 
 - Build-time region opt-in. `LORAWAN_REGIONS` cmake cache variable selects which regions to compile in (default `EU868`). Multi-region build example: `-DLORAWAN_REGIONS="EU868;EU433;US915;AS923"`.
@@ -166,7 +181,6 @@ The full Python binding surface taking shape across Sessions 7–10:
 
 Items considered but not yet implemented. None are blockers; each is an additive minor-version candidate.
 
-- **Expanded MIB getters/setters** — `nb_trans()` (per-uplink retransmission count, cheapest reliability knob), `channel_mask()`, `frame_counters()` (live `(fcnt_up, fcnt_down)` from `MIB_NVM_CTXS`), `public_network()` (sync word selection for private deployments), `rx_window_timing()`, `rx_clock_drift()` (useful after long deepsleep with RTC drift), `rejoin_cycle()`, `net_id()`. Each is a thin wrapper on existing MAC state.
 - **`__doc__` strings** on Python-facing methods, if MicroPython v1.29 supports it on `MP_DEFINE_CONST_FUN_OBJ`.
 
 ## Hardware notes (not version-specific)
