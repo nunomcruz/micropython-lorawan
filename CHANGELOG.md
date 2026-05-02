@@ -177,12 +177,6 @@ The full Python binding surface taking shape across Sessions 7–10:
 - USER_C_MODULE skeleton — `lorawan-module/` directory layout, `micropython.cmake` INTERFACE library, vendored LoRaMAC-node v4.7.0 sources.
 - T-Beam board definition — `ports/esp32/boards/LILYGO_TTGO_TBEAM/` (all variants, runtime auto-detect via `tbeam.py`), frozen `lora-sx127x` and `lora-sx126x` drivers.
 
-## Roadmap
-
-Items considered but not yet implemented. None are blockers; each is an additive minor-version candidate.
-
-- **`__doc__` strings** on Python-facing methods, if MicroPython v1.29 supports it on `MP_DEFINE_CONST_FUN_OBJ`.
-
 ## Hardware notes (not version-specific)
 
 - TCXO register on **SX1276**: T-Beam uses a crystal (`REG_LR_TCXO = 0x09`), NOT TCXO (`0x19`). Wrong value silences the radio.
